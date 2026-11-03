@@ -10,10 +10,6 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = []
-
-[project.optional-dependencies]
-openai-agents = ["openai-agents>=0.2"]
-langchain = ["langchain-core>=0.3"]
 keywords = ["kosa8", "sandbox", "microvm", "ai-agents", "security"]
 classifiers = [
   "License :: OSI Approved :: MIT License",
@@ -27,6 +23,10 @@ classifiers = [
 Homepage = "https://kosa8.com"
 Documentation = "https://docs.kosa8.com"
 Source = "https://github.com/kosa8ai/kosa8-py"
+
+[project.optional-dependencies]
+openai-agents = ["openai-agents>=0.2"]
+langchain = ["langchain-core>=0.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
