@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Windows, and paired workers.
+
+- With no `host=`, `KOSA8_HOST` or `socket_path=`, the client follows the CLI's saved worker connection (`~/.kosa8/worker.json`, written by `kosa8 wsl setup` and `kosa8 worker join`), token included, as the CLI does. On Windows that is the WSL2 engine; before, the SDK tried a unix socket, which Python on Windows does not have. `worker_file=False` turns it off.
+- A connection failure on Windows says to run `kosa8 wsl setup`.
+- CI runs the tests on Linux, macOS and Windows, Python 3.9 and 3.13.
+
 kosa8 Cloud, the same as `@kosa8/sdk`'s `Kosa8Cloud`.
 
 - `Kosa8Cloud`: a client for the kosa8 Cloud control plane, authenticated with a `k8c_live_` API key (`KOSA8_API_KEY`; address `KOSA8_CLOUD_URL`, default `https://api.kosa8.cloud`, https only except localhost). Standard library only.

@@ -85,6 +85,13 @@ Guides: https://docs.kosa8.com/guides/py-frameworks/ and https://docs.kosa8.com/
 | `actor=` | `tool`; recorded in the audit log as `human`, `agent` or `tool` |
 | `agent_token=` / `KOSA8_AGENT_TOKEN` | agent identity for the audit log |
 | `timeout=` | seconds per connect and read; `None` waits |
+| `worker_file=` | `~/.kosa8/worker.json`, the CLI's saved worker connection; `False` reads none |
+
+Where requests go, in order: `host=` or `KOSA8_HOST`; else the connection the
+CLI saved (`kosa8 wsl setup` on Windows, where the engine runs in WSL2, or
+`kosa8 worker join` anywhere), with its token; else the local daemon's socket.
+So on Windows, once `kosa8 wsl setup` has run, `Kosa8Client()` reaches the WSL2
+engine with no configuration.
 
 ## kosa8 Cloud
 

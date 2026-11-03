@@ -95,7 +95,10 @@ class Kosa8Client(ToolboxMixin):
     >>> sb = k.create_sandbox(name="demo", egress="deny")["sandbox"]
 
     Connection options follow the CLI: ``KOSA8_HOST``/``KOSA8_TOKEN`` select a
-    remote worker, otherwise ``~/.kosa8/run/kosa8.sock``.
+    remote worker; otherwise the connection the CLI saved (``kosa8 wsl setup``
+    on Windows, ``kosa8 worker join``), in ``worker_file`` (default
+    ``~/.kosa8/worker.json``; ``False`` reads none); otherwise
+    ``~/.kosa8/run/kosa8.sock``.
     """
 
     def __init__(
@@ -111,6 +114,7 @@ class Kosa8Client(ToolboxMixin):
         timeout: Optional[float] = None,
         checkpoint_store: Any = None,
         env: Optional[Mapping[str, str]] = None,
+        worker_file: Any = None,
     ) -> None:
         self.transport = Transport(
             socket_path=socket_path,
@@ -122,6 +126,7 @@ class Kosa8Client(ToolboxMixin):
             headers=headers,
             timeout=timeout,
             env=env,
+            worker_file=worker_file,
         )
         self.checkpoints = CheckpointBook(checkpoint_store or FileCheckpointStore())
         self._stdin_sent: set = set()

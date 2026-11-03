@@ -22,7 +22,7 @@ def _w(path, text):
 class Base(unittest.TestCase):
     def setUp(self):
         self.d = MockDaemon().start()
-        self.c = Kosa8Client(socket_path=self.d.socket_path, env={}, checkpoint_store=MemoryCheckpointStore())
+        self.c = Kosa8Client(**self.d.client_args, env={}, checkpoint_store=MemoryCheckpointStore())
 
     def tearDown(self):
         self.d.stop()

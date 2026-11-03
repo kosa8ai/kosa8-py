@@ -62,20 +62,61 @@ class Endpoint:
         return f"{self.scheme}://{self.host}{port}"
 
 
+def default_worker_file() -> str:
+    """The CLI's saved worker connection: ``$HOME/.kosa8/worker.json`` (internal/cli/worker.go)."""
+    return os.path.join(os.path.expanduser("~"), ".kosa8", "worker.json")
+
+
+def _load_saved_worker(path: str) -> Optional[Dict[str, Any]]:
+    """The saved connection, or None when there is none or it cannot be read."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            w = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(w, dict):
+        return None
+    host = w.get("host")
+    if not isinstance(host, str) or not host.strip():
+        return None
+    token = w.get("token")
+    return {
+        "host": host.strip(),
+        "token": token if isinstance(token, str) and token else None,
+        "insecure": w.get("insecure") is True,
+    }
+
+
 def resolve_endpoint(
     host: Optional[str] = None,
     socket_path: Optional[str] = None,
     token: Optional[str] = None,
     insecure: bool = False,
     env: Optional[Mapping[str, str]] = None,
+    worker_file: Union[str, bool, None] = None,
 ) -> Endpoint:
-    """Resolve where to connect, following the CLI's KOSA8_HOST rules."""
+    """Resolve where to connect, as the CLI does: ``host`` or ``KOSA8_HOST``;
+    else the CLI's saved worker connection (``worker_file``, default
+    ``~/.kosa8/worker.json``, written by ``kosa8 wsl setup`` and ``kosa8 worker
+    join``; ``False`` reads none); else the daemon's unix socket."""
     env = os.environ if env is None else env
     from_env = (env.get("KOSA8_HOST") or "").strip()
-    raw = (host if host is not None else from_env).strip().rstrip("/")
-    if raw == "":
-        return Endpoint(kind="unix", socket_path=socket_path or default_socket_path())
-    h = raw
+    raw = (host if host is not None else from_env).strip()
+    allow_plain = insecure or env.get("KOSA8_INSECURE") == "1"
+    if raw:
+        # A saved token is never sent to a host named here.
+        if token is None and host is None and from_env:
+            token = env.get("KOSA8_TOKEN") or None
+        return _parse_host(raw, allow_plain, token)
+    if socket_path is None and worker_file is not False and worker_file != "":
+        saved = _load_saved_worker(worker_file if isinstance(worker_file, str) else default_worker_file())
+        if saved:
+            return _parse_host(saved["host"], allow_plain or saved["insecure"], token if token is not None else saved["token"])
+    return Endpoint(kind="unix", socket_path=socket_path or default_socket_path())
+
+
+def _parse_host(raw: str, allow_plain: bool, token: Optional[str]) -> Endpoint:
+    h = raw = raw.rstrip("/")
     i = h.find("://")
     if i > 0:
         h = h[:i].lower() + h[i:]
@@ -93,7 +134,6 @@ def resolve_endpoint(
     u = urlsplit(h)
     if not u.hostname:
         raise Kosa8Error(f"KOSA8_HOST {raw!r} names no host")
-    allow_plain = insecure or env.get("KOSA8_INSECURE") == "1"
     if u.scheme == "http" and not allow_plain and not _is_loopback(u.hostname):
         hp = u.netloc
         raise Kosa8Error(
@@ -101,8 +141,6 @@ def resolve_endpoint(
             f"the network unencrypted. Use https://{hp} (a worker behind a TLS-terminating tunnel "
             "or proxy), or set insecure=True / KOSA8_INSECURE=1 if this link is already private and trusted"
         )
-    if token is None and host is None and from_env:
-        token = env.get("KOSA8_TOKEN") or None
     return Endpoint(
         kind="tcp",
         scheme=u.scheme,
@@ -119,6 +157,8 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self._socket_path = socket_path
 
     def connect(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):  # Python on Windows
+            raise FileNotFoundError(f"this Python has no unix sockets to reach {self._socket_path}")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if self.timeout is not None:
             s.settimeout(self.timeout)
@@ -196,9 +236,10 @@ class Transport:
         headers: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
         env: Optional[Mapping[str, str]] = None,
+        worker_file: Union[str, bool, None] = None,
     ) -> None:
         env = os.environ if env is None else env
-        self.endpoint = resolve_endpoint(host, socket_path, token, insecure, env)
+        self.endpoint = resolve_endpoint(host, socket_path, token, insecure, env, worker_file)
         if actor not in ("human", "agent", "tool"):
             raise Kosa8Error(f"actor must be human, agent or tool, not {actor!r}")
         self.actor = actor
@@ -292,7 +333,10 @@ class Transport:
             conn.close()
             hint = ""
             if isinstance(err, (FileNotFoundError, ConnectionRefusedError)):
-                hint = " (is kosa8 installed and its daemon running? start it with `kosa8 daemon start`)"
+                if self.endpoint.kind == "unix" and os.name == "nt":
+                    hint = " (on Windows the engine runs in WSL2: run `kosa8 wsl setup`, or set KOSA8_HOST)"
+                else:
+                    hint = " (is kosa8 installed and its daemon running? start it with `kosa8 daemon start`)"
             raise Kosa8ConnectionError(
                 f"kosa8 daemon unreachable at {self.target}: {err}{hint}", method=method, path=path
             ) from err

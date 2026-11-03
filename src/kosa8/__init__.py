@@ -39,7 +39,7 @@ from .errors import (
     Kosa8UnsupportedError,
     error_from_response,
 )
-from .transport import Transport, default_socket_path, resolve_endpoint
+from .transport import Transport, default_socket_path, default_worker_file, resolve_endpoint
 
 __version__ = "0.2.0"
 
@@ -62,6 +62,7 @@ __all__ = [
     "Artifact",
     "Transport",
     "default_socket_path",
+    "default_worker_file",
     "resolve_endpoint",
     "CheckpointBook",
     "FileCheckpointStore",
