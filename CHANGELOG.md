@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+kosa8 Cloud, the same as `@kosa8/sdk`'s `Kosa8Cloud`.
+
+- `Kosa8Cloud`: a client for the kosa8 Cloud control plane, authenticated with a `k8c_live_` API key (`KOSA8_API_KEY`; address `KOSA8_CLOUD_URL`, default `https://api.kosa8.cloud`, https only except localhost). Standard library only.
+- `cloud.sandboxes.create`, `list` and `get` return a `CloudSandbox` with `exec`, `sleep`, `wake`, `refresh` and `delete`.
+- `cloud.functions`: `deploy`, `list`, `get`, `delete`, `invoke` and `map`.
+- `cloud.me()` and `cloud.usage()`.
+- Errors: every error has `code`, the cloud's stable error code. New `Kosa8PaymentRequiredError` (402) and `Kosa8RateLimitError` (429).
+
 ## 0.2.0 — 2026-11-03
 
 The sandbox toolbox, and adapters for agent frameworks. Needs a kosa8 daemon with the

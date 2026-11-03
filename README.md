@@ -86,6 +86,36 @@ Guides: https://docs.kosa8.com/guides/py-frameworks/ and https://docs.kosa8.com/
 | `agent_token=` / `KOSA8_AGENT_TOKEN` | agent identity for the audit log |
 | `timeout=` | seconds per connect and read; `None` waits |
 
+## kosa8 Cloud
+
+The same sandboxes on kosa8 Cloud instead of the local daemon. Make an API
+key in the cloud dashboard and set `KOSA8_API_KEY`.
+
+```python
+from kosa8 import Kosa8Cloud, Kosa8PaymentRequiredError
+
+cloud = Kosa8Cloud()  # or Kosa8Cloud("k8c_live_...")
+
+box = cloud.sandboxes.create(template="python", sleep_after_s=600)
+r = box.exec(["python3", "-c", "print(6 * 7)"])
+print(r.exit_code, r.stdout)    # 0 42
+box.sleep()                     # costs only snapshot storage while asleep
+box.exec("ls /workspace")       # wakes it, files and all
+box.delete()
+
+cloud.functions.deploy("hello", {
+    "runtime": "python3.12",
+    "code": 'def handler(event):\n    return {"hello": event.get("name", "world")}\n',
+})
+out = cloud.functions.invoke("hello", {"name": "kosa8"})
+print(out["ok"], out["result"])  # True {'hello': 'kosa8'}
+```
+
+A new organization runs nothing until a payment method is on file; until
+then creating a sandbox raises `Kosa8PaymentRequiredError` (`code`
+`payment_required`), whose message says what to do. Every error from the
+cloud carries its stable `code`.
+
 ## Errors
 
 Every daemon error is raised as a typed exception carrying the daemon's own
