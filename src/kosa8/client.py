@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 
 from .checkpoints import CheckpointBook, FileCheckpointStore, _seq_of
 from .errors import Kosa8CheckpointError, Kosa8ConflictError, Kosa8Error, Kosa8StreamError, Kosa8TimeoutError
+from .toolbox import ToolboxMixin
 from .transport import Body, Transport, enc
 
 Env = Union[Mapping[str, str], Sequence[str], None]
@@ -86,7 +87,7 @@ def _env_list(env: Env) -> Optional[List[str]]:
     return list(env)
 
 
-class Kosa8Client:
+class Kosa8Client(ToolboxMixin):
     """Typed client for the kosa8 native API over the daemon's unix socket (or a remote worker).
 
     >>> from kosa8 import Kosa8Client
@@ -167,9 +168,19 @@ class Kosa8Client:
         capture: Optional[Dict[str, Any]] = None,
         labels: Optional[Mapping[str, str]] = None,
         broker: Optional[Dict[str, Any]] = None,
+        auto_stop_min: Optional[int] = None,
+        auto_delete_min: Optional[int] = None,
+        ttl_min: Optional[int] = None,
+        ephemeral: bool = False,
+        template: Optional[str] = None,
         approval: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /kosa8/v1/sandboxes: boot a microVM sandbox.
+
+        ``auto_stop_min`` stops it after that many idle minutes, ``ttl_min`` that long
+        after creation, ``auto_delete_min`` deletes it once stopped that long, and
+        ``ephemeral`` deletes it whenever it stops. ``template`` starts it with a
+        template's image (see :meth:`build_template`).
 
         ``egress``: ``"deny"``, ``"any"``, ``"fakenet"``, ``"allow:a.com,b.com"`` or
         ``{"allow": [...]}``. ``egress_allow=[...]`` is shorthand for the last.
@@ -195,6 +206,13 @@ class Kosa8Client:
             body["labels"] = dict(labels)
         if broker:
             body["broker"] = broker
+        for k, v in (("auto_stop_min", auto_stop_min), ("auto_delete_min", auto_delete_min), ("ttl_min", ttl_min)):
+            if v:
+                body[k] = v
+        if ephemeral:
+            body["ephemeral"] = True
+        if template:
+            body["template"] = template
         return self.transport.json("POST", "/kosa8/v1/sandboxes", body=body, approval=approval)
 
     def start_sandbox(self, sandbox: str, *, approval: Optional[str] = None) -> Dict[str, Any]:
@@ -707,3 +725,35 @@ class Sandbox:
 
     def rewind(self, **kw: Any) -> Dict[str, Any]:
         return self.client.rewind(self.id, **kw)
+
+    # --- toolbox ------------------------------------------------------------------
+
+    def run_code(self, code: str, **kw: Any) -> Any:
+        return self.client.run_code(self.id, code, **kw)
+
+    def shell(self, command: str, **kw: Any) -> Any:
+        return self.client.shell(self.id, command, **kw)
+
+    def list_files(self, path: str = "/workspace") -> List[Dict[str, Any]]:
+        return self.client.list_files(self.id, path)
+
+    def read_file(self, path: str) -> bytes:
+        return self.client.read_file(self.id, path)
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        return self.client.read_text(self.id, path, encoding)
+
+    def write_file(self, path: str, data: Any, **kw: Any) -> Dict[str, Any]:
+        return self.client.write_file(self.id, path, data, **kw)
+
+    def delete_file(self, path: str, **kw: Any) -> Dict[str, Any]:
+        return self.client.delete_file(self.id, path, **kw)
+
+    def git(self, op: str, **kw: Any) -> Any:
+        return self.client.git(self.id, op, **kw)
+
+    def preview(self, port: int, **kw: Any) -> Dict[str, Any]:
+        return self.client.create_preview(self.id, port, **kw)
+
+    def set_lifecycle(self, **kw: Any) -> Dict[str, Any]:
+        return self.client.set_lifecycle(self.id, **kw)
