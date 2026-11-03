@@ -22,6 +22,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://kosa8.com"
 Documentation = "https://docs.kosa8.com"
+Source = "https://github.com/kosa8ai/kosa8-py"
 
 [tool.setuptools.packages.find]
 where = ["src"]
