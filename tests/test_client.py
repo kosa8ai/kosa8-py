@@ -272,3 +272,80 @@ class EndpointTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixesTest(Base):
+    def test_second_write_stdin_raises(self):
+        self.d.on("POST", "/kosa8/v1/sandboxes/s/containers/c/stdin", lambda r, h: send_json(h, 200, {"ok": True}))
+        self.assertEqual(self.c.write_stdin("s", "c", b"hi\n"), {"ok": True})
+        with self.assertRaises(Kosa8Error):
+            self.c.write_stdin("s", "c", b"again\n")
+        self.assertEqual(len(self.d.find("POST", "/kosa8/v1/sandboxes/s/containers/c/stdin")), 1)
+
+    def test_bad_frame_is_protocol_error(self):
+        from kosa8 import Kosa8ProtocolError
+
+        def bad(r, h):
+            h.send_response(200)
+            h.send_header("Content-Type", "application/x-ndjson")
+            h.send_header("Content-Length", "9")
+            h.end_headers()
+            h.wfile.write(b"not json\n")
+
+        self.d.on("POST", "/kosa8/v1/sandboxes/s/run", bad)
+        with self.assertRaises(Kosa8ProtocolError):
+            self.c.run("s", "alpine", ["true"])
+
+    def test_checkpoint_retries_on_id_collision(self):
+        calls = []
+
+        def snap(r, h):
+            calls.append(r.json()["id"])
+            if len(calls) == 1:
+                send_json(h, 409, {"error": "snapshot already exists: s-ckpt-1"})
+            else:
+                send_json(h, 201, {"id": r.json()["id"]})
+
+        self.d.on("POST", "/kosa8/v1/sandboxes/s/snapshot", snap)
+        self.d.on("GET", "/kosa8/v1/snapshots", lambda r, h: send_json(h, 200, [{"id": "s-ckpt-1"}]))
+        out = self.c.checkpoint("s", label="a")
+        self.assertEqual(calls, ["s-ckpt-1", "s-ckpt-2"])
+        self.assertEqual(out["checkpoint"]["id"], "s-ckpt-2")
+
+    def test_conflict_for_another_reason_is_raised(self):
+        self.d.on("POST", "/kosa8/v1/sandboxes/s/snapshot", lambda r, h: send_json(h, 409, {"error": "sandbox busy"}))
+        self.d.on("GET", "/kosa8/v1/snapshots", lambda r, h: send_json(h, 200, []))
+        from kosa8 import Kosa8ConflictError
+
+        with self.assertRaises(Kosa8ConflictError):
+            self.c.checkpoint("s")
+
+    def test_file_lock_times_out(self):
+        import fcntl
+
+        from kosa8 import Kosa8CheckpointError
+
+        d = tempfile.mkdtemp()
+        store = FileCheckpointStore(os.path.join(d, "checkpoints.json"), lock_timeout=0.3)
+        fd = os.open(store.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        pid = os.fork()
+        if pid == 0:  # hold the lock from another process, as the CLI would
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            import time as _t
+
+            _t.sleep(2)
+            os._exit(0)
+        try:
+            import time as _t
+
+            _t.sleep(0.3)
+            with self.assertRaises(Kosa8CheckpointError):
+                store.update(lambda data: None)
+        finally:
+            os.waitpid(pid, 0)
+            os.close(fd)
+
+    def test_sandbox_handle_has_stdin_methods(self):
+        h = self.c.sandbox("s")
+        for m in ("exec_frames", "start_interactive", "write_stdin", "attach"):
+            self.assertTrue(callable(getattr(h, m)))

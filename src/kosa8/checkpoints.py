@@ -14,6 +14,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -54,8 +55,10 @@ class MemoryCheckpointStore:
 class FileCheckpointStore:
     """The store the kosa8 CLI, MCP server and desk use (mode 0600, rewritten atomically)."""
 
-    def __init__(self, path: Optional[str] = None) -> None:
+    def __init__(self, path: Optional[str] = None, *, lock_timeout: float = 10.0) -> None:
         self.path = path or os.path.join(os.path.expanduser("~"), ".kosa8", "checkpoints.json")
+        #: Seconds to wait for checkpoints.json.lock before giving up (10, as @kosa8/sdk).
+        self.lock_timeout = lock_timeout
         self._mu = threading.Lock()
 
     def load(self) -> StoreData:
@@ -78,7 +81,18 @@ class FileCheckpointStore:
                 try:
                     import fcntl
 
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    deadline = time.monotonic() + self.lock_timeout
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise Kosa8CheckpointError(
+                                    f"timed out after {self.lock_timeout:g}s waiting for {self.path}.lock; "
+                                    "another kosa8 process is holding it"
+                                ) from None
+                            time.sleep(0.05)
                 except ImportError:  # Windows: in-process lock only, as pkg/checkpoint lock_other.go
                     pass
                 data = self.load()

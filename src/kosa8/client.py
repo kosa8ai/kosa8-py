@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
-from .checkpoints import CheckpointBook, FileCheckpointStore
-from .errors import Kosa8Error, Kosa8StreamError, Kosa8TimeoutError
+from .checkpoints import CheckpointBook, FileCheckpointStore, _seq_of
+from .errors import Kosa8CheckpointError, Kosa8ConflictError, Kosa8Error, Kosa8StreamError, Kosa8TimeoutError
 from .transport import Body, Transport, enc
 
 Env = Union[Mapping[str, str], Sequence[str], None]
@@ -122,6 +123,8 @@ class Kosa8Client:
             env=env,
         )
         self.checkpoints = CheckpointBook(checkpoint_store or FileCheckpointStore())
+        self._stdin_sent: set = set()
+        self._stdin_mu = threading.Lock()
 
     # --- status ---------------------------------------------------------------
 
@@ -333,7 +336,22 @@ class Kosa8Client:
         return out["id"]
 
     def write_stdin(self, sandbox: str, container: str, data: Body, *, approval: Optional[str] = None) -> Dict[str, Any]:
-        """POST .../containers/{cid}/stdin: stream bytes (or an iterable of chunks) into stdin."""
+        """POST .../containers/{cid}/stdin: stream bytes (or an iterable of chunks) into stdin.
+
+        The request body is the container's whole stdin: the daemon closes stdin
+        when the body ends, so this can be called once per container. To feed
+        input over time, pass an iterable (a generator) that yields as it goes.
+        A second call raises instead of reporting success for input the process
+        would never see.
+        """
+        key = (sandbox, container)
+        with self._stdin_mu:
+            if key in self._stdin_sent:
+                raise Kosa8Error(
+                    f"stdin of container {container} in {sandbox} was already sent and is closed: the daemon "
+                    "treats one write_stdin body as the whole of stdin. Pass an iterable to stream input"
+                )
+            self._stdin_sent.add(key)
         return self.transport.json(
             "POST",
             f"/kosa8/v1/sandboxes/{enc(sandbox)}/containers/{enc(container)}/stdin",
@@ -498,7 +516,7 @@ class Kosa8Client:
                 r.error = str(err)
                 if isinstance(err, Kosa8StreamError):
                     r.output = (err.stdout + err.stderr).rstrip("\n")
-                if isinstance(err, Kosa8TimeoutError) or not _TRANSIENT.search(r.error):
+                if isinstance(err, Kosa8TimeoutError) or not _TRANSIENT.search(r.error) or attempt == 3:
                     break
                 time.sleep((attempt + 1) * 0.5)
         r.duration_ms = int((time.monotonic() - start) * 1000)
@@ -511,8 +529,19 @@ class Kosa8Client:
 
         The same store ``kosa8 checkpoint`` uses; the oldest is evicted past 10.
         """
+        # Two checkpoints taken at once (here or by the CLI) can pick the same
+        # next id; the loser's snapshot is refused with 409. Pick again.
+        # The winner records its id only once its snapshot is done, so the
+        # loser steps past the taken id rather than re-reading the store.
         cid, evict = self.checkpoints.next_id(sandbox)
-        snap = self.snapshot(sandbox, id=cid, approval=approval)
+        for attempt in range(10):
+            try:
+                snap = self.snapshot(sandbox, id=cid, approval=approval)
+                break
+            except Kosa8ConflictError as err:
+                if attempt == 9 or "already exists" not in str(err.daemon_message or err):
+                    raise
+                cid = f"{sandbox}-ckpt-{_seq_of(cid, sandbox) + 1}"
         for old in evict:  # evict only once the replacement exists
             try:
                 self.delete_snapshot(old, approval=approval)
@@ -538,8 +567,9 @@ class Kosa8Client:
         try:
             restored = self.restore_snapshot(target["id"], name=sandbox, approval=approval)
         except Kosa8Error as err:
-            raise Kosa8Error(
-                f"restore failed and {sandbox} is now stopped: {err} — recover with "
+            raise Kosa8CheckpointError(
+                f"restore failed and {sandbox} no longer exists (it was deleted to free its name for the "
+                f"restore): {err} — the checkpoint is intact; recover with "
                 f"restore_snapshot({target['id']!r}, name={sandbox!r})"
             ) from err
         dropped: List[str] = []
@@ -656,6 +686,18 @@ class Sandbox:
 
     def explore(self, variants: Sequence[str], **kw: Any) -> ExploreResult:
         return self.client.explore(self.id, variants, **kw)
+
+    def exec_frames(self, container: str, args: Sequence[str], **kw: Any) -> Iterator[Dict[str, Any]]:
+        return self.client.exec_frames(self.id, container, args, **kw)
+
+    def start_interactive(self, image: str, args: Sequence[str] = (), **kw: Any) -> str:
+        return self.client.start_interactive(self.id, image, args, **kw)
+
+    def write_stdin(self, container: str, data: Any, **kw: Any) -> Dict[str, Any]:
+        return self.client.write_stdin(self.id, container, data, **kw)
+
+    def attach(self, container: str, **kw: Any) -> ExecResult:
+        return self.client.attach(self.id, container, **kw)
 
     def checkpoint(self, **kw: Any) -> Dict[str, Any]:
         return self.client.checkpoint(self.id, **kw)

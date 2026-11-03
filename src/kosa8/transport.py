@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Union
 from urllib.parse import quote, urlencode, urlsplit
 
-from .errors import Kosa8ConnectionError, Kosa8Error, Kosa8TimeoutError, error_from_response
+from .errors import Kosa8ConnectionError, Kosa8Error, Kosa8ProtocolError, Kosa8TimeoutError, error_from_response
 
 APPROVAL_HEADER = "X-Kosa8-Approval"
 ACTOR_HEADER = "X-Kosa8-Actor"
@@ -324,7 +324,15 @@ class Transport:
             for line in res.lines():
                 s = line.strip()
                 if s:
-                    yield decode_frame(s)
+                    try:
+                        frame = decode_frame(s)
+                    except (ValueError, TypeError) as err:  # JSON or base64
+                        raise Kosa8ProtocolError(
+                            f"{method} {path}: the daemon sent a frame that is not valid NDJSON ({err}): {s[:200]!r}",
+                            method=method,
+                            path=path,
+                        ) from err
+                    yield frame
         except socket.timeout as err:
             raise Kosa8TimeoutError(f"{method} {path} timed out mid-stream", method=method, path=path) from err
         finally:

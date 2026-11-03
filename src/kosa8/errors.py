@@ -106,6 +106,10 @@ class Kosa8TimeoutError(Kosa8Error):
     """A call took longer than the timeout it was given."""
 
 
+class Kosa8ProtocolError(Kosa8Error):
+    """The daemon sent a frame stream line that is not valid NDJSON."""
+
+
 def _is_refusal(v: Any) -> bool:
     return isinstance(v, dict) and isinstance(v.get("why"), str)
 

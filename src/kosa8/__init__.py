@@ -31,12 +31,13 @@ from .errors import (
     Kosa8PolicyError,
     Kosa8StreamError,
     Kosa8TimeoutError,
+    Kosa8ProtocolError,
     Kosa8UnsupportedError,
     error_from_response,
 )
 from .transport import Transport, default_socket_path, resolve_endpoint
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Kosa8Client",
@@ -64,6 +65,7 @@ __all__ = [
     "Kosa8StreamError",
     "Kosa8CheckpointError",
     "Kosa8TimeoutError",
+    "Kosa8ProtocolError",
     "error_from_response",
     "__version__",
 ]
