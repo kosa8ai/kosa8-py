@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0 — 2026-11-03
+
+The sandbox toolbox, and adapters for agent frameworks. Needs a kosa8 daemon with the
+toolbox routes (the release after v0.12.1).
+
+- **Code run:** `run_code(sandbox, code, language="python")` returns a `CodeResult` with
+  stdout, stderr, the exit code and any matplotlib charts as PNG `artifacts`.
+- **Files:** `list_files`, `stat_file`, `read_file`/`read_text`, `write_file`, `delete_file`,
+  `make_dir`, `move_file`, all in the sandbox's `/workspace`.
+- **Git:** `git(sandbox, op, ...)`, `git_clone`, `git_status`, `git_commit` (stages first).
+- **Sessions:** `shell(sandbox, command)` keeps `cd` and `export` between calls and makes the
+  session on first use; also `create_session`, `session_exec`, `list_sessions`, `delete_session`.
+- **Terminals:** `start_pty` and `resize_pty`.
+- **Previews:** `create_preview(sandbox, port)` returns a signed link that expires;
+  `revoke_previews()` ends them all.
+- **Lifecycle:** `create_sandbox` takes `auto_stop_min`, `ttl_min`, `auto_delete_min`,
+  `ephemeral` and `template`; `set_lifecycle` changes them later.
+- **Templates:** `build_template(name, context_dir)` builds a Dockerfile into a template
+  (honouring `.dockerignore`), plus `list_templates` and `delete_template`.
+- **`Sandbox`** gains `run_code`, `shell`, `list_files`, `read_file`, `read_text`,
+  `write_file`, `delete_file`, `git`, `preview` and `set_lifecycle`.
+- **Framework adapters:** `kosa8.integrations.openai_agents.sandbox_tools` (OpenAI Agents
+  SDK) and `kosa8.integrations.langchain.sandbox_tools` (LangChain, LangGraph), on
+  `kosa8.integrations.sandbox_functions`. Install with `kosa8[openai-agents]` or
+  `kosa8[langchain]`. Tool errors come back to the model as text, with the daemon's remedy.
+
 ## 0.1.1 — 2026-11-03
 
 Fixes found while writing and testing the docs at https://docs.kosa8.com/guides/py-guide/.

@@ -49,6 +49,31 @@ sb.delete()
 Checkpoints share the CLI's store (`~/.kosa8/checkpoints.json`, under the same
 `flock`), so `kosa8 rewind` sees checkpoints taken here and the other way round.
 
+## Toolbox
+
+```python
+sbx = client.sandbox("agent-1")
+r = sbx.run_code("import math; print(math.pi)")          # CodeResult: stdout, exit_code, artifacts
+sbx.shell("cd /workspace && git init demo")               # cd and export persist
+sbx.write_file("demo/app.py", "print('hi')")
+print(sbx.read_text("demo/app.py"))
+sbx.shell("cd demo && python3 -m http.server 8000 >/dev/null 2>&1 &")
+print(sbx.preview(8000)["url"])                           # signed, expiring link
+client.create_sandbox(name="scratch", ephemeral=True, auto_stop_min=15)
+```
+
+## Agent frameworks
+
+```python
+from kosa8.integrations.openai_agents import sandbox_tools   # pip install 'kosa8[openai-agents]'
+agent = Agent(name="coder", tools=sandbox_tools(client, "agent-1"))
+
+from kosa8.integrations.langchain import sandbox_tools       # pip install 'kosa8[langchain]'
+agent = create_react_agent(model, sandbox_tools(client, "agent-1"))
+```
+
+Guides: https://docs.kosa8.com/guides/py-frameworks/ and https://docs.kosa8.com/guides/py-rl-eval/.
+
 ## Connecting
 
 | Setting | Default |

@@ -18,6 +18,7 @@ from .checkpoints import (
     MemoryCheckpointStore,
 )
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
+from .toolbox import Artifact, CodeResult, GitResult, ShellResult
 from .errors import (
     Kosa8ApiError,
     Kosa8ApprovalRequiredError,
@@ -37,7 +38,7 @@ from .errors import (
 )
 from .transport import Transport, default_socket_path, resolve_endpoint
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "Kosa8Client",
@@ -45,6 +46,10 @@ __all__ = [
     "ExecResult",
     "ExploreBranch",
     "ExploreResult",
+    "CodeResult",
+    "ShellResult",
+    "GitResult",
+    "Artifact",
     "Transport",
     "default_socket_path",
     "resolve_endpoint",
