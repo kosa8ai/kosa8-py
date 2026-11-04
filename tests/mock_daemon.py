@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import socket
 import socketserver
 import tempfile
 import threading
@@ -27,8 +28,19 @@ class Recorded:
 Handler = Callable[[Recorded, BaseHTTPRequestHandler], None]
 
 
-class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
+#: Python on Windows has no unix sockets; there the mock listens on loopback
+#: TCP, which is also how the SDK reaches the WSL2 engine on Windows.
+HAVE_UNIX = hasattr(socket, "AF_UNIX")
+
+if HAVE_UNIX:
+
+    class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+else:
+
+    class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):  # type: ignore[no-redef]
+        daemon_threads = True
 
 
 class MockDaemon:
@@ -73,7 +85,13 @@ class MockDaemon:
 
             do_GET = do_POST = do_DELETE = do_PUT = _handle
 
-        self.server = _Server(self.socket_path, H)
+        if HAVE_UNIX:
+            self.server = _Server(self.socket_path, H)
+            #: Keyword arguments that point a Kosa8Client at this mock.
+            self.client_args: Dict[str, Any] = {"socket_path": self.socket_path}
+        else:
+            self.server = _Server(("127.0.0.1", 0), H)
+            self.client_args = {"host": f"http://127.0.0.1:{self.server.server_address[1]}"}
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def on(self, method: str, pattern: str, handler: Handler) -> "MockDaemon":

@@ -25,6 +25,7 @@ class Kosa8Error(Exception):
         method: Optional[str] = None,
         path: Optional[str] = None,
         body: Any = None,
+        code: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -38,6 +39,8 @@ class Kosa8Error(Exception):
         self.path = path
         #: The decoded response body, when there was one.
         self.body = body
+        #: kosa8 Cloud's stable error code (payment_required, quota_exceeded, ...).
+        self.code = code
 
 
 class Kosa8ConnectionError(Kosa8Error):
@@ -114,18 +117,33 @@ def _is_refusal(v: Any) -> bool:
     return isinstance(v, dict) and isinstance(v.get("why"), str)
 
 
+class Kosa8PaymentRequiredError(Kosa8ApiError):
+    """402: kosa8 Cloud refused new work until a payment method is on file."""
+
+
+class Kosa8RateLimitError(Kosa8ApiError):
+    """429: too many requests, or a quota reached."""
+
+
 _BY_STATUS = {
     400: Kosa8BadRequestError,
     401: Kosa8AuthError,
     403: Kosa8PolicyError,
     404: Kosa8NotFoundError,
+    402: Kosa8PaymentRequiredError,
     409: Kosa8ConflictError,
+    429: Kosa8RateLimitError,
     501: Kosa8UnsupportedError,
 }
 
 
 def error_from_response(
-    status: int, body: Any, *, method: Optional[str] = None, path: Optional[str] = None
+    status: int,
+    body: Any,
+    *,
+    method: Optional[str] = None,
+    path: Optional[str] = None,
+    code: Optional[str] = None,
 ) -> Kosa8ApiError:
     """Build the typed error for an HTTP error answer.
 
@@ -154,6 +172,7 @@ def error_from_response(
         body=body,
         method=method,
         path=path,
+        code=code,
     )
     if status == 403 and _is_refusal(approval):
         return Kosa8ApprovalRequiredError(message, approval, **kw)

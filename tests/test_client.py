@@ -29,7 +29,7 @@ def sb(name, **extra):
 class Base(unittest.TestCase):
     def setUp(self):
         self.d = MockDaemon().start()
-        self.c = Kosa8Client(socket_path=self.d.socket_path, env={}, checkpoint_store=MemoryCheckpointStore())
+        self.c = Kosa8Client(**self.d.client_args, env={}, checkpoint_store=MemoryCheckpointStore())
 
     def tearDown(self):
         self.d.stop()
@@ -47,7 +47,7 @@ class StatusTest(Base):
         c = Kosa8Client(socket_path=os.path.join(tempfile.gettempdir(), "nope-k8.sock"), env={})
         with self.assertRaises(Kosa8ConnectionError) as cm:
             c.health()
-        self.assertIn("daemon running", str(cm.exception))
+        self.assertRegex(str(cm.exception), "daemon running|wsl setup")
 
 
 class SandboxTest(Base):
@@ -246,15 +246,16 @@ class FileStoreTest(unittest.TestCase):
         [t.join() for t in ts]
         self.assertEqual(len(book.list("s2")), 20)
         self.assertEqual(book.latest("s1")["label"], "go")
-        self.assertEqual(oct(os.stat(p).st_mode & 0o777), "0o600")
+        if os.name != "nt":  # POSIX modes
+            self.assertEqual(oct(os.stat(p).st_mode & 0o777), "0o600")
         self.assertTrue(os.path.exists(p + ".lock"))
 
 
 class EndpointTest(unittest.TestCase):
     def test_default_socket(self):
-        e = resolve_endpoint(env={})
+        e = resolve_endpoint(env={}, worker_file=False)
         self.assertEqual(e.kind, "unix")
-        self.assertTrue(e.socket_path.endswith(".kosa8/run/kosa8.sock"))
+        self.assertTrue(e.socket_path.endswith(os.path.join(".kosa8", "run", "kosa8.sock")))
 
     def test_host_rules(self):
         e = resolve_endpoint(env={"KOSA8_HOST": "https://w.example.com/", "KOSA8_TOKEN": "t"})
@@ -272,6 +273,55 @@ class EndpointTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SavedWorkerTest(unittest.TestCase):
+    """The connection kosa8 wsl setup / kosa8 worker join saves, as the CLI reads it."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.file = os.path.join(self.dir, "worker.json")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def save(self, w):
+        with open(self.file, "w") as f:
+            f.write(w if isinstance(w, str) else json.dumps(w))
+
+    def test_used_when_kosa8_host_is_unset(self):
+        self.save({"host": "http://127.0.0.1:7428", "token": "saved", "via": "wsl", "distro": "Ubuntu"})
+        e = resolve_endpoint(env={}, worker_file=self.file)
+        self.assertEqual((e.kind, e.scheme, e.host, e.port, e.token), ("tcp", "http", "127.0.0.1", 7428, "saved"))
+        c = Kosa8Client(env={}, worker_file=self.file, checkpoint_store=MemoryCheckpointStore())
+        self.assertEqual(c.transport.target, "http://127.0.0.1:7428")
+
+    def test_kosa8_host_wins_and_gets_no_saved_token(self):
+        self.save({"host": "http://127.0.0.1:7428", "token": "saved"})
+        e = resolve_endpoint(env={"KOSA8_HOST": "https://w.example.com"}, worker_file=self.file)
+        self.assertEqual((e.host, e.token), ("w.example.com", None))
+
+    def test_skipped_for_socket_bad_file_blank_host(self):
+        self.save({"host": "http://127.0.0.1:7428"})
+        self.assertEqual(resolve_endpoint(env={}, socket_path="/s.sock", worker_file=self.file).socket_path, "/s.sock")
+        self.save("{not json")
+        self.assertEqual(resolve_endpoint(env={}, worker_file=self.file).kind, "unix")
+        self.save({"host": "  ", "token": "t"})
+        self.assertEqual(resolve_endpoint(env={}, worker_file=self.file).kind, "unix")
+        self.assertEqual(resolve_endpoint(env={}, worker_file=os.path.join(self.dir, "missing.json")).kind, "unix")
+
+    def test_plain_http_to_lan_only_when_paired_insecure(self):
+        self.save({"host": "10.1.2.3:7428", "token": "t"})
+        with self.assertRaisesRegex(Kosa8Error, "plain http"):
+            resolve_endpoint(env={}, worker_file=self.file)
+        self.save({"host": "10.1.2.3:7428", "token": "t", "insecure": True})
+        self.assertEqual(resolve_endpoint(env={}, worker_file=self.file).kind, "tcp")
+
+    def test_explicit_token_wins(self):
+        self.save({"host": "https://w.example.com", "token": "saved"})
+        self.assertEqual(resolve_endpoint(env={}, worker_file=self.file, token="mine").token, "mine")
 
 
 class FixesTest(Base):
@@ -320,6 +370,7 @@ class FixesTest(Base):
         with self.assertRaises(Kosa8ConflictError):
             self.c.checkpoint("s")
 
+    @unittest.skipIf(os.name == "nt", "fork and flock are POSIX")
     def test_file_lock_times_out(self):
         import fcntl
 

@@ -17,6 +17,7 @@ from .checkpoints import (
     FileCheckpointStore,
     MemoryCheckpointStore,
 )
+from .cloud import CloudExecResult, CloudFunctions, CloudSandbox, CloudSandboxes, Kosa8Cloud
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
 from .toolbox import Artifact, CodeResult, GitResult, ShellResult
 from .errors import (
@@ -29,19 +30,28 @@ from .errors import (
     Kosa8ConnectionError,
     Kosa8Error,
     Kosa8NotFoundError,
+    Kosa8PaymentRequiredError,
     Kosa8PolicyError,
+    Kosa8RateLimitError,
     Kosa8StreamError,
     Kosa8TimeoutError,
     Kosa8ProtocolError,
     Kosa8UnsupportedError,
     error_from_response,
 )
-from .transport import Transport, default_socket_path, resolve_endpoint
+from .transport import Transport, default_socket_path, default_worker_file, resolve_endpoint
 
 __version__ = "0.2.0"
 
 __all__ = [
     "Kosa8Client",
+    "Kosa8Cloud",
+    "CloudSandbox",
+    "CloudSandboxes",
+    "CloudFunctions",
+    "CloudExecResult",
+    "Kosa8PaymentRequiredError",
+    "Kosa8RateLimitError",
     "Sandbox",
     "ExecResult",
     "ExploreBranch",
@@ -52,6 +62,7 @@ __all__ = [
     "Artifact",
     "Transport",
     "default_socket_path",
+    "default_worker_file",
     "resolve_endpoint",
     "CheckpointBook",
     "FileCheckpointStore",
