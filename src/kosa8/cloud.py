@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from .errors import Kosa8ConnectionError, Kosa8Error, Kosa8TimeoutError, error_from_response
 
-DEFAULT_CLOUD_URL = "https://api.kosa8.cloud"
+DEFAULT_CLOUD_URL = "https://api.kosa8.com"
 CLOUD_KEY_PREFIX = "k8c_live_"
 
 #: (method, url, headers, body bytes or None, timeout) -> (status, body bytes)

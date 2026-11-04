@@ -34,7 +34,7 @@ class Stub:
 class CloudTest(unittest.TestCase):
     def test_key_and_address(self):
         c = Kosa8Cloud(env={"KOSA8_API_KEY": KEY})
-        self.assertEqual(c.base_url, "https://api.kosa8.cloud")
+        self.assertEqual(c.base_url, "https://api.kosa8.com")
         self.assertNotIn(KEY, repr(c))
         with self.assertRaisesRegex(Kosa8Error, "KOSA8_API_KEY"):
             Kosa8Cloud(env={})
