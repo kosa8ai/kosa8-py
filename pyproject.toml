@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kosa8"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client for the kosa8 native API: microVM sandboxes for AI agents, with checkpoint, rewind, fork and explore."
 readme = "README.md"
 license = { text = "MIT" }

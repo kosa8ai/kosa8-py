@@ -41,7 +41,7 @@ from .errors import (
 )
 from .transport import Transport, default_socket_path, default_worker_file, resolve_endpoint
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Kosa8Client",
