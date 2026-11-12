@@ -118,11 +118,56 @@ def _is_refusal(v: Any) -> bool:
 
 
 class Kosa8PaymentRequiredError(Kosa8ApiError):
-    """402: kosa8 Cloud refused new work until a payment method is on file."""
+    """402: kosa8 Cloud refused new work: no payment method on file
+    (``payment_required``), the spending cap is reached
+    (``spending_cap_reached``), or a paid Store item's price was not accepted.
+
+    ``upgrade_url`` is where the person adds a payment method or credit, and
+    ``agent_message`` a sentence an AI agent should relay to its person word
+    for word (stop, don't retry). Both are ``None`` when the cloud sent none.
+    """
+
+    @property
+    def upgrade_url(self) -> Optional[str]:
+        return _body_str(self.body, "upgrade_url")
+
+    @property
+    def agent_message(self) -> Optional[str]:
+        return _body_str(self.body, "agent_message")
+
+
+class Kosa8OrgFrozenError(Kosa8ApiError):
+    """423 ``org_frozen``: the organization is frozen in the Security Center.
+
+    New sandboxes, commands, wakes and function calls are refused until an
+    owner or admin unfreezes it. Retrying does not help.
+    """
 
 
 class Kosa8RateLimitError(Kosa8ApiError):
-    """429: too many requests, or a quota reached."""
+    """429: too many requests, or a quota reached (``quota_exceeded``).
+
+    ``retry_after`` is the server's Retry-After in seconds, when it sent one.
+    """
+
+    retry_after: Optional[float] = None
+
+
+class Kosa8ExecTimeoutError(Kosa8ApiError, Kosa8TimeoutError):
+    """A kosa8 Cloud exec ran past the API's limit for a buffered command.
+
+    Today a buffered exec is cut off after about 30 seconds (HTTP 502
+    ``host_failed`` "timed out"; later servers answer 504 ``exec_timeout``).
+    Run long work in the background, writing to /workspace, and poll it::
+
+        box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1' &")
+    """
+
+
+def _body_str(body: Any, key: str) -> Optional[str]:
+    if isinstance(body, dict) and isinstance(body.get(key), str) and body[key]:
+        return body[key]
+    return None
 
 
 _BY_STATUS = {
@@ -132,6 +177,7 @@ _BY_STATUS = {
     404: Kosa8NotFoundError,
     402: Kosa8PaymentRequiredError,
     409: Kosa8ConflictError,
+    423: Kosa8OrgFrozenError,
     429: Kosa8RateLimitError,
     501: Kosa8UnsupportedError,
 }

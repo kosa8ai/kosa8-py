@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — 2026-11-12
+
+kosa8 Cloud parity: the Cloud client now reaches the whole sandbox API.
+
+- **Address:** the default is `https://api.kosa8.com`, now pinned by a test. Do not use 0.3.0, which defaulted to `api.kosa8.cloud`, a domain kosa8 does not use.
+- **Lifetime:** `cloud.sandboxes.create` takes `ttl_s` (60 s to 90 days, checked before sending), `delete_after` (Unix ms) and `accept_price` (paid Store items). New `CloudSandbox.update(ttl_s=, delete_after=, sleep_after_s=, clear_lifetime=)` (PATCH).
+- **Paging:** `cloud.sandboxes.list` takes `limit` and `cursor`; new `list_page()` returns a `CloudSandboxPage` with `next_cursor`, and `iter()` walks every page. A server that does not page yet answers everything in one page, which works the same.
+- **Files:** `box.files.read`, `read_text`, `write`, `list`, `mkdir`, `delete(recursive=)` (at most 8 MiB a file).
+- **Checkpoints and fork:** `box.checkpoint(label)`, `box.checkpoints()`, `box.rewind(checkpoint_id)` (returns a `CloudRewindResult` with the automatic `backup`), `box.fork(n)` and `box.ports()`. Files, checkpoints, fork and ports need the host's data plane: on a host without it they raise `Kosa8UnsupportedError` (501).
+- `cloud.templates()`.
+- **Errors:** `Kosa8PaymentRequiredError` exposes `upgrade_url` and `agent_message`. New `Kosa8OrgFrozenError` (423 `org_frozen`) and `Kosa8ExecTimeoutError` (504 `exec_timeout`, or today's 502 "timed out" after about 30 s; also a `Kosa8TimeoutError`). `Kosa8RateLimitError.retry_after` when the server sends Retry-After. An opener may now return `(status, body, headers)`.
+- README: Cloud quickstart first; how Cloud sandboxes run commands (Alpine `base`, fresh container per exec, only `/workspace` persists, the 30 s exec limit, 64 KiB bodies); the LangChain example uses `langchain.agents.create_agent`.
+
 ## 0.3.1 — 2026-11-03
 
 - The default kosa8 Cloud address is now `https://api.kosa8.com` (0.3.0 defaulted to `api.kosa8.cloud`, which kosa8 Cloud does not use). `KOSA8_CLOUD_URL` still overrides it.
