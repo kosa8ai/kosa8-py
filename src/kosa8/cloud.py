@@ -15,8 +15,8 @@ Errors are the SDK's usual typed errors; each carries the cloud's stable
 
 How the cloud runs commands: each ``exec`` runs in a fresh container, and only
 ``/workspace`` persists between them. The ``base`` template is Alpine Linux
-(busybox ``sh``; no bash, python or git). A buffered exec is cut off after
-about 30 seconds (:class:`~kosa8.Kosa8ExecTimeoutError`), and a request body
+(busybox ``sh``; no bash, python or git). A buffered exec runs at most
+90 seconds (:class:`~kosa8.Kosa8ExecTimeoutError`), and a request body
 is at most 64 KiB.
 
 Standard library only, like the rest of the SDK.
@@ -67,8 +67,8 @@ MAX_TTL_S = 7776000
 MAX_SLEEP_AFTER_S = 604800
 #: A fork makes from 1 to 100 copies.
 MAX_FORK = 100
-#: The limit kosa8 Cloud puts on a buffered exec today, in seconds.
-EXEC_LIMIT_S = 30
+#: The limit kosa8 Cloud puts on a buffered exec, in seconds (504 exec_timeout past it).
+EXEC_LIMIT_S = 90
 #: vCPU x GiB sizes a sized create takes.
 CLOUD_SIZES = ("2x4", "4x8", "8x16", "16x32")
 #: States a booting sandbox does not leave on its own.
@@ -79,7 +79,7 @@ _SETTLED = frozenset({"running", "error", "deleted", "stopped", "host_removed", 
 Opener = Callable[[str, str, Dict[str, str], Optional[bytes], float], Any]
 
 _EXEC_HINT = (
-    f"a buffered exec is limited to about {EXEC_LIMIT_S} s; run long work in the background, "
+    f"a buffered exec is stopped after {EXEC_LIMIT_S} s; run long work in the background, "
     "writing to /workspace, and poll it"
 )
 
@@ -264,7 +264,7 @@ def _header(headers: Mapping[str, str], name: str) -> Optional[str]:
 def _is_exec_timeout(status: int, code: Optional[str], message: str, path: str) -> bool:
     if status == 504 or code == "exec_timeout":
         return True
-    # Today the Worker gives up on the host after about 30 s and answers
+    # Older Workers gave up on the host before the 90 s limit and answered
     # 502 host_failed "exec failed on the host: ... timed out".
     return status == 502 and _is_exec_path(path) and "timed out" in message.lower()
 
@@ -543,7 +543,7 @@ class CloudSandbox:
 
         Each exec runs in a fresh container: only ``/workspace`` persists, so
         ``cd``, ``export`` and packages installed elsewhere are gone by the
-        next one. kosa8 Cloud cuts a buffered exec off after about 30 s, and
+        next one. kosa8 Cloud stops a buffered exec after 90 s, and
         this raises :class:`~kosa8.Kosa8ExecTimeoutError`; run long work in
         the background (``nohup sh -c '...' > /workspace/job.log 2>&1 &``) and
         poll it. The request (command and env) is at most 64 KiB.

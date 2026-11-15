@@ -156,8 +156,8 @@ class Kosa8RateLimitError(Kosa8ApiError):
 class Kosa8ExecTimeoutError(Kosa8ApiError, Kosa8TimeoutError):
     """A kosa8 Cloud exec ran past the API's limit for a buffered command.
 
-    Today a buffered exec is cut off after about 30 seconds (HTTP 502
-    ``host_failed`` "timed out"; later servers answer 504 ``exec_timeout``).
+    A buffered exec runs at most 90 seconds; past that the API stops it and
+    answers 504 ``exec_timeout`` (older servers: HTTP 502 ``host_failed`` "timed out").
     Run long work in the background, writing to /workspace, and poll it::
 
         box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1' &")
