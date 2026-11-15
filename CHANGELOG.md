@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 The rest of the kosa8 Cloud API, and a fix that makes the Cloud client work at all.
 
 - **Fix:** every Cloud request now sends `User-Agent: kosa8-python/<version>`. The API's edge refuses Python-urllib's default User-Agent with a bare 403 (Cloudflare error 1010), which 0.4.0 raised as `Kosa8PolicyError` on every call.
@@ -13,7 +11,7 @@ The rest of the kosa8 Cloud API, and a fix that makes the Cloud client work at a
 - **Secrets:** `cloud.secrets.set|list|delete` (a value goes in a body only, never comes back).
 - **Pipelines:** `cloud.pipelines.run|list|get|logs|cancel|artifacts|download_artifact|wait`, `cloud.pipelines.hooks.create|list|delete`.
 
-## 0.4.0 — 2026-11-12
+## 0.4.0 — 2026-11-15
 
 kosa8 Cloud parity: the Cloud client now reaches the whole sandbox API.
 
