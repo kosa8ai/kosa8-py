@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+The rest of the kosa8 Cloud API, and a fix that makes the Cloud client work at all.
+
+- **Fix:** every Cloud request now sends `User-Agent: kosa8-python/<version>`. The API's edge refuses Python-urllib's default User-Agent with a bare 403 (Cloudflare error 1010), which 0.4.0 raised as `Kosa8PolicyError` on every call.
+
+- **Sized and Docker creates:** `cloud.sandboxes.create` takes `size` (`CLOUD_SIZES`), `cpus` + `mem_mb`, `image`, `disk_gb`, `persistent`, `docker`, `cpu="dedicated"`, `name`, `env`, `egress`, `secrets`, `labels` and `snapshot`, and waits for a cold boot (`wait=False` to skip; `box.wait_until_running()`). Conflicting options raise `ValueError` before any request. `list()` takes `name` and `labels`.
+- **Background commands:** `box.exec_background(cmd)` → `CloudBackgroundExec` with `status()` and `wait()`; `box.get_exec(id)`.
+- **Snapshots:** `box.snapshot(name)`, `cloud.snapshots.create|list|get|delete`.
+- **More of a sandbox:** `box.previews` (create, list, link, rotate, delete), `box.terminal()`, `box.run_code()` and `box.code_contexts`, `box.files.read_raw|write_raw|link`, `box.egress|set_egress|reset_egress`, `box.schedules`, `box.set_labels|metrics|logs|secrets`; `cloud.egress_presets|org_egress|set_org_egress|capabilities`.
+- **Secrets:** `cloud.secrets.set|list|delete` (a value goes in a body only, never comes back).
+- **Pipelines:** `cloud.pipelines.run|list|get|logs|cancel|artifacts|download_artifact|wait`, `cloud.pipelines.hooks.create|list|delete`.
+
 ## 0.4.0 — 2026-11-12
 
 kosa8 Cloud parity: the Cloud client now reaches the whole sandbox API.

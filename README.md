@@ -69,6 +69,69 @@ out = cloud.functions.invoke("hello", {"name": "kosa8"})
 print(out["ok"], out["result"])  # True {'hello': 'kosa8'}
 ```
 
+### Sized and Docker sandboxes, env, background commands, snapshots
+
+```python
+# 4 vCPU / 8 GiB, Ubuntu with common toolchains, its own Docker engine and env.
+box = cloud.sandboxes.create(
+    size="4x8",                                       # 2x4, 4x8, 8x16 or 16x32 (CLOUD_SIZES)
+    image="kosa8-template/universal-24.04-20261115.2",
+    docker=True,                                      # implies persistent
+    env={"NODE_ENV": "production"},                   # every command gets it; never logged
+    name="web-1", labels={"team": "web"}, ttl_s=3600,
+)                                                     # a cold boot is waited for (wait=False to skip)
+
+job = box.exec_background("dockerd > /var/log/dockerd.log 2>&1 & sleep 3; docker run --rm hello-world")
+done = job.wait()                                     # or job.status() to poll yourself
+print(done["exit"], done["output"])
+
+snap = box.snapshot("web-ready")                      # durable: memory, processes and disk
+copy = cloud.sandboxes.create(snapshot=snap["id"], ttl_s=600)
+cloud.snapshots.list(); cloud.snapshots.delete(snap["id"])
+cloud.sandboxes.list(name="web-1", labels={"team": "web"})
+```
+
+`cpu="dedicated"` gives whole physical cores; `disk_gb` is 8 to 200; `region` takes `us-ash1`, `eu-hel1`, `us` or `eu`; `egress={...}` and `secrets=[...]` set its network policy and the secrets it holds at boot. A create from a `snapshot` takes the snapshot's template, size and image, so those options are refused before any request.
+
+### Previews, terminal, code interpreter, egress, schedules
+
+```python
+box.exec_background("python3 -m http.server 3000")
+print(box.previews.create(3000)["url"])               # private signed link on kosa8labs.com
+box.previews.create(8080, public=True, wake=True)
+box.previews.list(); box.previews.link(3000, expires_in_s=600); box.previews.rotate(3000); box.previews.delete(3000)
+
+print(box.terminal(cols=120, rows=32)["url"])         # wss:// URL for a PTY WebSocket
+r = box.run_code("import math; math.pi")              # stateful Python; charts come back as image/png
+box.code_contexts.create("nb"); box.code_contexts.reset("nb")
+
+box.set_egress(internet=False, presets=["pypi"], allow=["api.example.com"])
+box.reset_egress(); cloud.egress_presets(); cloud.set_org_egress({"internet": False}, enforce=True)
+
+box.schedules.create("0 * * * *", "date >> /workspace/hourly.log", wake=True)
+box.files.write_raw("/workspace/big.bin", data)       # no 8 MiB cap; read_raw too
+box.files.link("/workspace/big.bin")                  # presigned URL for curl, 10-300 s
+box.metrics(); box.logs(limit=20); box.secrets(); box.set_labels({"team": "ml"})
+cloud.capabilities()                                  # feature detection
+```
+
+### Secrets and Pipelines
+
+```python
+# The value goes in one request body and never comes back; sandboxes hold a placeholder.
+cloud.secrets.set("OPENAI", os.environ["OPENAI_API_KEY"], upstream="api.openai.com", pipelines=True)
+box = cloud.sandboxes.create(secrets=["OPENAI"])
+cloud.secrets.list(); cloud.secrets.delete("OPENAI")
+
+run = cloud.pipelines.run("https://github.com/me/app", ref="main", size="4x8", secrets=["NPM_TOKEN"])
+done = cloud.pipelines.wait(run["id"])                # success, failure, cancelled or error
+print(cloud.pipelines.logs(run["id"])["logs"][0]["text"])
+for a in cloud.pipelines.artifacts(run["id"]):
+    tgz = cloud.pipelines.download_artifact(run["id"], a["job"], a["idx"])
+hook = cloud.pipelines.hooks.create("https://github.com/me/app", provider="github", cron="0 3 * * *")
+print(hook["url"], hook["secret"])                    # give both to the repository's webhook settings
+```
+
 ### How Cloud sandboxes run commands
 
 - The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`,

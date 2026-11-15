@@ -27,6 +27,18 @@ from .cloud import (
     CloudSandboxes,
     CloudSandboxPage,
     Kosa8Cloud,
+    CLOUD_SIZES,
+)
+from .cloud_features import (
+    CloudBackgroundExec,
+    CloudCodeContexts,
+    CloudPipelineHooks,
+    CloudPipelines,
+    CloudPreviews,
+    CloudSchedules,
+    CloudSecrets,
+    CloudSnapshots,
+    pipeline_run_done,
 )
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
 from .toolbox import Artifact, CodeResult, GitResult, ShellResult
@@ -65,6 +77,16 @@ __all__ = [
     "CloudFiles",
     "CloudRewindResult",
     "CloudSandboxPage",
+    "CLOUD_SIZES",
+    "CloudBackgroundExec",
+    "CloudSnapshots",
+    "CloudPreviews",
+    "CloudSecrets",
+    "CloudSchedules",
+    "CloudCodeContexts",
+    "CloudPipelines",
+    "CloudPipelineHooks",
+    "pipeline_run_done",
     "DEFAULT_CLOUD_URL",
     "Kosa8PaymentRequiredError",
     "Kosa8RateLimitError",
