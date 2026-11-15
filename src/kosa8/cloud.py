@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,9 +42,23 @@ from .errors import (
     Kosa8TimeoutError,
     error_from_response,
 )
+from .cloud_features import (
+    CloudBackgroundExec,
+    CloudCodeContexts,
+    CloudPipelines,
+    CloudPreviews,
+    CloudSchedules,
+    CloudSecrets,
+    CloudSnapshots,
+    argv_of,
+    env_list,
+)
 
 DEFAULT_CLOUD_URL = "https://api.kosa8.com"
 CLOUD_KEY_PREFIX = "k8c_live_"
+#: Sent with every Cloud request: the API's edge refuses Python-urllib's
+#: default User-Agent (Cloudflare error 1010, a bare 403).
+USER_AGENT = "kosa8-python/0.4.0"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
@@ -54,6 +69,10 @@ MAX_SLEEP_AFTER_S = 604800
 MAX_FORK = 100
 #: The limit kosa8 Cloud puts on a buffered exec today, in seconds.
 EXEC_LIMIT_S = 30
+#: vCPU x GiB sizes a sized create takes.
+CLOUD_SIZES = ("2x4", "4x8", "8x16", "16x32")
+#: States a booting sandbox does not leave on its own.
+_SETTLED = frozenset({"running", "error", "deleted", "stopped", "host_removed", "host_lost", "sleeping", "paused"})
 
 #: (method, url, headers, body bytes or None, timeout) -> (status, body bytes),
 #: or (status, body bytes, response headers).
@@ -140,6 +159,12 @@ class Kosa8Cloud:
         self._open = opener or _urllib_open
         self.sandboxes = CloudSandboxes(self)
         self.functions = CloudFunctions(self)
+        #: Durable snapshots.
+        self.snapshots = CloudSnapshots(self)
+        #: Org secrets (values go in, never come out).
+        self.secrets = CloudSecrets(self)
+        #: CI runs, logs, artifacts and triggers.
+        self.pipelines = CloudPipelines(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -156,6 +181,27 @@ class Kosa8Cloud:
         """The templates the org can start: ``key``, ``cpus``, ``mem_mb``, ``image``, ``regions``, ``warm``."""
         return (self._request("GET", "/v1/templates") or {}).get("templates", [])
 
+    def capabilities(self) -> Dict[str, Any]:
+        """What this API offers, for feature detection."""
+        return self._request("GET", "/v1/capabilities") or {}
+
+    def egress_presets(self) -> Dict[str, Any]:
+        """Named egress presets (e.g. ``pypi``, ``npm``) and the hosts each allows."""
+        return (self._request("GET", "/v1/egress/presets") or {}).get("presets", {})
+
+    def org_egress(self) -> Optional[Dict[str, Any]]:
+        """The org's default egress policy (``default``, ``enforce``), or ``None`` (open internet)."""
+        return (self._request("GET", "/v1/org/egress") or {}).get("egress")
+
+    def set_org_egress(self, policy: Optional[Mapping[str, Any]], *, enforce: Optional[bool] = None) -> Dict[str, Any]:
+        """Set the org's default egress policy (an admin key); ``None`` clears it.
+        It is pushed at once to the running and sleeping sandboxes it changes;
+        with ``enforce`` it is a ceiling sandboxes cannot widen."""
+        body: Dict[str, Any] = {"default": dict(policy) if policy is not None else None}
+        if policy is not None and enforce is not None:
+            body["enforce"] = enforce
+        return self._request("PUT", "/v1/org/egress", body)
+
     def _request(
         self,
         method: str,
@@ -170,6 +216,7 @@ class Kosa8Cloud:
         headers = {
             "Authorization": f"Bearer {self._key}",
             "Accept": "application/octet-stream" if raw else "application/json",
+            "User-Agent": USER_AGENT,
         }
         payload = None
         if data is not None:
@@ -286,8 +333,37 @@ class CloudSandboxes:
         ttl_s: Optional[int] = None,
         delete_after: Optional[int] = None,
         accept_price: Optional[float] = None,
+        size: Optional[str] = None,
+        cpus: Optional[int] = None,
+        mem_mb: Optional[int] = None,
+        image: Optional[str] = None,
+        disk_gb: Optional[int] = None,
+        persistent: Optional[bool] = None,
+        docker: Optional[bool] = None,
+        cpu: Optional[str] = None,
+        name: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+        snapshot: Optional[Union[str, Mapping[str, Any]]] = None,
+        egress: Optional[Mapping[str, Any]] = None,
+        secrets: Optional[Sequence[str]] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        wait: bool = True,
+        wait_timeout: float = 300.0,
     ) -> "CloudSandbox":
         """Start a sandbox; returns once it is running.
+
+        Sized and Docker sandboxes: ``size`` (``2x4``, ``4x8``, ``8x16`` or
+        ``16x32``) or ``cpus`` + ``mem_mb``, ``image`` (an OCI image such as
+        ``kosa8-template/universal-24.04-20261115.2``), ``disk_gb`` (8 to 200)
+        boot cold at that size (the API answers ``creating``; this polls until
+        it is running unless ``wait=False``). ``docker=True`` runs a Docker
+        engine in it and makes it ``persistent`` (one long-lived container).
+        ``cpu="dedicated"`` gives whole physical cores. ``env`` is given to
+        every command (values are never logged or returned). ``snapshot``
+        (``snap_...`` or a snapshot dict) starts it as the snapshot was; it
+        then takes no template, size, image, disk, docker, persistent, cpu or
+        region. ``egress`` is its starting network policy, ``secrets`` names
+        org secrets it holds, ``labels`` are set right after it is created.
 
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
@@ -313,8 +389,43 @@ class CloudSandboxes:
             body["delete_after"] = delete_after
         if accept_price is not None:
             body["accept_price"] = accept_price
+        if snapshot is not None:
+            clash = [k for k, v in (
+                ("template", template), ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image),
+                ("disk_gb", disk_gb), ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("region", region),
+            ) if v is not None]
+            if clash:
+                raise ValueError(
+                    "a sandbox made from a snapshot takes its settings from the snapshot; leave out " + ", ".join(clash)
+                )
+            body["snapshot"] = snapshot if isinstance(snapshot, str) else snapshot["id"]
+        if (cpus is None) != (mem_mb is None):
+            raise ValueError("give cpus and mem_mb together")
+        if size is not None and cpus is not None:
+            raise ValueError("give size or cpus + mem_mb, not both")
+        if disk_gb is not None and (not _is_int(disk_gb) or not 8 <= disk_gb <= 200):
+            raise ValueError("disk_gb must be a whole number from 8 to 200")
+        if docker and persistent is False:
+            raise ValueError("a sandbox with docker is persistent; leave out persistent or set it to True")
+        for k, v in (
+            ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image), ("disk_gb", disk_gb),
+            ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name),
+        ):
+            if v is not None:
+                body[k] = v
+        if env is not None:
+            body["env"] = dict(env)
+        if egress is not None:
+            body["egress"] = dict(egress)
+        if secrets is not None:
+            body["secrets"] = list(secrets)
         r = self._cloud._request("POST", "/v1/sandboxes", body)
-        return CloudSandbox(self._cloud, r["sandbox"])
+        box = CloudSandbox(self._cloud, r["sandbox"])
+        if wait and box.state not in _SETTLED:
+            box.wait_until_running(timeout=wait_timeout)
+        if labels is not None:
+            box.set_labels(labels)
+        return box
 
     def list(  # noqa: A003
         self,
@@ -322,13 +433,15 @@ class CloudSandboxes:
         all: bool = False,  # noqa: A002 (the API's name)
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
+        name: Optional[str] = None,
+        labels: Optional[Mapping[str, Union[str, bool]]] = None,
     ) -> List["CloudSandbox"]:
         """The org's sandboxes, newest first; with ``all``, deleted ones too.
 
         With ``limit`` or ``cursor`` this is one page: :meth:`list_page` also
         gives the next cursor, and :meth:`iter` walks every page.
         """
-        return self.list_page(all=all, limit=limit, cursor=cursor).sandboxes
+        return self.list_page(all=all, limit=limit, cursor=cursor, name=name, labels=labels).sandboxes
 
     def list_page(
         self,
@@ -336,17 +449,27 @@ class CloudSandboxes:
         all: bool = False,  # noqa: A002
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
+        name: Optional[str] = None,
+        labels: Optional[Mapping[str, Union[str, bool]]] = None,
     ) -> CloudSandboxPage:
-        """One page of sandboxes and the cursor of the next (``None`` at the end)."""
-        q: Dict[str, str] = {}
+        """One page of sandboxes and the cursor of the next (``None`` at the end).
+
+        ``name`` finds a sandbox by its name; ``labels`` (``{"team": "ml",
+        "gpu": True}``) keeps only those with every label (``True``: any value).
+        """
+        q: List[tuple] = []
         if all:
-            q["all"] = "1"
+            q.append(("all", "1"))
         if limit is not None:
             if not _is_int(limit) or limit < 1:
                 raise ValueError("limit must be a positive whole number")
-            q["limit"] = str(limit)
+            q.append(("limit", str(limit)))
         if cursor:
-            q["cursor"] = cursor
+            q.append(("cursor", cursor))
+        if name is not None:
+            q.append(("name", name))
+        for k, v in (labels or {}).items():
+            q.append(("label", k if v is True else f"{k}={v}"))
         path = "/v1/sandboxes" + ("?" + urllib.parse.urlencode(q) if q else "")
         r = self._cloud._request("GET", path) or {}
         nxt = r.get("next_cursor")
@@ -540,6 +663,142 @@ class CloudSandbox:
         """
         return (self._cloud._request("GET", self._path("/ports")) or {}).get("ports", [])
 
+    def wait_until_running(self, *, timeout: float = 300.0, interval: float = 1.0) -> "CloudSandbox":
+        """Poll while it boots (``creating``); raises if it ends in ``error``
+        (with its ``last_error``) or the time runs out."""
+        deadline = time.monotonic() + timeout
+        while self.state not in _SETTLED:
+            if time.monotonic() + interval > deadline:
+                raise Kosa8TimeoutError(f"sandbox {self.id} still {self.state} after {timeout} s")
+            time.sleep(interval)
+            self.refresh()
+        if self.state == "error":
+            raise Kosa8Error(f"sandbox {self.id} failed to start: {self.info.get('last_error') or 'no reason given'}")
+        return self
+
+    def exec_background(
+        self,
+        cmd: Union[str, Sequence[str]],
+        *,
+        image: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> CloudBackgroundExec:
+        """Start a command that keeps running after this returns; read it
+        with ``.status()`` or wait for it with ``.wait()``::
+
+            job = box.exec_background("npm run build")
+            done = job.wait()
+            print(done["exit"], done["output"])
+        """
+        body: Dict[str, Any] = {"cmd": argv_of(cmd), "background": True}
+        if image is not None:
+            body["image"] = image
+        el = env_list(env)
+        if el:
+            body["env"] = el
+        r = self._cloud._request("POST", self._path("/exec"), body)
+        return CloudBackgroundExec(self._cloud, self._path(), r["exec"])
+
+    def get_exec(self, exec_id: str) -> CloudBackgroundExec:
+        """A background command by id (``bg_...``)."""
+        job = CloudBackgroundExec(self._cloud, self._path(), {"id": exec_id, "state": "running"})
+        job.status()
+        return job
+
+    def snapshot(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """Save it as a durable snapshot (memory, processes and disk), kept
+        until deleted whatever happens to the sandbox. Start copies with
+        ``cloud.sandboxes.create(snapshot=snap["id"])``."""
+        body = {"name": name} if name is not None else {}
+        return self._cloud._request("POST", self._path("/snapshots"), body)["snapshot"]
+
+    @property
+    def previews(self) -> CloudPreviews:
+        """Its ports at https URLs: ``box.previews.create(3000)["url"]``."""
+        return CloudPreviews(self._cloud, self._path())
+
+    @property
+    def schedules(self) -> CloudSchedules:
+        """Commands it runs on a cron schedule."""
+        return CloudSchedules(self._cloud, self._path())
+
+    @property
+    def code_contexts(self) -> CloudCodeContexts:
+        """Its code-interpreter contexts."""
+        return CloudCodeContexts(self._cloud, self._path())
+
+    def run_code(
+        self, code: str, *, context: Optional[str] = None, language: Optional[str] = None, timeout_s: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Run a Python cell in a stateful context (globals persist between
+        calls). Answers ``results`` (text, ``image/png`` charts, ...),
+        ``stdout``, ``stderr`` and ``error`` when it raised."""
+        body: Dict[str, Any] = {"code": code}
+        if context is not None:
+            body["context"] = context
+        if language is not None:
+            body["language"] = language
+        if timeout_s is not None:
+            body["timeout_s"] = timeout_s
+        return self._cloud._request("POST", self._path("/code"), body)
+
+    def terminal(
+        self, *, cols: Optional[int] = None, rows: Optional[int] = None, command: Optional[Sequence[str]] = None
+    ) -> Dict[str, Any]:
+        """A ``wss://`` URL for an interactive terminal (PTY): ``url``, ``expires_at``, ``protocol``."""
+        body: Dict[str, Any] = {}
+        if cols is not None:
+            body["cols"] = cols
+        if rows is not None:
+            body["rows"] = rows
+        if command is not None:
+            body["command"] = list(command)
+        return self._cloud._request("POST", self._path("/terminal"), body)["terminal"]
+
+    def egress(self) -> Dict[str, Any]:
+        """The egress policy it runs with."""
+        return self._cloud._request("GET", self._path("/egress"))["egress"]
+
+    def set_egress(
+        self,
+        *,
+        internet: Optional[bool] = None,
+        allow: Optional[Sequence[str]] = None,
+        deny: Optional[Sequence[str]] = None,
+        presets: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Change what it may reach, at once (a sleeping sandbox when it wakes)."""
+        body: Dict[str, Any] = {}
+        if internet is not None:
+            body["internet"] = internet
+        for k, v in (("allow", allow), ("deny", deny), ("presets", presets)):
+            if v is not None:
+                body[k] = list(v)
+        return self._cloud._request("PUT", self._path("/egress"), body)["egress"]
+
+    def reset_egress(self) -> Dict[str, Any]:
+        """Back to the organization's default egress policy."""
+        return self._cloud._request("DELETE", self._path("/egress"))["egress"]
+
+    def secrets(self) -> List[str]:
+        """Names of the org secrets it holds (never values)."""
+        return (self._cloud._request("GET", self._path("/secrets")) or {}).get("secrets", [])
+
+    def set_labels(self, labels: Mapping[str, str]) -> Dict[str, str]:
+        """Replace its labels (up to 16); ``{}`` clears them."""
+        r = self._cloud._request("PUT", self._path("/labels"), {"labels": dict(labels)}) or {}
+        self.info = {**self.info, "labels": r.get("labels", {})}
+        return r.get("labels", {})
+
+    def metrics(self) -> Dict[str, Any]:
+        """CPU, memory, disk and network use, read on the host."""
+        return self._cloud._request("GET", self._path("/metrics"))["metrics"]
+
+    def logs(self, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Its last commands, with exit codes and output tails."""
+        q = f"?limit={int(limit)}" if limit is not None else ""
+        return (self._cloud._request("GET", self._path(f"/logs{q}")) or {}).get("entries", [])
+
 
 class CloudFiles:
     """Files in a cloud sandbox, at most 8 MiB each. Paths are absolute, such
@@ -579,6 +838,33 @@ class CloudFiles:
         if not path:
             raise ValueError("a path is required, e.g. /workspace/data")
         return (self._sb._cloud._request("POST", self._sb._path("/files/mkdir"), {"path": path}) or {}).get("file", {})
+
+    def read_raw(self, path: str) -> bytes:
+        """The file's bytes with no 8 MiB cap (the streamed endpoint)."""
+        return self._sb._cloud._request("GET", self._q("/files/raw", path), raw=True)
+
+    def write_raw(self, path: str, content: Union[bytes, str], encoding: str = "utf-8") -> Dict[str, Any]:
+        """Create or replace a file with no 8 MiB cap (the streamed endpoint)."""
+        data = content.encode(encoding) if isinstance(content, str) else bytes(content)
+        r = self._sb._cloud._request("PUT", self._q("/files/raw", path), data=data)
+        return (r or {}).get("file", {}) if isinstance(r, dict) else {}
+
+    def link(self, path: str, *, method: Optional[str] = None, ttl_s: Optional[int] = None) -> Dict[str, Any]:
+        """A presigned URL for one download (``GET``, the default) or upload
+        (``PUT``) of ``path``, straight to the host: hand it to curl for big
+        files. ``ttl_s`` is 10 to 300."""
+        if not path:
+            raise ValueError("a path is required, e.g. /workspace/app.py")
+        body: Dict[str, Any] = {"path": path}
+        if method is not None:
+            if method not in ("GET", "PUT"):
+                raise ValueError("method is GET or PUT")
+            body["method"] = method
+        if ttl_s is not None:
+            if not _is_int(ttl_s) or not 10 <= ttl_s <= 300:
+                raise ValueError("ttl_s must be a whole number from 10 to 300")
+            body["ttl_s"] = ttl_s
+        return self._sb._cloud._request("POST", self._sb._path("/files/link"), body)["link"]
 
     def delete(self, path: str, *, recursive: bool = False) -> None:
         """Remove a file, or a folder and everything in it with ``recursive``."""
