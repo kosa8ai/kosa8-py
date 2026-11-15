@@ -321,8 +321,8 @@ class CloudTest(unittest.TestCase):
     def test_exec_timeout(self):
         cases = [
             (502, {"error": "host_failed", "message": "exec failed on the host: host unreachable: timed out"}),
-            (504, {"error": "exec_timeout", "message": "the command ran past 30 s"}),
-            (408, {"error": "exec_timeout", "message": "the command ran past 30 s"}),
+            (504, {"error": "exec_timeout", "message": "the command ran past 90 s"}),
+            (408, {"error": "exec_timeout", "message": "the command ran past 90 s"}),
         ]
         for status, body in cases:
             cloud = Kosa8Cloud(KEY, env={}, opener=Stub(lambda s, a=(status, body): a))
@@ -331,7 +331,7 @@ class CloudTest(unittest.TestCase):
             self.assertIsInstance(e.exception, Kosa8TimeoutError)
             self.assertIsInstance(e.exception, Kosa8ApiError)
             self.assertEqual(e.exception.status, status)
-            self.assertIn("30 s", str(e.exception))
+            self.assertIn("stopped after 90 s", str(e.exception))
         # A 502 that is not a timeout, or not on exec, stays a plain API error.
         cloud = Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (502, {"error": "host_failed", "message": "boom"})))
         with self.assertRaises(Kosa8ApiError) as e:

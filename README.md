@@ -142,7 +142,7 @@ print(hook["url"], hook["secret"])                    # give both to the reposit
   into the system) are gone by the next command. Install into `/workspace`, for
   example `pip install --target /workspace/lib ...` with `PYTHONPATH=/workspace/lib`,
   or chain the steps in one `sh -c`.
-- **A buffered `exec` is cut off after about 30 seconds** and raises
+- **A buffered `exec` runs at most 90 seconds** and raises
   `Kosa8ExecTimeoutError`. Run long work in the background and poll it:
   `box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1; echo $? > /workspace/test.exit' &")`.
 - A request body (command and env) is at most 64 KiB; a file read or write is at
@@ -158,7 +158,7 @@ print(hook["url"], hook["secret"])                    # give both to the reposit
 | `Kosa8PaymentRequiredError` (402) | no payment method (`payment_required`), spending cap reached (`spending_cap_reached`), Store price not accepted | show `e.upgrade_url`; an agent should relay `e.agent_message` to its person and stop |
 | `Kosa8OrgFrozenError` (423, `org_frozen`) | the org is frozen in the Security Center | an owner or admin unfreezes it; retrying does not help |
 | `Kosa8RateLimitError` (429) | too many requests, or `quota_exceeded` (active sandbox limit) | wait `e.retry_after` seconds when set, or delete sandboxes |
-| `Kosa8ExecTimeoutError` (504 `exec_timeout`, or today's 502 "timed out") | a buffered exec ran past about 30 s | run it in the background and poll |
+| `Kosa8ExecTimeoutError` (504 `exec_timeout`, or today's 502 "timed out") | a buffered exec ran past its 90 s limit | run it in the background and poll |
 | `Kosa8UnsupportedError` (501) | the host has no data plane yet (files, checkpoints, fork, ports) | use `exec`, or try later |
 
 Every Cloud error carries the server's stable `e.code` and its message.
