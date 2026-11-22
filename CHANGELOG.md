@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.5
 
 - Fix: the E2B code-interpreter shim (`kosa8.compat.e2b_code_interpreter.Sandbox`) creates a persistent sandbox. Before, its first `run_code` failed with 409 `not_persistent`, because the code interpreter keeps Python running between cells and kosa8 Cloud runs it only in a persistent sandbox. A persistent sandbox counts against the plan's persistent-sandbox limit; a `snap_...` template is started as the snapshot was.
 - The E2B shims start kosa8's `python` template when no template is given, and for E2B's `base`: E2B's default image has Python, kosa8's `base` (Alpine) does not, so the README's own `python3 app.py` failed with `python3: not found`. Pass another template key for anything else.
