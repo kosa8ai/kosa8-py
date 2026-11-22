@@ -458,3 +458,20 @@ class OrgTemplates(unittest.TestCase):
         from kosa8 import TemplateBuildError
         with self.assertRaisesRegex(TemplateBuildError, "manifest 404"):
             cloud.org_templates.wait("x")
+
+
+class ForkPrefix(unittest.TestCase):
+    def test_prefix_is_sent_and_checked(self):
+        def answer(s):
+            if s["path"].endswith("/fork"):
+                n = s["body"]["n"]
+                return 201, {"sandboxes": [{"id": f"sbx_c{i}", "state": "running", "name": f"{s['body'].get('prefix')}-{i + 1:04d}"} for i in range(n)], "failed": []}
+            return 200, {"sandbox": {"id": "sbx_p", "state": "running"}}
+
+        cloud, stub = make(answer)
+        box = cloud.sandboxes.get("sbx_p")
+        kids = box.fork(3, prefix="fk", run_id="run_1")
+        self.assertEqual(stub.seen[-1]["body"], {"n": 3, "prefix": "fk", "run_id": "run_1"})
+        self.assertEqual(len(kids), 3)
+        with self.assertRaisesRegex(ValueError, "prefix"):
+            box.fork(2, prefix="-bad")

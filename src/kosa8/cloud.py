@@ -272,10 +272,14 @@ def _ambient(cloud: Any) -> Dict[str, Any]:
 
 
 def _fork_body(n: int, labels: Optional[Mapping[str, str]], run_id: Optional[str], lease_s: Optional[int],
-               partial_ok: Optional[bool]) -> Dict[str, Any]:
+               partial_ok: Optional[bool], prefix: Optional[str] = None) -> Dict[str, Any]:
     _check_lease(lease_s)
     _check_labels(labels)
     body: Dict[str, Any] = {"n": n}
+    if prefix is not None:
+        if not isinstance(prefix, str) or not _PREFIX_RE.match(prefix):
+            raise ValueError("prefix must be 1-59 letters, digits, '.', '_' or '-', starting with a letter or digit")
+        body["prefix"] = prefix
     if labels:
         body["labels"] = dict(labels)
     if run_id:
@@ -1201,6 +1205,7 @@ class CloudSandbox:
         lease_s: Optional[int] = None,
         partial_ok: Optional[bool] = None,
         idempotency_key: Optional[str] = None,
+        prefix: Optional[str] = None,
     ) -> SandboxBatch:
         """``n`` live copies of the sandbox as it is now, on its host, as a
         :class:`SandboxBatch` (a list, with ``.failed``). Each is held to the
@@ -1234,7 +1239,7 @@ class CloudSandbox:
             left, call = n, 0
             while left > 0:
                 k = min(left, MAX_FORK_PER_CALL)
-                body = _fork_body(k, labels, run_id, lease_s, partial_ok)
+                body = _fork_body(k, labels, run_id, lease_s, partial_ok, prefix)
                 r = self._cloud._request("POST", self._path("/fork"), body,
                                          idempotency_key=_chunk_key(idempotency_key, call)) or {}
                 part = _batch_from(self._cloud, r, CloudSandbox, k)

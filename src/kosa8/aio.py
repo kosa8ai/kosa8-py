@@ -442,6 +442,7 @@ class AsyncCloudSandbox:
     async def fork(
         self, n: int = 1, *, labels: Optional[Mapping[str, str]] = None, run_id: Optional[str] = None,
         lease_s: Optional[int] = None, partial_ok: Optional[bool] = None, idempotency_key: Optional[str] = None,
+        prefix: Optional[str] = None,
     ) -> SandboxBatch:
         """``n`` live copies; see :meth:`kosa8.CloudSandbox.fork`."""
         _check_key(idempotency_key)
@@ -456,7 +457,7 @@ class AsyncCloudSandbox:
             while left > 0:
                 k = min(left, MAX_FORK_PER_CALL)
                 r = await self._cloud._request("POST", self._path("/fork"),
-                                               _fork_body(k, labels, run_id, lease_s, partial_ok),
+                                               _fork_body(k, labels, run_id, lease_s, partial_ok, prefix),
                                                idempotency_key=_chunk_key(idempotency_key, call)) or {}
                 part = _batch_from(self._cloud, r, AsyncCloudSandbox, k)
                 _reindex(part.failed, n - left)
