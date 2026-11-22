@@ -45,7 +45,14 @@ from .cloud import (
     _urllib_open,
     _ambient,
     _check_lease,
+    _check_key,
+    _chunk_key,
+    _drain_add,
+    _DRAIN_ROUNDS,
+    _idem_headers,
+    _reindex,
     MAX_FORK,
+    MAX_FORK_PER_CALL,
 )
 from .cloud_features import argv_of, env_list
 from .errors import (
@@ -205,13 +212,17 @@ class AsyncCloud:
         data: Optional[bytes] = None,
         raw: bool = False,
         retry: Optional[RetryPolicy] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Any:
-        policy = _ScopedRetry(self.retry if retry is None else retry, method, path)
-        return await acall_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw), policy)
+        """See :meth:`kosa8.Kosa8Cloud._request` (the same retries and Idempotency-Key)."""
+        extra = _idem_headers(method, path, idempotency_key)
+        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
+        return await acall_with_retry(
+            lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy)
 
     async def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
-                            raw: bool = False) -> Any:
-        headers, payload = self._sync._headers_payload(body, data, raw)
+                            raw: bool = False, extra: Optional[Mapping[str, str]] = None) -> Any:
+        headers, payload = self._sync._headers_payload(body, data, raw, extra)
         try:
             answer = await self._aopen(method, self.base_url + path, headers, payload, self.timeout)
         except (socket.timeout, TimeoutError, asyncio.TimeoutError) as e:
@@ -257,6 +268,7 @@ class AsyncCloudSandboxes:
         run_id: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
+        idempotency_key: Optional[str] = None,
     ) -> "AsyncCloudSandbox":
         """Start a sandbox; see :meth:`kosa8.CloudSandboxes.create`. Use it as
         ``async with await cloud.sandboxes.create(...) as box:`` to delete it on the way out."""
@@ -266,7 +278,7 @@ class AsyncCloudSandboxes:
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id,
         )
-        r = await self._cloud._request("POST", "/v1/sandboxes", body)
+        r = await self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = AsyncCloudSandbox(self._cloud, r["sandbox"])
         try:
             if wait and box.state not in _SETTLED:
@@ -294,6 +306,7 @@ class AsyncCloudSandboxes:
         partial_ok: bool = True,
         wait: bool = True,
         wait_timeout: float = 300.0,
+        idempotency_key: Optional[str] = None,
     ) -> SandboxBatch:
         """``n`` (1 to 1000) sandboxes in one call; see :meth:`kosa8.CloudSandboxes.create_many`."""
         amb = _ambient(self._cloud)
@@ -302,7 +315,7 @@ class AsyncCloudSandboxes:
             ttl_s=ttl_s, lease_s=amb.get("lease_s") if lease_s is None else lease_s,
             run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok,
         )
-        r = await self._cloud._request("POST", "/v1/sandboxes/batch", body) or {}
+        r = await self._cloud._request("POST", "/v1/sandboxes/batch", body, idempotency_key=idempotency_key) or {}
         batch = _batch_from(self._cloud, r, AsyncCloudSandbox, n)
         if wait:
             await _await_all(batch, wait_timeout, partial_ok)
@@ -345,8 +358,13 @@ class AsyncCloudSandboxes:
         ids: Optional[Sequence[Any]] = None,
     ) -> Dict[str, Any]:
         """Delete every matching sandbox; see :meth:`kosa8.CloudSandboxes.drain`."""
-        r = await self._cloud._request("POST", "/v1/sandboxes/drain", _selector(run_id, labels, ids)) or {}
-        return {"deleted": int(r.get("deleted", 0)), "failed": list(r.get("failed") or [])}
+        sel = _selector(run_id, labels, ids)
+        out: Dict[str, Any] = {"deleted": 0, "ids": [], "failed": []}
+        for _ in range(_DRAIN_ROUNDS):
+            r = await self._cloud._request("POST", "/v1/sandboxes/drain", sel) or {}
+            if not _drain_add(out, r):
+                break
+        return out
 
     async def grade(self, sandbox: Union[str, "AsyncCloudSandbox"], cmd: Union[str, Sequence[str]], **kw: Any) -> GradeResult:
         """Grade a solved sandbox in a sealed fork; see :meth:`kosa8.CloudSandbox.grade`."""
@@ -424,25 +442,29 @@ class AsyncCloudSandbox:
 
     async def fork(
         self, n: int = 1, *, labels: Optional[Mapping[str, str]] = None, run_id: Optional[str] = None,
-        lease_s: Optional[int] = None, partial_ok: Optional[bool] = None,
+        lease_s: Optional[int] = None, partial_ok: Optional[bool] = None, idempotency_key: Optional[str] = None,
     ) -> SandboxBatch:
         """``n`` live copies; see :meth:`kosa8.CloudSandbox.fork`."""
+        _check_key(idempotency_key)
         if not _is_int(n) or n < 1:
             raise ValueError("n must be a whole number of at least 1")
         amb = _ambient(self._cloud)
         run_id = amb.get("run_id") if run_id is None else run_id
         lease_s = amb.get("lease_s") if lease_s is None else lease_s
-        out = SandboxBatch(requested=n)
+        out = SandboxBatch(requested=n, run_id=run_id)
         try:
-            left = n
+            left, call = n, 0
             while left > 0:
-                k = min(left, MAX_FORK)
+                k = min(left, MAX_FORK_PER_CALL)
                 r = await self._cloud._request("POST", self._path("/fork"),
-                                               _fork_body(k, labels, run_id, lease_s, partial_ok)) or {}
+                                               _fork_body(k, labels, run_id, lease_s, partial_ok),
+                                               idempotency_key=_chunk_key(idempotency_key, call)) or {}
                 part = _batch_from(self._cloud, r, AsyncCloudSandbox, k)
+                _reindex(part.failed, n - left)
                 out.extend(part)
                 out.failed.extend(part.failed)
                 left -= k
+                call += 1
         except BaseException:
             await asyncio.gather(*(_aquiet_delete(c) for c in out))
             raise
@@ -452,12 +474,14 @@ class AsyncCloudSandbox:
         self, cmd: Union[str, Sequence[str]], *, files: Optional[Mapping[str, Union[bytes, str]]] = None,
         timeout_s: Optional[float] = None, env: Optional[Mapping[str, str]] = None, keep: bool = False,
         run_id: Optional[str] = None, rollout: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> GradeResult:
         """Grade in a sealed fork with hidden ``files``; see :meth:`kosa8.CloudSandbox.grade`."""
         amb = _ambient(self._cloud)
         run_id = amb.get("run_id") if run_id is None else run_id
         body = _grade_body(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout)
-        return _grade_result(await self._cloud._request("POST", self._path("/grade"), body) or {})
+        return _grade_result(await self._cloud._request("POST", self._path("/grade"), body,
+                                                        idempotency_key=idempotency_key) or {})
 
     async def heartbeat(self, *, extend_s: Optional[int] = None) -> int:
         return await self._cloud.sandboxes.heartbeat(ids=[self.id], extend_s=extend_s)

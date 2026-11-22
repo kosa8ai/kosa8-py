@@ -60,7 +60,12 @@ class FailureClasses(unittest.TestCase):
             (self.err(423, "org_frozen"), ("quota", False)),
             (self.err(400, "invalid_cmd"), ("client", False)),
             (self.err(404), ("client", False)),
-            (self.err(501, "not_supported"), ("client", False)),
+            (self.err(501, "not_supported"), ("infra", False)),
+            (self.err(409, "idempotency_in_progress"), ("client", True)),
+            (self.err(422, "idempotency_mismatch"), ("client", False)),
+            (self.err(500, "exec_stream_timeout"), ("timeout", True)),
+            (self.err(503, "host_busy"), ("infra", True)),
+            (self.err(400, "plan_feature"), ("quota", False)),
             (Kosa8ExecTimeoutError("t", status=504, code="exec_timeout"), ("timeout", False)),
             (Kosa8TimeoutError("t"), ("infra", True)),
             (Kosa8ConnectionError("c"), ("infra", True)),
@@ -132,11 +137,14 @@ class Retries(unittest.TestCase):
 
     def test_post_not_retried_on_5xx_but_on_429(self):
         fake = FakeCloud()
+        box = cloud_for(fake).sandboxes.create()
         fake.before = lambda m, p, b: (502, {"error": "host_failed", "message": "boom"})
         waits = no_sleep(self)
+        fake.calls.clear()
         with self.assertRaises(Kosa8ApiError):
-            cloud_for(fake).sandboxes.create()
-        self.assertEqual(len(fake.calls), 1)  # a create might have happened: never sent twice
+            box.exec("echo hi")  # an exec carries no Idempotency-Key: it might have run, never sent twice
+        self.assertEqual(len(fake.calls), 1)
+        fake.before = None
         fake2 = FakeCloud()
         n = {"i": 0}
 
@@ -267,10 +275,13 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
                          {"n": 3, "labels": {"g": "1"}, "run_id": "run_2", "lease_s": 120, "partial_ok": True})
         self.assertEqual(self.fake.sandboxes[kids[0].id]["labels"], {"g": "1", "kosa8.run": "run_2"})
         self.fake.calls.clear()
-        kids = base.fork(150)
+        kids = base.fork(150)  # one call: kosa8 Cloud makes them 100 at a time itself
         self.assertEqual(len(kids), 150)
-        self.assertEqual([b["n"] for b in bodies(self.fake, "POST", "/fork")], [100, 50])
-        self.assertEqual(bodies(self.fake, "POST", "/fork")[0], {"n": 100})  # what older servers take
+        self.assertEqual(bodies(self.fake, "POST", "/fork"), [{"n": 150}])
+        self.fake.calls.clear()
+        kids = base.fork(1200, partial_ok=True)
+        self.assertEqual([b["n"] for b in bodies(self.fake, "POST", "/fork")], [1000, 200])
+        self.assertEqual(len(kids), 1200)
 
     def test_fork_failure_deletes_earlier_chunks(self):
         base = self.cloud.sandboxes.create()
@@ -285,7 +296,7 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
 
         self.fake.before = second_fails
         with self.assertRaises(Kosa8Error):
-            base.fork(120)
+            base.fork(1020)
         self.assertEqual(self.fake.live(), [base.id])
 
     def test_heartbeat_and_drain(self):
@@ -301,7 +312,8 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cloud.sandboxes.drain()
         r = self.cloud.sandboxes.drain(run_id="run_3")
-        self.assertEqual(r, {"deleted": 2, "failed": []})
+        self.assertEqual(r["deleted"], 2)
+        self.assertEqual((sorted(r["ids"]), r["failed"]), (sorted([a.id, self.fake.deleted[-1]]), []))
         self.assertEqual(self.fake.live(), [other.id])
         self.assertEqual(self.cloud.sandboxes.drain(labels={"x": "y"}, ids=[other])["deleted"], 0)
         self.assertEqual(self.fake.drains[-1], {"labels": {"x": "y"}, "ids": [other.id]})
@@ -324,12 +336,12 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
         b = seen["body"]
         self.assertEqual(b["files"]["/grader/test.py"], base64.b64encode(b"print(1)").decode())
         self.assertEqual((b["cmd"], b["timeout_s"], b["env"], b["run_id"], b["rollout"]),
-                         (["python", "/grader/test.py"], 60, ["A=1"], "run_4", {"step": 2, "group": 0, "index": 1}))
+                         (["python", "/grader/test.py"], 60, ["A=1"], "run_4", {"step": 2, "group": "0", "index": 1}))
         self.assertNotIn("keep", b)
-        # Defaults from the exit code when the server sends no reward.
+        # The server works the reward out from the exit code when stdout has none.
         self.fake.on_grade = lambda sb, body, files: {"exit": 1, "stdout": "", "stderr": "boom"}
         g = self.cloud.sandboxes.grade(box.id, "pytest -q", keep=True)
-        self.assertEqual((g.reward, g.failure_class), (0.0, "exit_nonzero"))
+        self.assertEqual((g.reward, g.failure_class, g.reward_from, g.kept, g.recorded), (0.0, "exit_nonzero", "exit", True, None))
         self.assertEqual(self.fake.calls[-1][2]["cmd"], ["sh", "-c", "pytest -q"])
         self.assertTrue(self.fake.calls[-1][2]["keep"])
         with self.assertRaises(ValueError):

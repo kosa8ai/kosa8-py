@@ -24,7 +24,7 @@ def solve(sandbox, task):
 cloud = kosa8.Cloud()
 with Run(cloud, "swebench-gold-check", project="swe") as run:
     results = run.map(lambda task: swebench.create(cloud, task["instance"]), tasks, solve,
-                      grade_cmd=swebench.GRADE_CMD, grade_timeout_s=900, timeout_s=1200, concurrency=8)
+                      grade_cmd=swebench.GRADE_CMD, grade_timeout_s=90, timeout_s=1200, concurrency=8)
 
 for r in results:
     print(r.task["id"], r.reward, r.failure_class, "masked" if r.masked else "")

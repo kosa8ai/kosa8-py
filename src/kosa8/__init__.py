@@ -68,7 +68,7 @@ from .errors import (
     error_from_response,
 )
 from .transport import Transport, default_socket_path, default_worker_file, resolve_endpoint
-from .errors import FAILURE_CLASSES, classify_failure
+from .errors import FAILURE_CLASSES, classify_failure, failure_of
 from .retry import NO_RETRY, RetryPolicy
 from .aio import AsyncCloud, AsyncCloudFiles, AsyncCloudSandbox, AsyncCloudSandboxes
 
@@ -93,6 +93,7 @@ __all__ = [
     "NO_RETRY",
     "FAILURE_CLASSES",
     "classify_failure",
+    "failure_of",
     "CloudSandbox",
     "CloudSandboxes",
     "CloudFunctions",

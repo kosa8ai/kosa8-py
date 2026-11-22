@@ -16,8 +16,12 @@ Errors are the SDK's usual typed errors; each carries the cloud's stable
 How the cloud runs commands: each ``exec`` runs in a fresh container, and only
 ``/workspace`` persists between them. The ``base`` template is Alpine Linux
 (busybox ``sh``; no bash, python or git). A buffered exec runs at most
-90 seconds (:class:`~kosa8.Kosa8ExecTimeoutError`), and a request body
-is at most 64 KiB.
+90 seconds (:class:`~kosa8.Kosa8ExecTimeoutError`), and an exec request
+(command and env) is at most 64 KiB.
+
+The calls that make sandboxes (create, create_many, fork, grade) send an
+``Idempotency-Key`` that their retries reuse, so a retry after a timeout or a
+5xx gets the first answer instead of a second fleet.
 
 Standard library only, like the rest of the SDK.
 """
@@ -27,11 +31,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
@@ -73,6 +79,17 @@ MAX_SLEEP_AFTER_S = 604800
 MAX_FORK = 100
 #: A batch create makes from 1 to 1000 sandboxes.
 MAX_BATCH = 1000
+#: Copies one fork call makes at most (kosa8 Cloud makes them 100 at a time on the parent's host).
+MAX_FORK_PER_CALL = 1000
+#: A lease is 60 s to 24 hours.
+MIN_LEASE_S = 60
+MAX_LEASE_S = 86400
+#: A grade's hidden files: at most 64, adding up to 8 MiB before base64.
+GRADE_MAX_FILES = 64
+GRADE_MAX_BYTES = 8 * 1024 * 1024
+#: A recorded rollout's meta is at most 8 KiB as JSON, its stdout tail 4 KiB.
+META_MAX = 8192
+ROLLOUT_STDOUT_TAIL = 4096
 #: The label kosa8 Cloud groups a run's sandboxes by.
 RUN_LABEL = "kosa8.run"
 #: The limit kosa8 Cloud puts on a buffered exec, in seconds (504 exec_timeout past it).
@@ -130,19 +147,38 @@ class GradeResult:
     """What :meth:`CloudSandbox.grade` answered.
 
     ``reward`` is the grader's: the last stdout line that is JSON with a
-    numeric ``reward`` (and optional ``metrics``), else 1.0 for exit 0 and
-    0.0 otherwise. ``failure_class`` is ``ok``, ``exit_nonzero`` or ``timeout``.
+    numeric ``reward`` (and optional ``metrics``; ``reward_from="json"``),
+    else 1.0 for exit 0 and 0.0 otherwise (``reward_from="exit"``). When the
+    command did not finish (it timed out, or the host failed) ``reward`` is
+    ``None`` and ``failure_class`` is ``timeout`` or ``infra``: mask it, do
+    not score it 0. ``retryable`` says whether grading again may work.
     """
 
-    reward: float
+    reward: Optional[float]
     exit_code: Optional[int]
     stdout: str
     stderr: str
+    #: ``ok``, ``exit_nonzero``, ``timeout`` or ``infra``.
     failure_class: str
     metrics: Dict[str, Any]
     ms: Optional[int] = None
-    #: The id of the sealed fork the grader ran in (deleted unless ``keep``).
+    #: The id of the sealed fork the grader ran in (deleted unless ``kept``).
     grader_id: Optional[str] = None
+    #: ``json``, ``exit`` or ``None`` (no reward).
+    reward_from: Optional[str] = None
+    retryable: bool = False
+    #: Whether the grader fork was kept (``keep=True``).
+    kept: bool = False
+    #: The graded sandbox.
+    sandbox_id: Optional[str] = None
+    #: The run it was recorded on (``run_id=``), and whether that worked.
+    #: ``recorded`` is ``None`` without a run; ``False`` if recording failed
+    #: (the grade itself still stands).
+    run_id: Optional[str] = None
+    recorded: Optional[bool] = None
+    #: The error code and message when the command did not finish.
+    error: Optional[str] = None
+    message: Optional[str] = None
     #: The whole answer, for fields this SDK does not know yet.
     raw: Optional[Dict[str, Any]] = None
 
@@ -150,14 +186,19 @@ class GradeResult:
 class SandboxBatch(list):
     """The sandboxes a batch create or a fork made: a plain ``list`` of
     :class:`CloudSandbox`, plus ``failed`` (one dict per sandbox that was not
-    made: ``index``, ``code``, ``message``, ``failure_class``, ``retryable``)
-    and ``requested``."""
+    made: ``index``, ``code``, ``message``, ``failure_class``, ``retryable``),
+    ``requested`` and ``run_id``.
+
+    A call that made none raises the first refusal instead (its ``.body``
+    has ``requested``, ``created: 0`` and ``failed``), so an empty batch is
+    never returned."""
 
     def __init__(self, sandboxes: Sequence[Any] = (), *, failed: Optional[List[Dict[str, Any]]] = None,
-                 requested: Optional[int] = None) -> None:
+                 requested: Optional[int] = None, run_id: Optional[str] = None) -> None:
         super().__init__(sandboxes)
         self.failed: List[Dict[str, Any]] = list(failed or [])
         self.requested: int = len(self) + len(self.failed) if requested is None else requested
+        self.run_id = run_id
 
     @property
     def created(self) -> int:
@@ -176,24 +217,34 @@ def _exec_result(r: Mapping[str, Any]) -> CloudExecResult:
 
 
 def _grade_result(r: Mapping[str, Any]) -> GradeResult:
-    reward = r.get("reward")
     code = r.get("exit")
+    if not _is_int(code):
+        code = None
+    reward: Any = r.get("reward")
+    rfrom = r.get("reward_from")
     if not isinstance(reward, (int, float)) or isinstance(reward, bool):
-        reward = 1.0 if code == 0 else 0.0
+        reward = None
+        if "reward" not in r and code is not None:  # an answer without the field: by exit code
+            reward, rfrom = (1.0 if code == 0 else 0.0), "exit"
     fc = r.get("failure_class")
     if not isinstance(fc, str):
-        fc = "ok" if code == 0 else "exit_nonzero"
+        fc = "infra" if code is None else ("ok" if code == 0 else "exit_nonzero")
+    rt = r.get("retryable")
     metrics = r.get("metrics")
+    rec = r.get("recorded")
     return GradeResult(
-        reward=float(reward), exit_code=code, stdout=r.get("stdout") or "", stderr=r.get("stderr") or "",
-        failure_class=fc, metrics=dict(metrics) if isinstance(metrics, dict) else {}, ms=r.get("ms"),
-        grader_id=r.get("grader_id"), raw=dict(r),
+        reward=None if reward is None else float(reward), exit_code=code, stdout=r.get("stdout") or "",
+        stderr=r.get("stderr") or "", failure_class=fc, metrics=dict(metrics) if isinstance(metrics, dict) else {},
+        ms=r.get("ms"), grader_id=r.get("grader_id"), reward_from=rfrom if isinstance(rfrom, str) else None,
+        retryable=rt if isinstance(rt, bool) else fc == "infra", kept=r.get("kept") is True,
+        sandbox_id=r.get("sandbox_id"), run_id=r.get("run_id"), recorded=rec if isinstance(rec, bool) else None,
+        error=r.get("error"), message=r.get("message"), raw=dict(r),
     )
 
 
 def _check_lease(lease_s: Optional[int]) -> None:
-    if lease_s is not None and (not _is_int(lease_s) or not MIN_TTL_S <= lease_s <= MAX_TTL_S):
-        raise ValueError(f"lease_s must be a whole number of seconds from {MIN_TTL_S} to {MAX_TTL_S}")
+    if lease_s is not None and (not _is_int(lease_s) or not MIN_LEASE_S <= lease_s <= MAX_LEASE_S):
+        raise ValueError(f"lease_s must be a whole number of seconds from {MIN_LEASE_S} to {MAX_LEASE_S}")
 
 
 def _check_labels(labels: Optional[Mapping[str, str]]) -> None:
@@ -247,6 +298,8 @@ def _batch_body(
     _check_lifetime(ttl_s, None)
     _check_lease(lease_s)
     _check_labels(labels)
+    if lease_s is not None and ttl_s is not None:
+        raise ValueError("give lease_s or ttl_s, not both: a lease is a TTL that heartbeats move forward")
     body: Dict[str, Any] = {"count": n, "partial_ok": partial_ok}
     for k, v in (("template", template), ("image", image), ("cpus", cpus), ("mem_mb", mem_mb),
                  ("region", region), ("ttl_s", ttl_s), ("lease_s", lease_s), ("run_id", run_id)):
@@ -263,17 +316,29 @@ def _grade_body(
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {"cmd": argv_of(cmd)}
     if files:
+        if len(files) > GRADE_MAX_FILES:
+            raise ValueError(f"a grade takes at most {GRADE_MAX_FILES} files, got {len(files)}")
         enc: Dict[str, str] = {}
+        total = 0
         for path, content in files.items():
-            if not isinstance(path, str) or not path.startswith("/"):
-                raise ValueError(f"a grader file path must be absolute, got {path!r}")
+            if (not isinstance(path, str) or not path.startswith("/") or "\0" in path or len(path) > 4096
+                    or ".." in path.split("/")):
+                raise ValueError(f"a grader file path must be absolute, without '..', got {path!r}")
             raw = content.encode() if isinstance(content, str) else bytes(content)
+            total += len(raw)
+            if total > GRADE_MAX_BYTES:
+                raise ValueError(
+                    f"a grade's files add up to at most {GRADE_MAX_BYTES // (1024 * 1024)} MiB "
+                    f"(before base64); past that at {path!r}. Put large fixtures in the image or "
+                    "the sandbox, and only the hidden tests in files="
+                )
             enc[path] = base64.b64encode(raw).decode("ascii")
         body["files"] = enc
     if timeout_s is not None:
-        if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
-            raise ValueError("timeout_s must be a positive number of seconds")
-        body["timeout_s"] = timeout_s
+        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s != int(timeout_s)
+                or not 1 <= timeout_s <= EXEC_LIMIT_S):
+            raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {EXEC_LIMIT_S}")
+        body["timeout_s"] = int(timeout_s)
     el = env_list(env)
     if el:
         body["env"] = el
@@ -282,31 +347,79 @@ def _grade_body(
     if run_id:
         body["run_id"] = run_id
     if rollout:
-        body["rollout"] = dict(rollout)
+        ro = dict(rollout)
+        if ro.get("group") is not None:
+            ro["group"] = str(ro["group"])[:128]  # the grader takes a string
+        if ro.get("meta") is not None:
+            ro["meta"] = fit_meta(ro["meta"])
+        body["rollout"] = ro
     return body
 
 
+def fit_meta(meta: Mapping[str, Any], limit: int = META_MAX) -> Dict[str, Any]:
+    """``meta`` cut to what a recorded rollout keeps (8 KiB as JSON): keys
+    are dropped from the end, longest values first, and ``"truncated": true``
+    is added. Values that are not JSON are turned into strings."""
+    m = json.loads(json.dumps(dict(meta), default=str))
+
+    def size(d: Mapping[str, Any]) -> int:
+        return len(json.dumps(d, separators=(",", ":"), ensure_ascii=False))
+
+    if size(m) <= limit:
+        return m
+    m["truncated"] = True
+    for k in sorted((k for k in m if k != "truncated"), key=lambda k: -size({k: m[k]})):
+        if size(m) <= limit:
+            break
+        v = m.pop(k)
+        if isinstance(v, str) and size(m) + len(k) + 8 < limit:
+            m[k] = v[: max(0, limit - size(m) - len(k) - 8)]
+    return m
+
+
 def _batch_from(cloud: Any, r: Mapping[str, Any], make: Callable[[Any, Dict[str, Any]], Any], n: int) -> SandboxBatch:
+    r = r or {}
     return SandboxBatch(
-        [make(cloud, s) for s in (r or {}).get("sandboxes", [])],
-        failed=list((r or {}).get("failed") or []),
-        requested=(r or {}).get("requested", n),
+        [make(cloud, s) for s in r.get("sandboxes", [])],
+        failed=list(r.get("failed") or []),
+        requested=r.get("requested", n),
+        run_id=r.get("run_id"),
     )
 
 
-#: Methods that are safe to send twice. POSTs are retried only on 429, which
-#: means the request was refused before anything was done.
+#: Methods that are safe to send twice. Other POSTs are retried only on 429
+#: (refused before anything was done), unless they carry an Idempotency-Key.
 _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 _IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
+#: The POSTs kosa8 Cloud keeps an Idempotency-Key for (24 hours): a retry with
+#: the same key and body gets the first answer (``Idempotent-Replayed: true``).
+_KEYED_POSTS = re.compile(r"^/v1/sandboxes(/batch|/[A-Za-z0-9_]{1,64}/(fork|grade))?$")
+
+
+def keyed_route(method: str, path: str) -> bool:
+    """Whether kosa8 Cloud honours an Idempotency-Key on this call."""
+    return method == "POST" and bool(_KEYED_POSTS.match(path.split("?", 1)[0]))
+
+
+def new_idempotency_key() -> str:
+    return str(uuid.uuid4())
+
+
+def _check_key(key: Optional[str]) -> None:
+    if key is not None and (not isinstance(key, str) or not _KEY_RE.match(key)):
+        raise ValueError("idempotency_key must be 1-255 printable ASCII characters, e.g. a UUID")
+
+
+_KEY_RE = re.compile(r"^[\x21-\x7e]{1,255}$")
 
 
 class _ScopedRetry:
     """A :class:`RetryPolicy` limited to what is safe for one request."""
 
-    def __init__(self, policy: RetryPolicy, method: str, path: str) -> None:
+    def __init__(self, policy: RetryPolicy, method: str, path: str, *, keyed: bool = False) -> None:
         self.policy = policy
         bare = path.split("?", 1)[0]
-        self.idempotent = method in _IDEMPOTENT or bare in _IDEMPOTENT_POSTS
+        self.idempotent = keyed or method in _IDEMPOTENT or bare in _IDEMPOTENT_POSTS
 
     def should_retry(self, exc: BaseException, attempt: int) -> bool:
         if not self.policy.should_retry(exc, attempt):
@@ -449,19 +562,26 @@ class Kosa8Cloud:
         data: Optional[bytes] = None,
         raw: bool = False,
         retry: Optional[RetryPolicy] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Any:
         """One call, retried as :attr:`retry` allows. ``body`` is sent as JSON
         and ``data`` as raw bytes; with ``raw`` a successful answer's bytes are
-        returned as they came."""
-        policy = _ScopedRetry(self.retry if retry is None else retry, method, path)
-        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw), policy)
+        returned as they came. A call that makes sandboxes (:func:`keyed_route`)
+        sends ``idempotency_key`` (a new UUID when not given), the same on every
+        retry, so it may be retried after a timeout or a 5xx too."""
+        extra = _idem_headers(method, path, idempotency_key)
+        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
+        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy)
 
-    def _headers_payload(self, body: Any, data: Optional[bytes], raw: bool) -> "tuple[Dict[str, str], Optional[bytes]]":
+    def _headers_payload(self, body: Any, data: Optional[bytes], raw: bool,
+                         extra: Optional[Mapping[str, str]] = None) -> "tuple[Dict[str, str], Optional[bytes]]":
         headers = {
             "Authorization": f"Bearer {self._key}",
             "Accept": "application/octet-stream" if raw else "application/json",
             "User-Agent": USER_AGENT,
         }
+        if extra:
+            headers.update(extra)
         payload = None
         if data is not None:
             headers["Content-Type"] = "application/octet-stream"
@@ -472,8 +592,8 @@ class Kosa8Cloud:
         return headers, payload
 
     def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
-                      raw: bool = False) -> Any:
-        headers, payload = self._headers_payload(body, data, raw)
+                      raw: bool = False, extra: Optional[Mapping[str, str]] = None) -> Any:
+        headers, payload = self._headers_payload(body, data, raw, extra)
         try:
             answer = self._open(method, self.base_url + path, headers, payload, self.timeout)
         except (socket.timeout, TimeoutError) as e:
@@ -486,6 +606,13 @@ class Kosa8Cloud:
         except (urllib.error.URLError, OSError) as e:
             raise Kosa8ConnectionError(f"could not reach kosa8 Cloud at {self.base_url}: {e}", method=method, path=path) from e
         return _parse_answer(answer, method, path, raw)
+
+
+def _idem_headers(method: str, path: str, key: Optional[str]) -> Dict[str, str]:
+    _check_key(key)
+    if key is None and not keyed_route(method, path):
+        return {}
+    return {"Idempotency-Key": key or new_idempotency_key()}
 
 
 def _parse_answer(answer: Any, method: str, path: str, raw: bool) -> Any:
@@ -552,6 +679,10 @@ def _cloud_error(
             e.retry_after = float(ra) if ra is not None else None
         except ValueError:
             e.retry_after = None
+    if getattr(e, "retry_after", None) is None and isinstance(body, dict):
+        ra_s = body.get("retry_after_s")  # e.g. 409 idempotency_in_progress
+        if isinstance(ra_s, (int, float)) and not isinstance(ra_s, bool) and ra_s > 0:
+            e.retry_after = float(ra_s)
     return e
 
 
@@ -671,6 +802,7 @@ class CloudSandboxes:
         run_id: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
+        idempotency_key: Optional[str] = None,
     ) -> "CloudSandbox":
         """Start a sandbox; returns once it is running.
 
@@ -701,6 +833,13 @@ class CloudSandboxes:
         ``sleep_after_s`` is the idle time before it sleeps (0 never; default
         300). ``accept_price`` is a paid Store item's current price in USD,
         which the person agreed to.
+
+        ``idempotency_key`` (default a new UUID) is sent as the
+        ``Idempotency-Key`` header and reused on every retry, so a create that
+        timed out or met a 5xx is retried without making a second sandbox.
+        Pass your own to make a create safe to repeat across processes (kosa8
+        Cloud keeps the answer 24 hours; the same key with another body is
+        ``422 idempotency_mismatch``).
         """
         body, labels = _create_body(
             self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
@@ -708,7 +847,7 @@ class CloudSandboxes:
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id,
         )
-        r = self._cloud._request("POST", "/v1/sandboxes", body)
+        r = self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = CloudSandbox(self._cloud, r["sandbox"])
         try:
             if wait and box.state not in _SETTLED:
@@ -737,6 +876,7 @@ class CloudSandboxes:
         partial_ok: bool = True,
         wait: bool = True,
         wait_timeout: float = 300.0,
+        idempotency_key: Optional[str] = None,
     ) -> SandboxBatch:
         """Start ``n`` (1 to 1000) sandboxes in one call (``POST /v1/sandboxes/batch``).
 
@@ -744,8 +884,12 @@ class CloudSandboxes:
         retry. With ``partial_ok`` (the default) the ones it could not make
         (for example past the plan's running limit, ``code="running_limit"``)
         are in ``.failed``; with ``partial_ok=False`` it is all or nothing and
-        the first failure is raised. ``wait`` polls until each is running;
-        a sandbox that fails to boot is deleted and moved to ``.failed``.
+        the first failure is raised. Either way, if none could be made the
+        first refusal is raised (its ``.body`` has ``requested``, ``created``
+        and ``failed``). ``wait`` polls until each is running; a sandbox that
+        fails to boot is deleted and moved to ``.failed``. The call carries an
+        ``Idempotency-Key`` (``idempotency_key``, default a new UUID) that its
+        retries reuse.
         """
         amb = _ambient(self._cloud)
         body = _batch_body(
@@ -753,7 +897,7 @@ class CloudSandboxes:
             ttl_s=ttl_s, lease_s=amb.get("lease_s") if lease_s is None else lease_s,
             run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok,
         )
-        r = self._cloud._request("POST", "/v1/sandboxes/batch", body) or {}
+        r = self._cloud._request("POST", "/v1/sandboxes/batch", body, idempotency_key=idempotency_key) or {}
         batch = _batch_from(self._cloud, r, CloudSandbox, n)
         if wait:
             _wait_all(batch, wait_timeout, partial_ok)
@@ -783,10 +927,18 @@ class CloudSandboxes:
         labels: Optional[Mapping[str, str]] = None,
         ids: Optional[Sequence[Union[str, "CloudSandbox"]]] = None,
     ) -> Dict[str, Any]:
-        """Delete every matching sandbox of the org: ``{"deleted": n, "failed": [...]}``.
-        Needs at least one of ``run_id``, ``labels`` or ``ids``."""
-        r = self._cloud._request("POST", "/v1/sandboxes/drain", _selector(run_id, labels, ids)) or {}
-        return {"deleted": int(r.get("deleted", 0)), "failed": list(r.get("failed") or [])}
+        """Delete every matching sandbox of the org: ``{"deleted": n, "ids":
+        [...], "failed": [{"id", "code", "message", "failure_class",
+        "retryable"}, ...]}``. Needs at least one of ``run_id``, ``labels`` or
+        ``ids``. kosa8 Cloud deletes up to 1000 a call; this calls again while
+        it says there are more (and stops if a call deleted none)."""
+        sel = _selector(run_id, labels, ids)
+        out: Dict[str, Any] = {"deleted": 0, "ids": [], "failed": []}
+        for _ in range(_DRAIN_ROUNDS):
+            r = self._cloud._request("POST", "/v1/sandboxes/drain", sel) or {}
+            if not _drain_add(out, r):
+                break
+        return out
 
     def grade(
         self,
@@ -799,10 +951,12 @@ class CloudSandboxes:
         keep: bool = False,
         run_id: Optional[str] = None,
         rollout: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> GradeResult:
         """Grade a solved sandbox in a sealed fork; see :meth:`CloudSandbox.grade`."""
         box = sandbox if isinstance(sandbox, CloudSandbox) else CloudSandbox(self._cloud, {"id": sandbox})
-        return box.grade(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout)
+        return box.grade(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout,
+                         idempotency_key=idempotency_key)
 
     def list(  # noqa: A003
         self,
@@ -1031,37 +1185,49 @@ class CloudSandbox:
         run_id: Optional[str] = None,
         lease_s: Optional[int] = None,
         partial_ok: Optional[bool] = None,
+        idempotency_key: Optional[str] = None,
     ) -> SandboxBatch:
         """``n`` live copies of the sandbox as it is now, on its host, as a
         :class:`SandboxBatch` (a list, with ``.failed``). Each is held to the
         rules of a create (payment, quotas).
 
-        One API call makes at most 100; for more this makes several calls,
-        and if one of them raises, the copies already made are deleted.
-        ``labels`` go on every copy, ``run_id`` labels them ``kosa8.run``,
-        ``lease_s`` leases them (see :meth:`CloudSandboxes.create`). With
-        ``partial_ok=True`` copies that could not be made are reported in
-        ``.failed`` instead of failing the call; ``False`` (and the API's
-        default) is all or nothing.
+        One API call makes up to 1000 (kosa8 Cloud makes them 100 at a time);
+        for more this makes several calls, and if one of them raises, the
+        copies already made are deleted. ``labels`` go on every copy,
+        ``run_id`` labels them ``kosa8.run``, ``lease_s`` leases them (see
+        :meth:`CloudSandboxes.create`). With ``partial_ok=True`` copies that
+        could not be made (no room on the host, the running limit) are
+        reported in ``.failed`` instead of failing the call; ``False`` is all
+        or nothing. The API's default is ``True`` when ``labels``, ``run_id``
+        or ``lease_s`` is given or ``n`` is over 100, else ``False``. A fork
+        that made none raises the first refusal (its ``.body`` has
+        ``requested``, ``created`` and ``failed``).
 
-        Data plane: may answer 501 ``not_supported`` on current hosts.
+        Each call carries an ``Idempotency-Key`` its retries reuse
+        (``idempotency_key`` is used for the first call; later ones add
+        ``-2``, ``-3``, ...). A sandbox with secrets cannot be forked (409
+        ``secrets``). May answer 501 ``not_supported`` on some hosts.
         """
         if not _is_int(n) or n < 1:
             raise ValueError("n must be a whole number of at least 1")
         amb = _ambient(self._cloud)
         run_id = amb.get("run_id") if run_id is None else run_id
         lease_s = amb.get("lease_s") if lease_s is None else lease_s
-        out = SandboxBatch(requested=n)
+        _check_key(idempotency_key)
+        out = SandboxBatch(requested=n, run_id=run_id)
         try:
-            left = n
+            left, call = n, 0
             while left > 0:
-                k = min(left, MAX_FORK)
+                k = min(left, MAX_FORK_PER_CALL)
                 body = _fork_body(k, labels, run_id, lease_s, partial_ok)
-                r = self._cloud._request("POST", self._path("/fork"), body) or {}
+                r = self._cloud._request("POST", self._path("/fork"), body,
+                                         idempotency_key=_chunk_key(idempotency_key, call)) or {}
                 part = _batch_from(self._cloud, r, CloudSandbox, k)
+                _reindex(part.failed, n - left)
                 out.extend(part)
                 out.failed.extend(part.failed)
                 left -= k
+                call += 1
         except BaseException:
             for child in out:
                 _quiet_delete(child)
@@ -1078,6 +1244,7 @@ class CloudSandbox:
         keep: bool = False,
         run_id: Optional[str] = None,
         rollout: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> GradeResult:
         """Grade this sandbox's state with hidden tests, in a sealed fork.
 
@@ -1086,14 +1253,23 @@ class CloudSandbox:
         sees them), runs ``cmd`` and deletes the copy (unless ``keep``). The
         reward is the last stdout line that is JSON with a numeric
         ``"reward"`` (``{"reward": 0.5, "metrics": {...}}``), else 1.0 for
-        exit 0 and 0.0 otherwise. With ``run_id`` it is recorded as a rollout
-        of that run (``rollout``: ``step``, ``group``, ``index``, ``meta``).
-        The request, files included (base64), is at most 64 KiB.
+        exit 0 and 0.0 otherwise; ``None`` (``failure_class`` ``timeout`` or
+        ``infra``) when the command did not finish. With ``run_id`` kosa8
+        Cloud records it as a rollout of that run (``rollout``: ``step``,
+        ``group``, ``index``, ``meta``; ``.recorded`` says it did), so do not
+        record it again.
+
+        ``files``: at most 64, adding up to 8 MiB before base64 (a
+        ``ValueError`` here otherwise). ``timeout_s``: 1 to 90 whole seconds.
+        The call carries an ``Idempotency-Key`` (``idempotency_key``, default
+        a new UUID) that its retries reuse: a retry after a timeout or a 5xx
+        gets the first grade's answer, and records nothing twice.
         """
         amb = _ambient(self._cloud)
         run_id = amb.get("run_id") if run_id is None else run_id
         body = _grade_body(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout)
-        return _grade_result(self._cloud._request("POST", self._path("/grade"), body) or {})
+        return _grade_result(self._cloud._request("POST", self._path("/grade"), body,
+                                                  idempotency_key=idempotency_key) or {})
 
     def heartbeat(self, *, extend_s: Optional[int] = None) -> int:
         """Push back this sandbox's lease; see :meth:`CloudSandboxes.heartbeat`."""
@@ -1345,6 +1521,35 @@ class CloudFunctions:
         if concurrency is not None:
             body["concurrency"] = concurrency
         return self._cloud._request("POST", self._path(name, "/map"), body)
+
+
+#: Drain calls at most (1000 sandboxes each).
+_DRAIN_ROUNDS = 100
+
+
+def _drain_add(out: Dict[str, Any], r: Mapping[str, Any]) -> bool:
+    """Add one drain answer to ``out``; True if another call is worth making."""
+    n = int(r.get("deleted", 0) or 0)
+    out["deleted"] += n
+    out["ids"].extend(r.get("ids") or [])
+    out["failed"].extend(r.get("failed") or [])
+    return bool(r.get("more")) and n > 0
+
+
+def _chunk_key(key: Optional[str], call: int) -> Optional[str]:
+    """The Idempotency-Key of a fork's ``call``-th request (``None``: a new one)."""
+    if key is None or call == 0:
+        return key
+    suffix = f"-{call + 1}"
+    return key[: 255 - len(suffix)] + suffix
+
+
+def _reindex(failed: List[Dict[str, Any]], offset: int) -> None:
+    """Make a later fork call's ``failed[i].index`` count from the first copy."""
+    if offset:
+        for f in failed:
+            if _is_int(f.get("index")):
+                f["index"] += offset
 
 
 def _quiet_delete(box: Any) -> None:

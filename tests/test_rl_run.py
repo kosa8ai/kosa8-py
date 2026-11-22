@@ -68,7 +68,7 @@ class RunLifecycle(unittest.TestCase):
         self.assertEqual(len(grades), 4)
         self.assertEqual(grades[0]["files"], {"/grader/test.py": "cHJpbnQoJ2hpZGRlbicp"})
         self.assertEqual(grades[0]["run_id"], rid)
-        self.assertEqual(sorted(g["rollout"]["group"] for g in grades), [0, 1, 2, 3])
+        self.assertEqual(sorted(g["rollout"]["group"] for g in grades), ["0", "1", "2", "3"])  # the grader takes a string
         self.assertEqual({g["rollout"]["step"] for g in grades}, {0})
         self.assertEqual(grades[0]["rollout"]["meta"]["task"][0], "t")
         self.assertNotIn(base.id, seen)
@@ -278,7 +278,7 @@ class Leases(unittest.TestCase):
                 time.sleep(0.01)
         self.assertGreaterEqual(ls.beats, 2)
         self.assertEqual(self.fake.heartbeats[0], {"labels": {"job": "j1"}, "extend_s": 120})
-        self.assertEqual(ls.drained, {"deleted": 1, "failed": []})
+        self.assertEqual((ls.drained["deleted"], ls.drained["failed"]), (1, []))
         self.assertNotIn(a.id, self.fake.live())
         self.assertTrue(ls.closed)
         self.assertEqual(ls.close(), ls.drained)  # idempotent

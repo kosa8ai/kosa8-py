@@ -457,7 +457,7 @@ class SweBench(unittest.TestCase):
         self.assertEqual(g.reward, 1.0)
         self.assertEqual(fake.sandboxes[box.id]["files"]["/workspace/.kosa8/patch.diff"], b"--- a\n+++ b\n")
         grade = [b for m, p, b in fake.calls if p.endswith("/grade")][0]
-        self.assertEqual((grade["cmd"], grade["run_id"], grade["timeout_s"]), (swebench.GRADE_CMD, "run_s", 1800))
+        self.assertEqual((grade["cmd"], grade["run_id"], grade["timeout_s"]), (swebench.GRADE_CMD, "run_s", 90))
         fake.on_exec = lambda sb, argv, env: {"exit": 1, "stdout": "", "stderr": "error: patch failed"}
         with self.assertRaises(ValueError):
             swebench.grade(box, self.INSTANCE, patch="bad")

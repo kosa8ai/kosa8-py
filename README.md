@@ -169,8 +169,11 @@ Every Cloud error carries the server's stable `e.code` and its message, and
 Since 0.5.0 the client retries what is safe to send again: reads, deletes,
 heartbeats and drains on infra failures (no answer, 5xx, host or capacity
 codes), and any request on a 429, waiting at least its `Retry-After`. Waits
-are exponential with full jitter, 3 tries by default. A create, exec or grade
-that failed with a 5xx is **not** resent, since it may have run.
+are exponential with full jitter, 3 tries by default. Creates, batches, forks
+and grades carry an `Idempotency-Key` that their retries reuse, so they are
+retried on infra failures too and kosa8 Cloud answers a retry with the first
+answer. Other POSTs (an exec, recording rollouts) that failed with a 5xx are
+**not** resent, since they may have run.
 `Kosa8Cloud(retry=kosa8.RetryPolicy(attempts=5))` changes it;
 `retry=kosa8.NO_RETRY` turns it off.
 
@@ -227,12 +230,15 @@ exit. If the process is killed outright, kosa8 Cloud deletes the sandboxes
 |---|---|---|
 | `ok` / `exit_nonzero` | the command or grader ran (it passed or failed) | - |
 | `timeout` | an exec or grader ran past its limit | no |
-| `infra` | host failed, not ready, no capacity, 5xx, no answer | yes |
+| `infra` | host failed, not ready, no capacity, 5xx, no answer | yes (not a 501: the host lacks the feature) |
 | `quota` | running or plan limit, payment (402), frozen org; a 429 rate limit | only 429 |
-| `client` | a bad request, 404 or 409 | no |
+| `client` | a bad request, 404, 409, 410, 413 or 422 | no (except `409 idempotency_in_progress`) |
 | `error` | your own code raised (SDK-side class) | no |
 
-`kosa8.classify_failure(exc)` gives `(failure_class, retryable)` for any exception.
+`kosa8.classify_failure(exc)` gives `(failure_class, retryable)` for any
+exception, and `kosa8.failure_of(status, code)` the server's rule for an HTTP
+status and error code. A rollout whose own code raised (`error`) is recorded on
+the run as `client`, with `sdk_failure_class: "error"` in its meta.
 
 **Building blocks.** These work on both `kosa8.Cloud` and `kosa8.AsyncCloud`:
 
@@ -265,10 +271,27 @@ the same loop with `async def solve` ([examples/rl/async_rollouts.py](examples/r
 | `kosa8.rl.gym` | a Gymnasium-style `SandboxEnv`: the actions are shell commands and `submit` grades |
 | `kosa8.rl.swebench` | SWE-bench: `create` (the instance image), `apply_patch`, `grade` and `tasks` with the hidden tests ([swebench_grade.py](examples/rl/swebench_grade.py)) |
 
-Limits to plan around: a buffered exec runs at most 90 s, and a request body
-(grader files included, as base64) is at most 64 KiB. One fork call makes 100
-sandboxes and one batch call makes 1000. Your plan's running limit also
-applies; past it, a batch reports the rest as `running_limit` in `.failed`.
+Limits to plan around: a buffered exec (the grader's command included) runs
+at most 90 s, and an exec request (command and env) is at most 64 KiB. A
+grade takes at most 64 hidden files, adding up to 8 MiB before base64 (the SDK
+raises `ValueError` past that); a recorded rollout keeps 8 KiB of `meta` and
+4 KiB of stdout. One fork call makes up to 1000 copies (100 at a time on the
+parent's host) and one batch call makes 1000; a lease is 60 s to 24 hours.
+Your plan's running limit also applies: past it, a batch or fork reports the
+rest as `running_limit` in `.failed`, and one that made none raises the first
+refusal (with `requested`, `created: 0` and `failed` in the error's `.body`).
+
+**Safe retries.** Creates, batches, forks and grades send an
+`Idempotency-Key` (a new UUID, or `idempotency_key=` yours) that every retry
+reuses; kosa8 Cloud keeps the answer for 24 hours and replays it. So the SDK
+retries those calls after a timeout or a 5xx too, and a retried grade records
+its rollout once. The same key with another body is `422
+idempotency_mismatch`; a duplicate that arrives while the first is still
+running waits for it, or gets `409 idempotency_in_progress`, which the SDK
+retries. A grade given a run (inside `Run`, or `run_id=`) is recorded by kosa8
+Cloud itself (`GradeResult.recorded`), so `Run.map` does not record it again.
+A grade whose command did not finish has `reward=None` and failure class
+`timeout` or `infra`: masked, never scored 0.
 
 ## Quickstart: local daemon
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .._forkmap import ChildPool, ItemTimeout, backoff, call_with_timeout, run_pool
-from ..cloud import GradeResult
+from ..cloud import ROLLOUT_STDOUT_TAIL, GradeResult, fit_meta
 from ..errors import classify_failure
 from .. import retry as _retry
 from ..retry import RetryPolicy, acall_with_retry, call_with_retry
@@ -75,10 +75,16 @@ class RolloutResult:
             meta["error"] = self.error[:2000]
         if self.attempts > 1:
             meta["attempts"] = self.attempts
+        # The server keeps failure classes it knows; the SDK's own "error"
+        # (your solve raised) is recorded as "client", with the error in meta.
+        fc = self.failure_class if self.failure_class != "error" else "client"
+        if self.failure_class == "error":
+            meta["sdk_failure_class"] = "error"
         row: Dict[str, Any] = {
-            "step": self.step, "group": self.group, "index": self.index, "sandbox_id": self.sandbox_id,
-            "reward": self.reward, "failure_class": self.failure_class, "exit": self.exit_code,
-            "duration_ms": self.duration_ms, "meta": meta, "stdout_tail": (self.stdout or "")[-STDOUT_TAIL:],
+            "step": self.step, "group": str(self.group), "index": self.index, "sandbox_id": self.sandbox_id,
+            "reward": self.reward, "failure_class": fc, "exit": self.exit_code,
+            "duration_ms": self.duration_ms, "meta": fit_meta(meta) if meta else None,
+            "stdout_tail": (self.stdout or "")[-ROLLOUT_STDOUT_TAIL:],
         }
         if self.tokens is not None:
             row["tokens"] = self.tokens
@@ -158,7 +164,7 @@ def _from_output(res: RolloutResult, out: Any) -> bool:
     return False
 
 
-def _apply_grade(res: RolloutResult, g: GradeResult, recorded: bool) -> None:
+def _apply_grade(res: RolloutResult, g: GradeResult) -> None:
     res.reward = g.reward
     res.metrics = g.metrics
     res.exit_code = g.exit_code
@@ -166,7 +172,28 @@ def _apply_grade(res: RolloutResult, g: GradeResult, recorded: bool) -> None:
     res.stderr = g.stderr[-STDOUT_TAIL:]
     res.failure_class = g.failure_class
     res.grader_id = g.grader_id
-    res.recorded = recorded
+    if g.reward is None and g.error:
+        res.error = f"grader: {g.error}: {g.message or ''}".rstrip(": ")
+    # kosa8 Cloud recorded it (source "grade") when given a run: never twice.
+    # recorded False (recording failed there) leaves it to Run.record.
+    res.recorded = g.recorded is True
+
+
+class _GradeDidNotFinish(Exception):
+    """A grade that answered 200 but whose command did not finish on a
+    retryable failure (the host failed): raised so the retry loop grades again
+    (with a new Idempotency-Key, since a replay would give the same answer)."""
+
+    def __init__(self, grade: GradeResult) -> None:
+        super().__init__(grade.message or grade.error or "the grader did not finish")
+        self.grade = grade
+        self.body = {"failure_class": grade.failure_class, "retryable": True}
+
+
+def _settled(g: GradeResult) -> GradeResult:
+    if g.reward is None and g.retryable:
+        raise _GradeDidNotFinish(g)
+    return g
 
 
 _NO_REWARD = (
@@ -290,12 +317,16 @@ def run_map(
                 if spec.grade_cmd is not None:
                     # The solved state is still there: retry the grader alone, not the agent.
                     gc = child
-                    g = call_with_retry(
-                        lambda: gc.grade(spec.grade_cmd, files=spec.files_for(task), timeout_s=spec.grade_timeout_s,
-                                         env=spec.grade_env, run_id=run_id, rollout=spec.rollout_info(res)),
-                        policy, sleep=stop.wait,
-                    )
-                    _apply_grade(res, g, recorded=bool(run_id))
+                    try:
+                        g = call_with_retry(
+                            lambda: _settled(gc.grade(spec.grade_cmd, files=spec.files_for(task),
+                                                      timeout_s=spec.grade_timeout_s, env=spec.grade_env,
+                                                      run_id=run_id, rollout=spec.rollout_info(res))),
+                            policy, sleep=stop.wait,
+                        )
+                    except _GradeDidNotFinish as e:
+                        g = e.grade  # still not finished: masked below, already recorded as infra
+                    _apply_grade(res, g)
                 elif spec.reward is not None:
                     r = spec.reward(child, task, out)
                     if not _from_output(res, r):
@@ -437,13 +468,17 @@ async def map_rollouts(
                     gave = _from_output(res, out)
                     if spec.grade_cmd is not None:
                         gc = child
-                        g = await acall_with_retry(
-                            lambda: gc.grade(spec.grade_cmd, files=spec.files_for(task),
-                                             timeout_s=spec.grade_timeout_s, env=spec.grade_env, run_id=run_id,
-                                             rollout=spec.rollout_info(res)),
-                            policy,
-                        )
-                        _apply_grade(res, g, recorded=bool(run_id))
+
+                        async def grade_once() -> GradeResult:
+                            return _settled(await gc.grade(spec.grade_cmd, files=spec.files_for(task),
+                                                           timeout_s=spec.grade_timeout_s, env=spec.grade_env,
+                                                           run_id=run_id, rollout=spec.rollout_info(res)))
+
+                        try:
+                            g = await acall_with_retry(grade_once, policy)
+                        except _GradeDidNotFinish as e:
+                            g = e.grade
+                        _apply_grade(res, g)
                     elif spec.reward is not None:
                         r = spec.reward(child, task, out)
                         if asyncio.iscoroutine(r):

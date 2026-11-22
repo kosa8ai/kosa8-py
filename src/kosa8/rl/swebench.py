@@ -19,7 +19,9 @@ from the ``swebench`` package's own test spec. No SWE-bench import is needed.
 
 Sandboxes are ``persistent`` (one long-lived container), so changes outside
 ``/workspace`` (the repository is at ``/testbed``) stay between commands.
-The grade request, test patch included, is at most 64 KiB.
+The hidden files (test patch and runner) are at most 64 and 8 MiB in all,
+and the grader's command runs at most 90 s (a buffered exec); a test run
+that needs longer is reported ``timeout``, not reward 0.
 """
 
 from __future__ import annotations
@@ -99,7 +101,7 @@ def tasks(instances: Sequence[Mapping[str, Any]], *, test_cmd: Optional[str] = N
 
 
 def grade(sandbox: Any, instance: Mapping[str, Any], *, patch: Optional[str] = None, test_cmd: Optional[str] = None,
-          timeout_s: Optional[float] = 1800, run_id: Optional[str] = None,
+          timeout_s: Optional[float] = 90, run_id: Optional[str] = None,
           rollout: Optional[Mapping[str, Any]] = None) -> Any:
     """Grade the sandbox's ``/testbed`` (after applying ``patch``, if given)
     with the instance's hidden tests, in a sealed fork; a :class:`~kosa8.GradeResult`."""

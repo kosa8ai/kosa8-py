@@ -106,9 +106,13 @@ class Run:
         return cls(cloud, run_id=run_id, **kw)
 
     @staticmethod
-    def list(cloud: Any, *, project: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:  # noqa: A003
-        """The org's runs, with their summary counts."""
-        q = {k: v for k, v in (("project", project), ("status", status)) if v}
+    def list(  # noqa: A003
+        cloud: Any, *, project: Optional[str] = None, status: Optional[str] = None, name: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """The org's runs, newest first (at most ``limit``, up to 100), each
+        with a short ``summary`` and its ``recommendations`` count."""
+        q = {k: str(v) for k, v in (("project", project), ("status", status), ("name", name), ("limit", limit)) if v}
         r = cloud._request("GET", "/v1/rl/runs" + ("?" + urllib.parse.urlencode(q) if q else "")) or {}
         return list(r.get("runs", []))
 
@@ -201,7 +205,10 @@ class Run:
 
     def flush(self) -> int:
         """Send every buffered rollout now; returns how many were recorded.
-        On an error the unsent rows stay buffered and the error is raised."""
+        On an error the unsent rows stay buffered and the error is raised.
+        (Recording carries no Idempotency-Key on kosa8 Cloud, so a call is not
+        resent after a 5xx; a call whose answer was lost and is sent again by
+        the next flush may record its rows twice.)"""
         sent = 0
         with self._flush_lock:
             while True:
@@ -242,11 +249,15 @@ class Run:
 
     def rollouts(
         self, *, step: Optional[int] = None, failure_class: Optional[str] = None, min_reward: Optional[float] = None,
-        limit: Optional[int] = None, cursor: Optional[str] = None,
+        max_reward: Optional[float] = None, sandbox_id: Optional[str] = None, limit: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """One page of recorded rollouts: ``{"rollouts": [...], "next_cursor": ...}``."""
+        """One page of recorded rollouts (at most 500), oldest first:
+        ``{"rollouts": [...], "next_cursor": ...}``. Each has ``source``:
+        ``grade`` (recorded by the sealed grader) or ``api`` (by :meth:`record`)."""
         q = {k: str(v) for k, v in (("step", step), ("failure_class", failure_class), ("min_reward", min_reward),
-                                     ("limit", limit), ("cursor", cursor)) if v is not None}
+                                     ("max_reward", max_reward), ("sandbox_id", sandbox_id), ("limit", limit),
+                                     ("cursor", cursor)) if v is not None}
         return self.cloud._request("GET", self._path("/rollouts" + ("?" + urllib.parse.urlencode(q) if q else ""))) or {}
 
     def export(self, path: Optional[str] = None) -> bytes:

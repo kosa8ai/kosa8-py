@@ -243,25 +243,61 @@ def error_from_response(
 #: ``error`` is the SDK's own: your code raised something that is not a kosa8 error.
 FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "infra", "quota", "client", "error")
 
+# The server's lists (workers/cloud-api/src/failures.js), for an error body
+# that came without failure_class (an older Worker, a proxy's answer).
 _INFRA_CODES = frozenset({
-    "host_failed", "not_ready", "host_gone", "host_lost", "host_removed", "capacity", "no_capacity",
-    "placement", "placement_failed", "unavailable", "internal", "upstream",
+    "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",
+    "wake_failed", "try_again", "internal", "kernel_failed", "egress_failed", "dns_unreachable", "host_lost",
+    "host_removed", "insufficient_storage", "starting",
 })
+_RATE_CODES = frozenset({"rate_limited", "slow_down", "too_soon"})
 _QUOTA_CODES = frozenset({
-    "running_limit", "quota_exceeded", "plan_limit", "payment_required", "spending_cap_reached", "org_frozen",
+    "quota_exceeded", "running_limit", "plan_required", "plan_limit", "plan_feature", "payment_required",
+    "payment_declined", "spending_cap_reached", "snapshot_limit", "org_frozen", "org_suspended", "too_many_runs",
 })
+#: A duplicate of an Idempotency-Key request that is still running: asking
+#: again (after its ``retry_after_s``) gets the first one's answer.
+IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
+
+
+def failure_of(status: Optional[int], code: Optional[str] = None) -> "tuple[str, bool]":
+    """``(failure_class, retryable)`` for an HTTP status and error code, as
+    kosa8 Cloud works it out (``failureOf`` in its failures.js)."""
+    c = code if isinstance(code, str) else ""
+    if status is None or status < 400:
+        return "ok", False
+    if c == "exec_timeout":
+        return "timeout", False
+    if "timeout" in c:
+        return "timeout", True
+    if c in _RATE_CODES:
+        return "quota", True
+    if c in _QUOTA_CODES or status in (402, 423):
+        return "quota", False
+    if status == 429:
+        return "quota", c != "quota_exceeded"
+    if c in ("not_available", "not_supported") or status == 501:
+        return "infra", False
+    if c in _INFRA_CODES or status >= 500:
+        return "infra", True
+    return "client", False
 
 
 def classify_failure(exc: BaseException) -> "tuple[str, bool]":
     """``(failure_class, retryable)`` for any exception.
 
     A kosa8 Cloud error body's ``failure_class`` and ``retryable`` are used as
-    sent. Otherwise: no answer, a 5xx (not 501) or a host/capacity code is
-    ``infra`` (retryable); an exec past its limit is ``timeout``; 402, 423 and
-    plan/running limits are ``quota``; 429 is ``quota`` and retryable unless it
-    is a used-up quota; any other 4xx and 501 are ``client``. An exception that
-    is not a :class:`Kosa8Error` is ``error`` (not retryable): a bug in your code.
+    sent. Otherwise the server's rules (:func:`failure_of`): no answer, a 5xx
+    (not 501) or a host/capacity code is ``infra`` (retryable); an exec past
+    its limit is ``timeout``; 402, 423 and plan/running limits are ``quota``;
+    429 is ``quota`` and retryable unless it is a used-up quota; 501 is
+    ``infra`` but not retryable (the host lacks the feature); any other 4xx is
+    ``client``. ``409 idempotency_in_progress`` is retryable: the first
+    request with that key is still running. An exception that is not a
+    :class:`Kosa8Error` is ``error`` (not retryable): a bug in your code.
     """
+    if isinstance(exc, Kosa8Error) and exc.code == IDEMPOTENCY_IN_PROGRESS:
+        return "client", True
     body = getattr(exc, "body", None)
     if isinstance(body, dict) and isinstance(body.get("failure_class"), str):
         fc = body["failure_class"]
@@ -271,6 +307,13 @@ def classify_failure(exc: BaseException) -> "tuple[str, bool]":
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return "infra", True
         return "error", False
+    if isinstance(exc, Kosa8ExecTimeoutError):
+        return "timeout", False
+    if isinstance(exc, (Kosa8ConnectionError, Kosa8TimeoutError)):
+        return "infra", True
+    if exc.status is None:
+        return "error", False
+    return failure_of(exc.status, exc.code)
     if isinstance(exc, Kosa8ExecTimeoutError):
         return "timeout", False
     if isinstance(exc, (Kosa8ConnectionError, Kosa8TimeoutError)):
