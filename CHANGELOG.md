@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: the E2B code-interpreter shim (`kosa8.compat.e2b_code_interpreter.Sandbox`) creates a persistent sandbox. Before, its first `run_code` failed with 409 `not_persistent`, because the code interpreter keeps Python running between cells and kosa8 Cloud runs it only in a persistent sandbox. A persistent sandbox counts against the plan's persistent-sandbox limit; a `snap_...` template is started as the snapshot was.
+- The E2B shims start kosa8's `python` template when no template is given, and for E2B's `base`: E2B's default image has Python, kosa8's `base` (Alpine) does not, so the README's own `python3 app.py` failed with `python3: not found`. Pass another template key for anything else.
+- A 409 `not_persistent` (native `box.run_code` on a sandbox created without `persistent=True`) says how to fix it in Python: `cloud.sandboxes.create(template="python", persistent=True)`, or the code-interpreter shim.
+- README: `pip install kosa8` (no version floor); the LangChain, Inspect and Harbor adapters are `pip install langchain-kosa8` / `inspect-kosa8` / `harbor-kosa8`; what persists between commands (only `/workspace`, unless the sandbox is persistent) matches the server; a "same thing in each language" table for the five SDKs.
 - `CloudSandbox.exec(cmd, timeout_s=)` and `AsyncCloudSandbox.exec(cmd, timeout_s=)`: the API's `timeout_s` (1 to 90 whole seconds) stops the command in the sandbox when it runs that long, and raises `Kosa8ExecTimeoutError` (without the 90 s hint, which is about the buffered limit). There was no way to set it from the cloud clients; any other value is a `ValueError` before the call. The JS SDK's `exec({ timeoutS })` already had it.
 
 ## 0.5.4

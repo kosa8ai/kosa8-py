@@ -189,6 +189,10 @@ class FakeCloud:
             return 201, {"link": {"url": f"https://h.example/dl?path={b['path']}&m={b.get('method', 'GET')}", "expires_at": 1}}
         if rest == "/previews":
             return 201, {"preview": {"port": b["port"], "url": f"https://p{b['port']}.example/?t=sig"}}
+        if rest.startswith("/code") and not self.boxes.get(sid, {}).get("persistent"):
+            # Like workers/cloud-api/src/code.js: the interpreter needs a persistent sandbox.
+            return 409, {"error": "not_persistent", "message": "the code interpreter keeps state in a long-lived process, "
+                         "which needs a persistent sandbox: create one with \"persistent\": true"}
         if rest == "/code":
             return 200, self.code_answer
         if rest == "/code/contexts" and method == "POST":

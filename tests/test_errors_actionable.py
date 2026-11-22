@@ -57,6 +57,18 @@ class CloudErrorTest(unittest.TestCase):
         self.assertEqual(
             str(e), "no capacity: fork fewer or retry in 10 s [HTTP 503 no_capacity; retry in 10 s; request a5e77ddee9ef8120-BOS]")
 
+    def test_not_persistent_run_code_says_how_in_python(self):
+        body = {"error": "not_persistent", "message": "the code interpreter keeps state in a long-lived process, "
+                "which needs a persistent sandbox: create one with \"persistent\": true"}
+        cloud = Kosa8Cloud(KEY, env={}, retry=NO_RETRY, opener=opener(409, body, {"X-Request-Id": "req_1"}))
+        from kosa8.cloud import CloudSandbox
+        box = CloudSandbox(cloud, {"id": "sbx_1", "state": "running"})
+        e = raised(cloud, lambda c: box.run_code("1"))
+        self.assertIsInstance(e, Kosa8ConflictError)
+        self.assertEqual(e.code, "not_persistent")
+        self.assertIn('persistent=True', str(e))
+        self.assertIn("request req_1", str(e))
+
     def test_x_request_id_wins_over_cf_ray(self):
         cloud = Kosa8Cloud(KEY, env={}, retry=NO_RETRY, opener=opener(
             404, {"error": "not_found", "message": "no such sandbox"}, {"x-request-id": "req_1", "CF-Ray": "r-2"}))

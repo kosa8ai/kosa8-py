@@ -708,6 +708,8 @@ def _is_exec_timeout(status: int, code: Optional[str], message: str, path: str) 
 #: Where a person makes a kosa8 Cloud API key.
 KEYS_URL = "https://app.kosa8.com/app#keys"
 _KEY_HINT = f"check KOSA8_API_KEY, or make a new key at {KEYS_URL}"
+_PERSISTENT_HINT = ("in Python: cloud.sandboxes.create(template=\"python\", persistent=True); "
+                    "or use kosa8.compat.e2b_code_interpreter.Sandbox, which creates one")
 
 
 def _request_id(headers: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -748,6 +750,8 @@ def _cloud_error(
         msg_body = {"error": body.get("message") or body.get("error")}
         if status == 401 and code == "unauthorized":
             msg_body["remediation"] = _KEY_HINT
+        elif code == "not_persistent":
+            msg_body["remediation"] = _PERSISTENT_HINT
     if isinstance(msg_body, dict):
         message = str(msg_body.get("error") or "")
     else:
@@ -1459,7 +1463,9 @@ class CloudSandbox:
         self, code: str, *, context: Optional[str] = None, language: Optional[str] = None, timeout_s: Optional[float] = None
     ) -> Dict[str, Any]:
         """Run a Python cell in a stateful context (globals persist between
-        calls). Answers ``results`` (text, ``image/png`` charts, ...),
+        calls). The sandbox must be persistent (``sandboxes.create(...,
+        persistent=True)``); otherwise this raises :class:`Kosa8ConflictError`
+        ``not_persistent``. Answers ``results`` (text, ``image/png`` charts, ...),
         ``stdout``, ``stderr`` and ``error`` when it raised."""
         body: Dict[str, Any] = {"code": code}
         if context is not None:

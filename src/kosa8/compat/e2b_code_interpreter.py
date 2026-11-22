@@ -7,7 +7,10 @@ Mirrors ``e2b-code-interpreter`` **2.11.10** (``Sandbox.run_code``,
 ``create_code_context``, ``list_code_contexts``, ``remove_code_context``,
 ``restart_code_context`` and the ``Execution`` / ``Result`` / ``Logs``
 models), on top of everything :mod:`kosa8.compat.e2b` mirrors. Sandboxes
-start from kosa8's ``python`` template unless ``template=`` says otherwise.
+start from kosa8's ``python`` template unless ``template=`` says otherwise,
+and are persistent (one long-lived container), because the interpreter keeps
+its Python process between cells. A persistent sandbox counts against the
+plan's persistent-sandbox limit.
 Python cells only; other languages raise :class:`kosa8.compat.Unsupported`.
 """
 
@@ -21,9 +24,10 @@ MIRRORS = {"e2b-code-interpreter": "2.11.10", "e2b": "2.64.0"}
 
 
 class Sandbox(_e2b.Sandbox):
-    """E2B's code-interpreter ``Sandbox``; its default template is kosa8's ``python``."""
+    """E2B's code-interpreter ``Sandbox``: kosa8's ``python`` template, persistent."""
 
     _default_template = "python"
+    _persistent = True
 
 
 __all__ = list(_e2b.__all__)
