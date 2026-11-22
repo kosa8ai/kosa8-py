@@ -59,7 +59,7 @@ class RunLifecycle(unittest.TestCase):
         # The base was labelled and leased by the open run; the run was created, then finished.
         rid = run.id
         create = [b for m, p, b in self.fake.calls if m == "POST" and p == "/v1/sandboxes"][0]
-        self.assertEqual(create, {"template": "python", "lease_s": 600})
+        self.assertEqual(create, {"template": "python", "lease_s": 600, "labels": {"kosa8.run": run.id}})
         self.assertEqual(self.fake.runs[rid]["status"], "finished")
         self.assertEqual(self.fake.runs[rid]["name"], "my-grpo-run")
         # Children are forks of base, graded with the hidden files and run id, then deleted; at exit
@@ -250,6 +250,7 @@ class RunMap(unittest.TestCase):
         self.assertEqual(len(made), 2)
         self.assertTrue(all(r.ok for r in list(res) + list(res2) + list(res3)))
         creates = [b for m, p, b in self.fake.calls if m == "POST" and p == "/v1/sandboxes"]
+        creates = [{k: v for k, v in c.items() if k != "labels"} for c in creates]  # each also has kosa8.run
         self.assertIn({"template": "python", "lease_s": 600}, creates)
         self.assertIn({"snapshot": "snap_abc", "lease_s": 600}, creates)
         self.assertEqual(self.fake.live(), [])

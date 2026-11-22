@@ -107,9 +107,10 @@ class AsyncCloudTest(AsyncBase):
 
     def test_create_cancelled_deletes(self):
         async def go():
-            self.fake.before = lambda m, p, b: (400, {"error": "invalid_labels", "message": "no"}) \
-                if p.endswith("/labels") else None
-            with self.assertRaises(Kosa8ApiError):
+            self.fake.create_state = "creating"
+            self.fake.before = lambda m, p, b: (200, {"sandbox": {"id": p.rsplit("/", 1)[1], "state": "error"}}) \
+                if m == "GET" and p.startswith("/v1/sandboxes/sbx_") else None
+            with self.assertRaises(Exception):
                 await self.cloud.sandboxes.create(labels={"a": "b"})
             self.assertEqual(self.fake.live(), [])
 

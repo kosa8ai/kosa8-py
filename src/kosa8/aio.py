@@ -272,7 +272,7 @@ class AsyncCloudSandboxes:
     ) -> "AsyncCloudSandbox":
         """Start a sandbox; see :meth:`kosa8.CloudSandboxes.create`. Use it as
         ``async with await cloud.sandboxes.create(...) as box:`` to delete it on the way out."""
-        body, labels = _create_body(
+        body = _create_body(
             self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
@@ -283,8 +283,6 @@ class AsyncCloudSandboxes:
         try:
             if wait and box.state not in _SETTLED:
                 await box.wait_until_running(timeout=wait_timeout)
-            if labels is not None:
-                await box.set_labels(labels)
         except BaseException:
             await _aquiet_delete(box)
             raise

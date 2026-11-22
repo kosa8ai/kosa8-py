@@ -381,6 +381,27 @@ class FlushKeysPrefixSwebench(unittest.TestCase):
             self.fake.before = None
         self.assertEqual(len(keys(self.fake, "POST", "/rollouts")), 2)
 
+    def test_create_sends_labels_in_the_body(self):
+        self.fake.create_state = "creating"
+        seen = {}
+        orig = self.fake._route
+
+        def route(method, path, query, body):
+            if method == "GET" and path.startswith("/v1/sandboxes/sbx_") and "during" not in seen:
+                # While it boots, a drain by run id already sees it.
+                seen["during"] = [s["id"] for s in self.fake._match({"run_id": "run_l"})]
+            return orig(method, path, query, body)
+
+        self.fake._route = route
+        box = self.cloud.sandboxes.create(run_id="run_l", labels={"team": "a"})
+        create = [b for m, p, b in self.fake.calls if m == "POST" and p == "/v1/sandboxes"][-1]
+        self.assertEqual(create["labels"], {"team": "a", "kosa8.run": "run_l"})
+        self.assertEqual(seen["during"], [box.id])
+        self.assertFalse([c for c in self.fake.calls if c[1].endswith("/labels")])  # no second call
+        self.fake.create_state = "running"
+        self.cloud.sandboxes.create()
+        self.assertNotIn("labels", [b for m, p, b in self.fake.calls if m == "POST" and p == "/v1/sandboxes"][-1])
+
     def test_prefix(self):
         batch = self.cloud.sandboxes.create_many(2, prefix="w")
         self.assertEqual([self.fake.sandboxes[b.id]["name"] for b in batch], ["w-0001", "w-0002"])

@@ -208,7 +208,7 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
     def test_create_lease_and_run_label(self):
         box = self.cloud.sandboxes.create(template="python", lease_s=600, run_id="run_9", labels={"team": "rl"})
         body = bodies(self.fake, "POST", "/v1/sandboxes")[0]
-        self.assertEqual(body, {"template": "python", "lease_s": 600})
+        self.assertEqual(body, {"template": "python", "lease_s": 600, "labels": {"team": "rl", "kosa8.run": "run_9"}})
         self.assertEqual(box.info["labels"], {"team": "rl", "kosa8.run": "run_9"})
         with self.assertRaises(ValueError):
             self.cloud.sandboxes.create(lease_s=10)
@@ -216,11 +216,15 @@ class BatchForkLeaseDrainGrade(unittest.TestCase):
             self.cloud.sandboxes.create(labels={str(i): "x" for i in range(17)})
 
     def test_create_deletes_when_it_cannot_finish(self):
-        def bad_labels(m, p, b):
-            return (400, {"error": "invalid_labels", "message": "no"}) if p.endswith("/labels") else None
+        self.fake.create_state = "creating"
 
-        self.fake.before = bad_labels
-        with self.assertRaises(Kosa8ApiError):
+        def fails_to_boot(m, p, b):
+            if m == "GET" and p.startswith("/v1/sandboxes/sbx_"):
+                return 200, {"sandbox": {"id": p.rsplit("/", 1)[1], "state": "error", "last_error": "boot"}}
+            return None
+
+        self.fake.before = fails_to_boot
+        with self.assertRaises(Kosa8Error):
             self.cloud.sandboxes.create(labels={"a": "b"})
         self.assertEqual(self.fake.live(), [])
 

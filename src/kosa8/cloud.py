@@ -720,8 +720,10 @@ def _create_body(
     snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
     secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
     run_id: Optional[str],
-) -> "tuple[Dict[str, Any], Optional[Dict[str, str]]]":
-    """The body of ``POST /v1/sandboxes`` (checked), and the labels to set after it."""
+) -> Dict[str, Any]:
+    """The body of ``POST /v1/sandboxes`` (checked). Labels, ``kosa8.run``
+    included, go in the body: kosa8 Cloud stores them before it answers, so a
+    run's sandbox is found by drain and heartbeat while it boots."""
     _check_lifetime(ttl_s, delete_after)
     _check_sleep_after(sleep_after_s)
     amb = _ambient(cloud)
@@ -776,7 +778,9 @@ def _create_body(
         body["egress"] = dict(egress)
     if secrets is not None:
         body["secrets"] = list(secrets)
-    return body, (dict(labels) if labels is not None else None)
+    if labels:
+        body["labels"] = dict(labels)
+    return body
 
 
 class CloudSandboxes:
@@ -831,7 +835,8 @@ class CloudSandboxes:
         (``snap_...`` or a snapshot dict) starts it as the snapshot was; it
         then takes no template, size, image, disk, docker, persistent, cpu or
         region. ``egress`` is its starting network policy, ``secrets`` names
-        org secrets it holds, ``labels`` are set right after it is created.
+        org secrets it holds, ``labels`` are sent with the create (stored
+        before it answers, so they are there while it boots).
 
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
@@ -849,7 +854,7 @@ class CloudSandboxes:
         Cloud keeps the answer 24 hours; the same key with another body is
         ``422 idempotency_mismatch``).
         """
-        body, labels = _create_body(
+        body = _create_body(
             self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
@@ -860,8 +865,6 @@ class CloudSandboxes:
         try:
             if wait and box.state not in _SETTLED:
                 box.wait_until_running(timeout=wait_timeout)
-            if labels is not None:
-                box.set_labels(labels)
         except BaseException:
             # It was made but cannot be handed back: do not leave it running.
             _quiet_delete(box)
