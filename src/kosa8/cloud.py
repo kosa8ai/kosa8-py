@@ -29,6 +29,7 @@ Standard library only, like the rest of the SDK.
 from __future__ import annotations
 
 import base64
+import email.utils
 import json
 import os
 import re
@@ -489,10 +490,13 @@ class Kosa8Cloud:
         env = os.environ if env is None else env
         key = (api_key if api_key is not None else env.get("KOSA8_API_KEY", "")).strip()
         if not key:
-            raise Kosa8Error("no kosa8 Cloud API key: pass api_key or set KOSA8_API_KEY")
+            raise Kosa8Error(
+                "no kosa8 Cloud API key: set KOSA8_API_KEY or pass api_key=...; "
+                f"make one at {KEYS_URL} (API keys)")
         if not key.startswith((CLOUD_KEY_PREFIX, CLOUD_TOKEN_PREFIX)):
             raise Kosa8Error(
-                f"a kosa8 Cloud API key starts with {CLOUD_KEY_PREFIX} (a capability token with {CLOUD_TOKEN_PREFIX})")
+                f"a kosa8 Cloud API key starts with {CLOUD_KEY_PREFIX} (a capability token with {CLOUD_TOKEN_PREFIX}); "
+                f"copy the whole key from {KEYS_URL}")
         self._key = key
         self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or DEFAULT_CLOUD_URL)
         self.timeout = timeout
@@ -635,10 +639,20 @@ class Kosa8Cloud:
                     f"kosa8 Cloud did not answer within {self.timeout} s ({_EXEC_HINT})",
                     method=method, path=path, code="exec_timeout",
                 ) from e
-            raise Kosa8TimeoutError(f"kosa8 Cloud did not answer within {self.timeout} s", method=method, path=path) from e
+            raise Kosa8TimeoutError(_timeout_message(self.timeout), method=method, path=path) from e
         except (urllib.error.URLError, OSError) as e:
-            raise Kosa8ConnectionError(f"could not reach kosa8 Cloud at {self.base_url}: {e}", method=method, path=path) from e
+            raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
         return _parse_answer(answer, method, path, raw)
+
+
+def _timeout_message(timeout: float) -> str:
+    return (f"kosa8 Cloud did not answer within {timeout} s; try again, "
+            f"or give the client more time with Kosa8Cloud(timeout=...)")
+
+
+def _unreachable_message(base_url: str, e: BaseException) -> str:
+    return (f"could not reach kosa8 Cloud at {base_url}: {e}; "
+            "check the network connection and KOSA8_CLOUD_URL, then try again")
 
 
 def _idem_headers(method: str, path: str, key: Optional[str]) -> Dict[str, str]:
@@ -682,17 +696,49 @@ def _is_exec_timeout(status: int, code: Optional[str], message: str, path: str) 
     return status == 502 and _is_exec_path(path) and "timed out" in message.lower()
 
 
+#: Where a person makes a kosa8 Cloud API key.
+KEYS_URL = "https://app.kosa8.com/app#keys"
+_KEY_HINT = f"check KOSA8_API_KEY, or make a new key at {KEYS_URL}"
+
+
+def _request_id(headers: Optional[Mapping[str, str]]) -> Optional[str]:
+    if not headers:
+        return None
+    return _header(headers, "X-Request-Id") or _header(headers, "cf-ray") or None
+
+
+def _retry_after_header(headers: Optional[Mapping[str, str]]) -> Optional[float]:
+    """Retry-After in seconds: delta-seconds or an HTTP date."""
+    ra = _header(headers, "Retry-After") if headers else None
+    if ra is None or not ra.strip():
+        return None
+    try:
+        v = float(ra.strip())
+        return v if v >= 0 else None
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(ra.strip())
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    return max(0.0, when.timestamp() - time.time())
+
+
 def _cloud_error(
     status: int, body: Any, method: str, path: str, headers: Optional[Mapping[str, str]] = None
 ) -> Kosa8Error:
-    # The cloud answers {error: code, message}: the sentence is the message,
-    # and the code is kept.
+    # The cloud answers {error: code, message, retry_after_s?, retryable?, ...}:
+    # the sentence is the message, and the code and the rest are kept.
     code = None
     msg_body = body
     if isinstance(body, dict):
         if isinstance(body.get("error"), str):
             code = body["error"]
         msg_body = {"error": body.get("message") or body.get("error")}
+        if status == 401 and code == "unauthorized":
+            msg_body["remediation"] = _KEY_HINT
     if isinstance(msg_body, dict):
         message = str(msg_body.get("error") or "")
     else:
@@ -706,16 +752,13 @@ def _cloud_error(
     else:
         e = error_from_response(status, msg_body, method=method, path=path, code=code)
     e.body = body
-    if isinstance(e, Kosa8RateLimitError) and headers:
-        ra = _header(headers, "Retry-After")
-        try:
-            e.retry_after = float(ra) if ra is not None else None
-        except ValueError:
-            e.retry_after = None
-    if getattr(e, "retry_after", None) is None and isinstance(body, dict):
-        ra_s = body.get("retry_after_s")  # e.g. 409 idempotency_in_progress
+    e.request_id = _request_id(headers)
+    e.retry_after = _retry_after_header(headers)
+    if e.retry_after is None and isinstance(body, dict):
+        ra_s = body.get("retry_after_s")  # 409 idempotency_in_progress / template_building, 503 no_capacity
         if isinstance(ra_s, (int, float)) and not isinstance(ra_s, bool) and ra_s > 0:
             e.retry_after = float(ra_s)
+    e._api_answer = True
     return e
 
 

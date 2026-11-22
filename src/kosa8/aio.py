@@ -40,6 +40,8 @@ from .cloud import (
     _is_exec_path,
     _is_int,
     _parse_answer,
+    _timeout_message,
+    _unreachable_message,
     _ScopedRetry,
     _selector,
     _urllib_open,
@@ -252,9 +254,9 @@ class AsyncCloud:
                     f"kosa8 Cloud did not answer within {self.timeout} s ({_EXEC_HINT})",
                     method=method, path=path, code="exec_timeout",
                 ) from e
-            raise Kosa8TimeoutError(f"kosa8 Cloud did not answer within {self.timeout} s", method=method, path=path) from e
+            raise Kosa8TimeoutError(_timeout_message(self.timeout), method=method, path=path) from e
         except OSError as e:
-            raise Kosa8ConnectionError(f"could not reach kosa8 Cloud at {self.base_url}: {e}", method=method, path=path) from e
+            raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
         return _parse_answer(answer, method, path, raw)
 
 
