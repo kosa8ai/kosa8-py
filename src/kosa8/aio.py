@@ -291,6 +291,7 @@ class AsyncCloudSandboxes:
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
         record: Optional[bool] = None,
+        ai_gateway: Optional[bool] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -302,6 +303,7 @@ class AsyncCloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
+            ai_gateway=ai_gateway,
         )
         r = await self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = AsyncCloudSandbox(self._cloud, r["sandbox"])

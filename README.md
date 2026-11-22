@@ -133,6 +133,38 @@ hook = cloud.pipelines.hooks.create("https://github.com/me/app", provider="githu
 print(hook["url"], hook["secret"])                    # give both to the repository's webhook settings
 ```
 
+### Browsers (headless Chromium over CDP)
+
+A cloud browser is headless Chromium you drive over CDP with Playwright or
+Puppeteer, or use through quick page loads. $0.12 per browser-hour, billed per second;
+`ttl_s` (30 to 3600, default 300) closes it on its own.
+
+```python
+with cloud.browser(ttl_s=300) as b:                   # closed on the way out
+    png = b.screenshot("https://example.com")         # PNG bytes (full_page=True for the whole page)
+    page = b.goto("https://example.com")              # url, title, text
+
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(b.cdp_url)   # cdp_url is valid 10 minutes; b.refresh() for a new one
+        print(browser.contexts[0].pages[0].title() if browser.contexts and browser.contexts[0].pages else "")
+
+cloud.list_browsers(state="all"); cloud.get_browser("brw_..."); cloud.browsers.delete("brw_...")
+```
+
+### AI gateway
+
+Model calls from sandboxes go through the org's gateway: provider keys stay on
+kosa8 Cloud, with caching, a rate limit and per-sandbox usage.
+
+```python
+cloud.set_ai_key("openai", os.environ["OPENAI_API_KEY"])   # never sent back; list_ai_keys() shows a hint
+cloud.update_ai_settings(enabled=True, cache_ttl_s=3600, rate_per_min=120)
+box = cloud.sandboxes.create(ai_gateway=True)   # OPENAI_BASE_URL, ANTHROPIC_BASE_URL, KOSA8_AI_GATEWAY_URL, KOSA8_AI_TOKEN set
+print(cloud.ai_usage("2026-11")["total"])       # calls, cost_usd, tokens_in, tokens_out, cached, errors
+cloud.delete_ai_key("openai")
+```
+
 ### How Cloud sandboxes run commands
 
 - The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`,

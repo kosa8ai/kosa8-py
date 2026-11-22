@@ -33,6 +33,7 @@ from .cloud import (
     Kosa8Cloud,
     CLOUD_SIZES,
 )
+from .cloud_browser import BROWSER_PRICE_PER_HOUR_USD, CloudAI, CloudBrowser, CloudBrowsers
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -81,6 +82,10 @@ Cloud = Kosa8Cloud
 __version__ = "0.5.5"
 
 __all__ = [
+    "CloudBrowser",
+    "CloudBrowsers",
+    "CloudAI",
+    "BROWSER_PRICE_PER_HOUR_USD",
     "CloudTemplates",
     "CloudBurst",
     "CloudTokens",
