@@ -288,7 +288,7 @@ FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "oom", "infra", "quota", "cl
 _INFRA_CODES = frozenset({
     "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",
     "wake_failed", "try_again", "internal", "kernel_failed", "egress_failed", "dns_unreachable", "host_lost",
-    "host_removed", "insufficient_storage", "starting",
+    "host_removed", "insufficient_storage", "starting", "database_busy",
 })
 _RATE_CODES = frozenset({"rate_limited", "slow_down", "too_soon"})
 _QUOTA_CODES = frozenset({
