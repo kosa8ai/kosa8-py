@@ -21,10 +21,16 @@ Things that differ everywhere, because kosa8 Cloud works this way:
 
 * Each command runs in a fresh container and only ``/workspace`` persists
   between commands, so relative paths are put under ``/workspace``.
-* A buffered command runs at most 90 seconds; run longer work in the
-  background (E2B ``background=True``, Modal's entrypoint) and poll it.
-* Output arrives when a command ends, not as it is printed; callbacks such as
-  E2B's ``on_stdout`` are called once, with all of it.
+* Output streams where the other SDK streams it. A command given output
+  callbacks (E2B ``on_stdout`` / ``on_stderr``), a timeout over 90 s, or run
+  through an API that is itself a stream (Modal ``sandbox.exec(...)``,
+  Daytona session commands and their ``get_session_command_logs_async``)
+  is a streamed exec: the output arrives as the command prints it and the
+  command is not held to 90 s. A plain buffered command (no callbacks, no
+  long timeout) still runs at most 90 s and answers once, when it ends.
+* A background command (E2B ``background=True``, Modal's entrypoint) is
+  polled about once a second; its new output is passed on as it appears,
+  stdout and stderr together.
 
 Every shim object keeps the kosa8 object it wraps as ``.kosa8``
 (a :class:`kosa8.CloudSandbox`) for anything the other SDK has no word for.
@@ -34,13 +40,15 @@ from __future__ import annotations
 
 import functools
 import posixpath
+import threading
+import time
 import urllib.parse
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from ..cloud import Kosa8Cloud
+from ..cloud import CloudExecResult, CloudExecStream, Kosa8Cloud
 from ..errors import Kosa8Error
 
-__all__ = ["Unsupported", "set_default_cloud", "get_cloud"]
+__all__ = ["Unsupported", "set_default_cloud", "get_cloud", "StreamPump"]
 
 
 class Unsupported(Kosa8Error, NotImplementedError):
@@ -74,7 +82,7 @@ def get_cloud(api_key: Optional[str] = None) -> Kosa8Cloud:
         return _default_cloud
     if _default_cloud is not None:
         return Kosa8Cloud(api_key, base_url=_default_cloud.base_url, timeout=_default_cloud.timeout,
-                          opener=_default_cloud._open)
+                          opener=_default_cloud._open, stream_opener=_default_cloud._stream_open)
     return Kosa8Cloud(api_key)
 
 
@@ -181,3 +189,92 @@ def translating(convert: Callable[[Kosa8Error], Optional[BaseException]]) -> Cal
 
     return deco
 
+
+
+class StreamPump:
+    """A streamed exec read to its end on a thread, for APIs that hand back a
+    process while it still runs (Modal's ``exec``, Daytona's async session
+    commands). ``on_chunk(stream, text)`` is called on that thread as output
+    arrives; :meth:`follow` yields the chunks to any number of readers, and
+    :meth:`wait` gives the :class:`kosa8.CloudExecResult` (or raises what the
+    stream raised)."""
+
+    def __init__(self, stream: CloudExecStream, on_chunk: Optional[Callable[[str, str], None]] = None) -> None:
+        self._stream = stream
+        self._on_chunk = on_chunk
+        self._cv = threading.Condition()
+        self.chunks: List[Tuple[str, str]] = []
+        self.done = False
+        self.error: Optional[BaseException] = None
+        self.result: Optional[CloudExecResult] = None
+        self._thread = threading.Thread(target=self._run, name="kosa8-exec-stream", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for name, text in self._stream:
+                if self._on_chunk is not None:
+                    self._on_chunk(name, text)
+                with self._cv:
+                    self.chunks.append((name, text))
+                    self._cv.notify_all()
+            code = self._stream.exit_code
+            self.result = CloudExecResult(exit_code=code, stdout=self._stream.stdout, stderr=self._stream.stderr,
+                                          failure_class=None if code is None else ("ok" if code == 0 else "exit_nonzero"))
+        except BaseException as e:  # noqa: BLE001 (handed to whoever waits)
+            self.error = e
+        finally:
+            self._stream.close()
+            with self._cv:
+                self.done = True
+                self._cv.notify_all()
+
+    def follow(self, start: int = 0) -> Iterator[Tuple[str, str]]:
+        """Every chunk from index ``start`` on, blocking for new ones until the command ends."""
+        i = start
+        while True:
+            with self._cv:
+                while i >= len(self.chunks) and not self.done:
+                    self._cv.wait()
+                batch = self.chunks[i:]
+                finished = self.done
+            yield from batch
+            i += len(batch)
+            if finished and i >= len(self.chunks):
+                return
+
+    def text(self, stream: Optional[str] = None) -> str:
+        """The output so far: one stream, or both interleaved as printed."""
+        with self._cv:
+            return "".join(t for n, t in self.chunks if stream is None or n == stream)
+
+    def wait(self, timeout: Optional[float] = None) -> CloudExecResult:
+        self._thread.join(timeout)
+        if not self.done:
+            raise TimeoutError("the command is still running")
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+    def close(self) -> None:
+        """Stop reading (closes the connection)."""
+        self._stream.close()
+
+
+def poll_output(status: Callable[[], Dict[str, Any]], interval: float = 1.0) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Follow a background command: yields ``(new output, status)`` each time
+    its output grows, and a last ``("", status)`` once it has exited."""
+    seen = 0
+    while True:
+        s = status()
+        out = s.get("output") or ""
+        new = out[seen:] if len(out) > seen else ""
+        seen = max(seen, len(out))
+        exited = s.get("state") == "exited"
+        if new:
+            yield new, s
+        if exited:
+            yield "", s
+            return
+        time.sleep(interval)

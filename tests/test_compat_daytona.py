@@ -192,8 +192,8 @@ class DaytonaTest(unittest.TestCase):
 
     def test_process_unsupported(self):
         sb = self.d.create()
-        for n in ("create_session", "get_session", "execute_session_command", "get_session_command_logs", "list_sessions",
-                  "delete_session", "create_pty_session", "connect_pty_session", "kill_pty_session"):
+        for n in ("get_entrypoint_logs", "send_session_command_input", "create_pty_session", "connect_pty_session",
+                  "kill_pty_session"):
             with self.assertRaises(Unsupported):
                 getattr(sb.process, n)("s")
 

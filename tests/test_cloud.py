@@ -388,9 +388,11 @@ class ExecTimeoutParam(unittest.TestCase):
         self.assertEqual(stub.seen[-1]["body"]["timeout_s"], 3)
         box.exec("true")
         self.assertNotIn("timeout_s", stub.seen[-1]["body"])
-        for bad in (0, 91, 2.5, True, "3"):
+        for bad in (0, 2.5, True, "3"):
             with self.assertRaises(ValueError):
                 box.exec("true", timeout_s=bad)
+        with self.assertRaises(ValueError):
+            box.exec("true", timeout_s=91, stream=False)
 
     def test_own_timeout_raises_exec_timeout_without_the_90s_hint(self):
         body = {"error": "exec_timeout", "message": "the command ran longer than its timeout_s of 3 s and was stopped",

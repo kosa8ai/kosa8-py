@@ -104,11 +104,13 @@ class ModalTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             p = sb.exec("x", stdout=modal.StreamType.STDOUT, stderr=modal.StreamType.DEVNULL)
+            p.wait()
         self.assertEqual(buf.getvalue(), "out\n")
         self.assertEqual((p.stdout.read(), p.stderr.read()), ("", ""))
         self.f.on_exec = lambda argv, env: (124, "", "")
+        p = sb.exec("sleep", "60", timeout=1)
         with self.assertRaises(modal.ExecTimeoutError):
-            sb.exec("sleep", "60", timeout=1)
+            p.wait()
         self.f.on_exec = lambda argv, env: (3, "", "")
         self.assertEqual(sb.exec("false").returncode, 3)
 

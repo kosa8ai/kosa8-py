@@ -24,10 +24,15 @@ Modal                           kosa8 Cloud
                                 ``tags`` labels, ``block_network`` no
                                 internet, ``region`` region. ``*args`` (the
                                 entrypoint) run as a background command.
-``sandbox.exec(*args)``         exec; the returned process has already finished
+``sandbox.exec(*args)``         a streamed exec, returned while it runs:
+                                ``process.stdout`` iterates lines as they
+                                print; ``wait`` / ``poll`` / ``read`` as in
+                                Modal; not held to 90 s
 ``wait`` / ``poll``             the entrypoint's background command (or, with
                                 no entrypoint, the sandbox's state)
-``stdout.read()`` / iteration   the entrypoint's output, when it ends
+``stdout.read()`` / iteration   the entrypoint's output: iteration polls it
+                                about once a second, ``read()`` waits for
+                                the end
 ``terminate``                   delete
 ``snapshot_filesystem``         a durable snapshot, usable as ``image=``
 ``filesystem.*``                the sandbox's files API
@@ -36,8 +41,9 @@ Modal                           kosa8 Cloud
 ==============================  ===============================================
 
 The default image is kosa8's ``python`` template (Modal's default is a slim
-Debian with Python). Output arrives when a command ends, not line by line.
-Only ``/workspace`` outlives a command, and an ``exec`` runs at most 90 s.
+Debian with Python). ``exec`` output streams as it prints; the
+entrypoint's stderr arrives when it ends. Only ``/workspace`` outlives a
+command.
 Image builds (``pip_install``, ``run_commands`` ...), GPUs, volumes, tunnels
 and stdin raise :class:`kosa8.compat.Unsupported`.
 """
@@ -63,7 +69,7 @@ from ..errors import (
     Kosa8NotFoundError,
     Kosa8TimeoutError,
 )
-from . import Unsupported, abs_path, get_cloud, given, in_dir, stat_entry, translating
+from . import StreamPump, Unsupported, abs_path, get_cloud, given, in_dir, poll_output, stat_entry, translating
 
 __all__ = [
     "App", "Image", "Secret", "Sandbox", "ContainerProcess", "StreamReader", "StreamWriter", "StreamType",
@@ -274,10 +280,12 @@ class StreamType(enum.Enum):
 
 
 class StreamReader:
-    """A finished stream: ``read()`` returns all of it, iterating gives its lines."""
+    """A process's stdout or stderr. ``read()`` waits for the end and returns
+    all of it; iterating yields lines as they are printed."""
 
-    def __init__(self, fetch: Any, fd: int, text: bool = True) -> None:
+    def __init__(self, fetch: Any, fd: int, text: bool = True, follow: Any = None) -> None:
         self._fetch = fetch
+        self._follow = follow
         self._fd = fd
         self._text = text
         self._data: Optional[str] = None
@@ -296,8 +304,18 @@ class StreamReader:
         return d if self._text else d.encode()
 
     def __iter__(self) -> Iterator[Union[str, bytes]]:
-        for line in self._all().splitlines(keepends=True):
-            yield line if self._text else line.encode()
+        if self._follow is None or self._data is not None:
+            for line in self._all().splitlines(keepends=True):
+                yield line if self._text else line.encode()
+            return
+        buf = ""
+        for piece in self._follow():
+            buf += piece
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                yield line + "\n" if self._text else (line + "\n").encode()
+        if buf:
+            yield buf if self._text else buf.encode()
 
 
 class StreamWriter:
@@ -312,23 +330,51 @@ class StreamWriter:
 
 
 class ContainerProcess:
-    """What ``sandbox.exec`` returns. The command has run to its end by the time you have it."""
+    """What ``sandbox.exec`` returns, while the command runs: a streamed exec
+    read on a thread. Iterating ``stdout`` / ``stderr`` yields lines as they
+    are printed; ``read()``, ``wait()`` and ``returncode`` once it ends,
+    ``poll()`` None until then."""
 
-    def __init__(self, stdout: str, stderr: str, returncode: Optional[int], text: bool) -> None:
-        self.stdout = StreamReader(lambda: stdout, 1, text)
-        self.stderr = StreamReader(lambda: stderr, 2, text)
+    def __init__(self, pump: StreamPump, text: bool, *, keep_out: bool = True, keep_err: bool = True,
+                 timeout: Optional[int] = None) -> None:
+        self._pump = pump
+        self._timeout = timeout
+        self._code: Optional[int] = None
+        self.stdout = StreamReader(lambda: self._wait_text("stdout", keep_out), 1, text,
+                                   follow=(lambda: self._follow("stdout")) if keep_out else None)
+        self.stderr = StreamReader(lambda: self._wait_text("stderr", keep_err), 2, text,
+                                   follow=(lambda: self._follow("stderr")) if keep_err else None)
         self.stdin = StreamWriter()
-        self._code = returncode
+
+    @_md
+    def _finish(self) -> Optional[int]:
+        r = self._pump.wait()
+        self._code = r.exit_code
+        if self._timeout and r.exit_code in (124, 143):
+            raise ExecTimeoutError(f"exec timed out after {self._timeout} s")
+        return self._code
+
+    def _wait_text(self, stream: str, keep: bool) -> str:
+        self._finish()
+        return self._pump.text(stream) if keep else ""
+
+    def _follow(self, stream: str) -> Iterator[str]:
+        for name, text in self._pump.follow():
+            if name == stream:
+                yield text
+        self._finish()
 
     @property
     def returncode(self) -> Optional[int]:
-        return self._code
+        return self.poll()
 
     def poll(self) -> Optional[int]:
-        return self._code
+        if not self._pump.done:
+            return None
+        return self._finish()
 
     def wait(self) -> Optional[int]:
-        return self._code
+        return self._finish()
 
 
 # --- filesystem ------------------------------------------------------------------------------------------
@@ -472,7 +518,7 @@ class Sandbox:
         self._workdir = workdir
         self._code: Optional[int] = None
         self.filesystem = SandboxFilesystem(box)
-        self.stdout = StreamReader(self._entry_stdout, 1)
+        self.stdout = StreamReader(self._entry_stdout, 1, follow=self._entry_follow if entry is not None else None)
         self.stderr = StreamReader(self._entry_stderr, 2)
         self.stdin = StreamWriter()
 
@@ -608,8 +654,11 @@ class Sandbox:
         _pty_info: Any = None,
         pty_info: Any = None,
     ) -> ContainerProcess:
-        """Run a command to its end (90 s at most on kosa8) and return it.
-        ``timeout`` shorter than that is applied with ``timeout(1)``."""
+        """Start a command and return it while it runs (a streamed exec, not
+        held to kosa8's 90 s for a buffered one): iterate ``process.stdout``
+        for lines as they print, or ``wait()``. ``timeout`` is applied with
+        ``timeout(1)``; ``wait()`` / ``read()`` then raise
+        :class:`ExecTimeoutError`."""
         if not args:
             raise InvalidError("exec needs a command")
         if pty or pty_info or _pty_info:
@@ -622,20 +671,14 @@ class Sandbox:
         argv = list(args)
         if timeout:
             argv = ["timeout", str(int(timeout)), *argv]
-        r = self.kosa8.exec(in_dir(argv, workdir or self._workdir), env=envs or None)
-        out, err = r.stdout, r.stderr
-        # StreamType.STDOUT prints to this process's stdout instead of keeping it.
-        if stdout is StreamType.STDOUT:
-            print(out, end="")
-        if stderr is StreamType.STDOUT:
-            print(err, end="")
-        if stdout is not StreamType.PIPE:
-            out = ""
-        if stderr is not StreamType.PIPE:
-            err = ""
-        if timeout and r.exit_code in (124, 143):
-            raise ExecTimeoutError(f"exec timed out after {timeout} s")
-        return ContainerProcess(out, err, r.exit_code, text)
+        def echo(name: str, piece: str) -> None:
+            # StreamType.STDOUT prints to this process's stdout as it arrives.
+            if (stdout if name == "stdout" else stderr) is StreamType.STDOUT:
+                print(piece, end="", flush=True)
+
+        live = self.kosa8.exec_stream(in_dir(argv, workdir or self._workdir), env=envs or None)
+        return ContainerProcess(StreamPump(live, echo), text, keep_out=stdout is StreamType.PIPE,
+                                keep_err=stderr is StreamType.PIPE, timeout=timeout)
 
     # the entrypoint ---------------------------------------------------------------------------
 
@@ -653,6 +696,15 @@ class Sandbox:
             raise Unsupported("modal Sandbox.stdout without an entrypoint here",
                               "create it with Sandbox.create(*args) on this handle, or read output from sandbox.exec(...)")
         return (self._entry_done(True) or {}).get("output") or ""
+
+    def _entry_follow(self) -> Iterator[str]:
+        """The entrypoint's output as it appears, polled about once a second."""
+        assert self._entry is not None
+        for new, st in poll_output(self._entry.status):
+            if new:
+                yield new
+            elif st.get("state") == "exited":
+                self._code = st.get("exit")
 
     @_md
     def _entry_stderr(self) -> str:
