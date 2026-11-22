@@ -19,7 +19,11 @@ from .checkpoints import (
 )
 from .cloud import (
     DEFAULT_CLOUD_URL,
+    RUN_LABEL,
     CloudExecResult,
+    ForkResult,
+    GradeResult,
+    SandboxBatch,
     CloudFiles,
     CloudFunctions,
     CloudRewindResult,
@@ -64,12 +68,32 @@ from .errors import (
     error_from_response,
 )
 from .transport import Transport, default_socket_path, default_worker_file, resolve_endpoint
+from .errors import FAILURE_CLASSES, classify_failure, failure_of
+from .retry import NO_RETRY, RetryPolicy
+from .aio import AsyncCloud, AsyncCloudFiles, AsyncCloudSandbox, AsyncCloudSandboxes
 
-__version__ = "0.4.0"
+#: ``kosa8.Cloud()`` is :class:`Kosa8Cloud`.
+Cloud = Kosa8Cloud
+
+__version__ = "0.5.0"
 
 __all__ = [
     "Kosa8Client",
     "Kosa8Cloud",
+    "Cloud",
+    "AsyncCloud",
+    "AsyncCloudSandbox",
+    "AsyncCloudSandboxes",
+    "AsyncCloudFiles",
+    "SandboxBatch",
+    "GradeResult",
+    "ForkResult",
+    "RUN_LABEL",
+    "RetryPolicy",
+    "NO_RETRY",
+    "FAILURE_CLASSES",
+    "classify_failure",
+    "failure_of",
     "CloudSandbox",
     "CloudSandboxes",
     "CloudFunctions",

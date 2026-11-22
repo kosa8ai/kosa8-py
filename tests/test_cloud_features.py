@@ -123,12 +123,11 @@ class SizedCreate(unittest.TestCase):
             cloud.sandboxes.create(size="2x4", wait_timeout=0)
 
     def test_from_snapshot_and_labels(self):
-        cloud, stub = make(lambda s: (200, {"id": "sbx_1", "labels": {"team": "ml"}}) if s["path"].endswith("/labels")
-                           else (201, {"sandbox": sbx(snapshot_id=SNAP["id"])}))
+        cloud, stub = make(lambda s: (201, {"sandbox": sbx(snapshot_id=SNAP["id"], labels={"team": "ml"})}))
         box = cloud.sandboxes.create(snapshot=SNAP, env={"A": "1"}, labels={"team": "ml"})
-        self.assertEqual(stub.seen[0]["body"], {"snapshot": "snap_abcdefgh", "env": {"A": "1"}})
-        self.assertEqual(route(stub.seen[1]), "PUT /v1/sandboxes/sbx_1/labels")
-        self.assertEqual(stub.seen[1]["body"], {"labels": {"team": "ml"}})
+        # Labels go in the create body (stored before the answer), not a second call.
+        self.assertEqual(stub.seen[0]["body"], {"snapshot": "snap_abcdefgh", "env": {"A": "1"}, "labels": {"team": "ml"}})
+        self.assertEqual(len(stub.seen), 1)
         self.assertEqual(box.info["labels"], {"team": "ml"})
 
     def test_list_by_name_and_labels(self):

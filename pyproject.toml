@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kosa8"
-version = "0.4.0"
+version = "0.5.0"
 description = "Python client for the kosa8 native API: microVM sandboxes for AI agents, with checkpoint, rewind, fork and explore."
 readme = "README.md"
 license = { text = "MIT" }
@@ -27,6 +27,13 @@ Source = "https://github.com/kosa8ai/kosa8-py"
 [project.optional-dependencies]
 openai-agents = ["openai-agents>=0.2"]
 langchain = ["langchain-core>=0.3"]
+# A pooled HTTP client for kosa8.AsyncCloud (without it, the standard library runs in threads).
+async = ["httpx>=0.25"]
+rl = ["httpx>=0.25"]
+
+# NeMo Gym finds the kosa8 sandbox provider by this name: `sandbox: {kosa8: {...}}`.
+[project.entry-points."nemo_gym.sandbox_providers"]
+kosa8 = "kosa8.rl.nemo_gym:Kosa8Provider"
 
 [tool.setuptools.packages.find]
 where = ["src"]

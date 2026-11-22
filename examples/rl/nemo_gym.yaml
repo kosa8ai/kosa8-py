@@ -1,0 +1,17 @@
+# NeMo Gym sandbox provider config for kosa8 (the `kosa8` provider is found
+# through the kosa8 package's `nemo_gym.sandbox_providers` entry point).
+#
+#   pip install kosa8 nemo-gym
+#   export KOSA8_API_KEY=k8c_live_...
+#   gym env start \
+#     --config responses_api_agents/mini_swe_agent_2/configs/mini_swe_agent_2.yaml \
+#     --config examples/rl/nemo_gym.yaml \
+#     --config responses_api_models/vllm_model/configs/vllm_model.yaml
+sandbox:
+  kosa8:
+    api_key: ${oc.env:KOSA8_API_KEY,null}
+    create:
+      template: python       # used when a SandboxSpec has no image
+      lease_s: 3600          # deleted an hour after the trainer stops heartbeating
+    exec:
+      default_timeout_s: 85  # kosa8 Cloud stops a buffered command at 90 s
