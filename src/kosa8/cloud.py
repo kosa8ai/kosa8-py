@@ -327,6 +327,18 @@ def _batch_body(
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,58}$")
 
 
+def _exec_timeout_s(timeout_s: Optional[float]) -> Optional[int]:
+    """``timeout_s`` of a buffered exec as the API takes it: whole seconds,
+    1 to :data:`EXEC_LIMIT_S` (90; the API holds a buffered exec to that), or
+    None for none. Anything else is a ``ValueError`` here, not a round trip."""
+    if timeout_s is None:
+        return None
+    if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s != int(timeout_s)
+            or not 1 <= timeout_s <= EXEC_LIMIT_S):
+        raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {EXEC_LIMIT_S}")
+    return int(timeout_s)
+
+
 def _grade_body(
     cmd: Union[str, Sequence[str]], *, files: Optional[Mapping[str, Union[bytes, str]]], timeout_s: Optional[float],
     env: Optional[Mapping[str, str]], keep: bool, run_id: Optional[str], rollout: Optional[Mapping[str, Any]],
@@ -352,10 +364,7 @@ def _grade_body(
             enc[path] = base64.b64encode(raw).decode("ascii")
         body["files"] = enc
     if timeout_s is not None:
-        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s != int(timeout_s)
-                or not 1 <= timeout_s <= EXEC_LIMIT_S):
-            raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {EXEC_LIMIT_S}")
-        body["timeout_s"] = int(timeout_s)
+        body["timeout_s"] = _exec_timeout_s(timeout_s)
     el = env_list(env)
     if el:
         body["env"] = el
@@ -745,8 +754,10 @@ def _cloud_error(
         message = str(msg_body or "")
     e: Kosa8Error
     if _is_exec_timeout(status, code, message, path):
+        # Its own timeout_s (exec(..., timeout_s=)) needs no hint about 90 s.
+        hint = "" if "timeout_s" in message else f" ({_EXEC_HINT})"
         e = Kosa8ExecTimeoutError(
-            f"{message or f'request failed with HTTP {status}'} ({_EXEC_HINT})",
+            f"{message or f'request failed with HTTP {status}'}{hint}",
             status=status, daemon_message=message or None, method=method, path=path, code=code or "exec_timeout",
         )
     else:
@@ -1158,6 +1169,7 @@ class CloudSandbox:
         *,
         image: Optional[str] = None,
         env: Optional[Mapping[str, str]] = None,
+        timeout_s: Optional[float] = None,
     ) -> CloudExecResult:
         """Run a command and wait for it. A string runs through ``sh -c``.
         A sleeping sandbox wakes for it.
@@ -1168,6 +1180,11 @@ class CloudSandbox:
         this raises :class:`~kosa8.Kosa8ExecTimeoutError`; run long work in
         the background (``nohup sh -c '...' > /workspace/job.log 2>&1 &``) and
         poll it. The request (command and env) is at most 64 KiB.
+
+        ``timeout_s`` (1 to 90 whole seconds) stops the command in the sandbox
+        when it runs that long: :class:`~kosa8.Kosa8ExecTimeoutError` then
+        carries the output so far. The way to bound a test you do not trust
+        to finish.
         """
         argv = ["sh", "-c", cmd] if isinstance(cmd, str) else list(cmd)
         body: Dict[str, Any] = {"cmd": argv}
@@ -1175,6 +1192,9 @@ class CloudSandbox:
             body["image"] = image
         if env:
             body["env"] = [f"{k}={v}" for k, v in env.items()]
+        t = _exec_timeout_s(timeout_s)
+        if t is not None:
+            body["timeout_s"] = t
         r = self._cloud._request("POST", self._path("/exec"), body)
         return _exec_result(r)
 
