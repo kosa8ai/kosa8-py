@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4 — unreleased
+
+- Actionable kosa8 Cloud errors. `str(e)` is the server's sentence followed by what to do with it: `no capacity: fork fewer or retry in 10 s [HTTP 503 no_capacity; retry in 10 s; request a5e77ddee9ef8120-BOS]` (a 402 adds `upgrade: <url>` when the sentence lacks it). `e.message` is still the sentence alone.
+- `Kosa8Error.request_id`: the request's `X-Request-Id`, else Cloudflare's `cf-ray`; quote it to support.
+- `Kosa8Error.retry_after` (and its alias `retry_after_s`) is on every error: the `Retry-After` header on any status (seconds or an HTTP date), else the body's `retry_after_s` (409 `template_building`, 503 `no_capacity`, 409 `idempotency_in_progress`). Retries wait at least that long.
+- Client-side errors say what to do next: a missing or malformed key points at `KOSA8_API_KEY`, `api_key=` and https://app.kosa8.com/app#keys; a 401 `unauthorized` adds the same hint; a timeout says to try again or raise `Kosa8Cloud(timeout=...)`; an unreachable API says to check the network and `KOSA8_CLOUD_URL`.
+
 ## 0.5.3
 
 - `cloud.tokens` (both clients): capability tokens. `create(scopes, sandbox_ids=, labels=, ttl_s=, name=)` (its `secret` is shown once), `list(all=)`, `revoke`. A `k8c_tok_` token is accepted as the client's key.

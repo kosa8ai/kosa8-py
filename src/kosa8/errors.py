@@ -26,6 +26,8 @@ class Kosa8Error(Exception):
         path: Optional[str] = None,
         body: Any = None,
         code: Optional[str] = None,
+        request_id: Optional[str] = None,
+        retry_after: Optional[float] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -41,6 +43,26 @@ class Kosa8Error(Exception):
         self.body = body
         #: kosa8 Cloud's stable error code (payment_required, quota_exceeded, ...).
         self.code = code
+        #: The request's id (kosa8 Cloud's ``X-Request-Id``, else Cloudflare's
+        #: ``cf-ray``): quote it to support. ``None`` when there was no answer.
+        self.request_id = request_id
+        #: Seconds the server asked to wait before trying again (its
+        #: ``Retry-After`` header, else the body's ``retry_after_s``); ``None``
+        #: when it said nothing.
+        self.retry_after = retry_after
+        # Set on kosa8 Cloud API answers: str() then adds the status, code,
+        # retry hint and request id after the server's sentence.
+        self._api_answer = False
+
+    def __str__(self) -> str:
+        if not getattr(self, "_api_answer", False):
+            return super().__str__()
+        return f"{self.message} [{'; '.join(_answer_facts(self))}]"
+
+    @property
+    def retry_after_s(self) -> Optional[float]:
+        """The same as :attr:`retry_after`: seconds to wait before trying again."""
+        return self.retry_after
 
     @property
     def failure_class(self) -> str:
@@ -164,8 +186,6 @@ class Kosa8RateLimitError(Kosa8ApiError):
     ``retry_after`` is the server's Retry-After in seconds, when it sent one.
     """
 
-    retry_after: Optional[float] = None
-
 
 class Kosa8ExecTimeoutError(Kosa8ApiError, Kosa8TimeoutError):
     """A kosa8 Cloud exec ran past the API's limit for a buffered command.
@@ -176,6 +196,26 @@ class Kosa8ExecTimeoutError(Kosa8ApiError, Kosa8TimeoutError):
 
         box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1' &")
     """
+
+
+def _seconds(v: float) -> str:
+    return str(int(v)) if float(v).is_integer() else f"{v:.1f}"
+
+
+def _answer_facts(e: "Kosa8Error") -> "list[str]":
+    """What str() adds to a kosa8 Cloud error after the server's sentence:
+    ``HTTP 503 no_capacity; retry in 10 s; request a5e7...-BOS``."""
+    facts = [" ".join(x for x in (f"HTTP {e.status}" if e.status else "", e.code or "") if x) or "no answer"]
+    if e.retry_after is not None and e.retry_after > 0:
+        facts.append(f"retry in {_seconds(e.retry_after)} s")
+    elif e.status is not None and e.retryable:
+        facts.append("retryable")
+    upgrade = _body_str(e.body, "upgrade_url")
+    if e.status == 402 and upgrade and upgrade not in e.message:
+        facts.append(f"upgrade: {upgrade}")
+    if e.request_id:
+        facts.append(f"request {e.request_id}")
+    return facts
 
 
 def _body_str(body: Any, key: str) -> Optional[str]:

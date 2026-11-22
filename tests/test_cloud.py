@@ -130,7 +130,8 @@ class CloudTest(unittest.TestCase):
         with self.assertRaises(Kosa8PaymentRequiredError) as e:
             cloud.sandboxes.create()
         self.assertEqual(e.exception.code, "payment_required")
-        self.assertEqual(str(e.exception), "add a payment method to start running work")
+        self.assertEqual(e.exception.message, "add a payment method to start running work")
+        self.assertEqual(str(e.exception), "add a payment method to start running work [HTTP 402 payment_required]")
         self.assertEqual(e.exception.status, 402)
         with self.assertRaises(Kosa8RateLimitError) as e:
             cloud.sandboxes.create()
