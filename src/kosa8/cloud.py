@@ -13,8 +13,10 @@ The address is ``https://api.kosa8.com`` (``KOSA8_CLOUD_URL`` overrides it).
 Errors are the SDK's usual typed errors; each carries the cloud's stable
 ``code`` (for example ``payment_required``, ``quota_exceeded``).
 
-How the cloud runs commands: each ``exec`` runs in a fresh container, and only
-``/workspace`` persists between them. The ``base`` template is Alpine Linux
+How the cloud runs commands: each ``exec`` is a fresh process; files in
+``/workspace`` persist for the sandbox's life, and installed packages (and
+anything else outside ``/workspace``) need ``persistent=True``, one long-lived
+container. The ``base`` template is Alpine Linux
 (busybox ``sh``; no bash, python or git). A buffered exec runs at most
 90 seconds (:class:`~kosa8.Kosa8ExecTimeoutError`), and an exec request
 (command and env) is at most 64 KiB.
@@ -56,6 +58,15 @@ from .retry import RetryPolicy, call_with_retry
 from .jobs import CloudJobs
 from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens, preview_path
 from .cloud_browser import CloudAI, CloudBrowser, CloudBrowsers
+from .cloud_api import (
+    CloudAccount,
+    CloudApiKeys,
+    CloudAudit,
+    CloudBenchmarks,
+    CloudFunctions,
+    CloudRL,
+    CloudWebhooks,
+)
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -75,7 +86,7 @@ CLOUD_KEY_PREFIX = "k8c_live_"
 CLOUD_TOKEN_PREFIX = "k8c_tok_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
-USER_AGENT = "kosa8-python/0.5.5"
+USER_AGENT = "kosa8-python/0.6.0"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
@@ -101,8 +112,15 @@ ROLLOUT_STDOUT_TAIL = 4096
 RUN_LABEL = "kosa8.run"
 #: The limit kosa8 Cloud puts on a buffered exec, in seconds (504 exec_timeout past it).
 EXEC_LIMIT_S = 90
-#: vCPU x GiB sizes a sized create takes.
-CLOUD_SIZES = ("2x4", "4x8", "8x16", "16x32")
+#: vCPU x GiB sizes a create takes (``size="0.25x0.5"``, or ``cpus=0.25, mem_mb=512``).
+#: The small ones (under 2 vCPU) share a vCPU and are billed at their fraction.
+CLOUD_SIZES = ("0.25x0.5", "0.5x1", "1x2", "2x4", "4x8", "8x16", "16x32")
+#: The small sizes (a fraction of a shared vCPU, or one vCPU).
+SMALL_SIZES = ("0.25x0.5", "0.5x1", "1x2")
+#: The region of kosa8's overflow capacity (Cloudflare Containers). A sandbox
+#: there has no checkpoint, rewind, fork, sleep or snapshot: those calls answer
+#: 501 ``not_available`` (:class:`~kosa8.Kosa8UnsupportedError`), as sent.
+OVERFLOW_REGION = "cf-auto"
 #: States a booting sandbox does not leave on its own.
 _SETTLED = frozenset({"running", "error", "deleted", "stopped", "host_removed", "host_lost", "sleeping", "paused"})
 
@@ -298,7 +316,7 @@ def _fork_body(n: int, labels: Optional[Mapping[str, str]], run_id: Optional[str
 
 
 def _batch_body(
-    n: int, *, template: Optional[str], image: Optional[str], cpus: Optional[int], mem_mb: Optional[int],
+    n: int, *, template: Optional[str], image: Optional[str], cpus: Optional[float], mem_mb: Optional[int],
     region: Optional[str], labels: Optional[Mapping[str, str]], ttl_s: Optional[int], lease_s: Optional[int],
     run_id: Optional[str], partial_ok: bool, prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -338,6 +356,42 @@ def _exec_timeout_s(timeout_s: Optional[float]) -> Optional[int]:
             or not 1 <= timeout_s <= EXEC_LIMIT_S):
         raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {EXEC_LIMIT_S}")
     return int(timeout_s)
+
+
+def _link_body(path: str, method: Optional[str], ttl_s: Optional[int]) -> Dict[str, Any]:
+    """The body of ``POST …/files/link`` (checked)."""
+    if not path:
+        raise ValueError("a path is required, e.g. /workspace/app.py")
+    body: Dict[str, Any] = {"path": path}
+    if method is not None:
+        if method not in ("GET", "PUT"):
+            raise ValueError("method is GET or PUT")
+        body["method"] = method
+    if ttl_s is not None:
+        if not _is_int(ttl_s) or not 10 <= ttl_s <= 300:
+            raise ValueError("ttl_s must be a whole number from 10 to 300")
+        body["ttl_s"] = ttl_s
+    return body
+
+
+#: The longest ``timeout_s`` a streamed or background command takes.
+MAX_EXEC_TIMEOUT_S = 86400
+
+
+def _background_body(cmd: Union[str, Sequence[str]], image: Optional[str], env: Optional[Mapping[str, str]],
+                     timeout_s: Optional[int]) -> Dict[str, Any]:
+    """The body of a background ``POST …/exec`` (checked)."""
+    body: Dict[str, Any] = {"cmd": argv_of(cmd), "background": True}
+    if image is not None:
+        body["image"] = image
+    el = env_list(env)
+    if el:
+        body["env"] = el
+    if timeout_s is not None:
+        if not _is_int(timeout_s) or not 1 <= timeout_s <= MAX_EXEC_TIMEOUT_S:
+            raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {MAX_EXEC_TIMEOUT_S}")
+        body["timeout_s"] = timeout_s
+    return body
 
 
 def _grade_body(
@@ -414,8 +468,9 @@ def _batch_from(cloud: Any, r: Mapping[str, Any], make: Callable[[Any, Dict[str,
     )
 
 
-#: Methods that are safe to send twice. Other POSTs are retried only on 429
-#: (refused before anything was done), unless they carry an Idempotency-Key.
+#: Methods that are safe to send twice. Other POSTs are retried only when the
+#: server refused them before doing anything (:data:`PRE_EXECUTION_CODES`, a
+#: 429), unless they carry an Idempotency-Key.
 _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 _IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
 #: The POSTs kosa8 Cloud keeps an Idempotency-Key for (24 hours): a retry with
@@ -441,6 +496,19 @@ def _check_key(key: Optional[str]) -> None:
 _KEY_RE = re.compile(r"^[\x21-\x7e]{1,255}$")
 
 
+#: Refusals made before a request did anything, so any request (an exec, a
+#: POST without an Idempotency-Key) is safe to send again: 503
+#: ``database_busy`` (the API's database was overloaded), 409
+#: ``template_building`` (the template is still being built) and 409
+#: ``idempotency_in_progress`` (the first request with that key still runs).
+PRE_EXECUTION_CODES = frozenset({"database_busy", "template_building", "idempotency_in_progress"})
+
+
+def safe_to_resend(exc: BaseException) -> bool:
+    """Whether the server refused ``exc``'s request before doing anything."""
+    return getattr(exc, "status", None) == 429 or getattr(exc, "code", None) in PRE_EXECUTION_CODES
+
+
 class _ScopedRetry:
     """A :class:`RetryPolicy` limited to what is safe for one request."""
 
@@ -452,7 +520,7 @@ class _ScopedRetry:
     def should_retry(self, exc: BaseException, attempt: int) -> bool:
         if not self.policy.should_retry(exc, attempt):
             return False
-        return self.idempotent or getattr(exc, "status", None) == 429
+        return self.idempotent or safe_to_resend(exc)
 
     def delay(self, exc: Optional[BaseException], attempt: int) -> float:
         return self.policy.delay(exc, attempt)
@@ -534,6 +602,18 @@ class Kosa8Cloud:
         self.browsers = CloudBrowsers(self)
         #: The AI gateway: provider keys, settings and usage.
         self.ai = CloudAI(self)
+        #: Pricing, limits, usage insights, images, lineage, checkpoints.
+        self.account = CloudAccount(self)
+        #: The org's API keys: create, rotate, revoke.
+        self.api_keys = CloudApiKeys(self)
+        #: Webhook endpoints, their deliveries and test events.
+        self.webhooks = CloudWebhooks(self)
+        #: The hash-chained audit log.
+        self.audit = CloudAudit(self)
+        #: Ready-made benchmarks and their instances.
+        self.benchmarks = CloudBenchmarks(self)
+        #: RL runs, compare and alert rules.
+        self.rl = CloudRL(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -544,7 +624,35 @@ class Kosa8Cloud:
 
     def usage(self) -> Dict[str, Any]:
         """This month's usage, bill estimate and whether work is paused for payment."""
-        return self._request("GET", "/v1/usage")
+        return self.account.usage()
+
+    def usage_insights(self) -> Dict[str, Any]:
+        """Daily spend, top sandboxes, credit left and projected month-end spend."""
+        return self.account.usage_insights()
+
+    def pricing(self) -> Dict[str, Any]:
+        """The rate card: per vCPU-hour, GiB-hour, browser-hour, sizes and plans."""
+        return self.account.pricing()
+
+    def limits(self) -> Dict[str, Any]:
+        """The running-sandbox limit and how many are active."""
+        return self.account.limits()
+
+    def request_limit(self, max_running: int, *, reason: Optional[str] = None) -> Dict[str, Any]:
+        """Ask kosa8 for a higher running-sandbox limit."""
+        return self.account.request_limit(max_running, reason=reason)
+
+    def images(self) -> List[Dict[str, Any]]:
+        """Images behind the templates the org's hosts offer, with tag and digest."""
+        return self.account.images()
+
+    def lineage(self) -> Dict[str, Any]:
+        """Sandboxes with their fork parents (``nodes``, ``roots``)."""
+        return self.account.lineage()
+
+    def checkpoints(self) -> Dict[str, Any]:
+        """Checkpoints of every running or sleeping sandbox (up to 25)."""
+        return self.account.checkpoints()
 
     def templates(self) -> List[Dict[str, Any]]:
         """The templates the org can start: ``key``, ``cpus``, ``mem_mb``, ``image``, ``regions``, ``warm``."""
@@ -812,6 +920,8 @@ def _cloud_error(
     e.retry_after = _retry_after_header(headers)
     if e.retry_after is None and isinstance(body, dict):
         ra_s = body.get("retry_after_s")  # 409 idempotency_in_progress / template_building, 503 no_capacity
+        if ra_s is None:
+            ra_s = body.get("retry_after")  # 503 database_busy
         if isinstance(ra_s, (int, float)) and not isinstance(ra_s, bool) and ra_s > 0:
             e.retry_after = float(ra_s)
     e._api_answer = True
@@ -838,7 +948,7 @@ def _check_sleep_after(sleep_after_s: Optional[int]) -> None:
 
 def _create_body(
     cloud: Any, *, template: Optional[str], region: Optional[str], sleep_after_s: Optional[int], ttl_s: Optional[int],
-    delete_after: Optional[int], accept_price: Optional[float], size: Optional[str], cpus: Optional[int],
+    delete_after: Optional[int], accept_price: Optional[float], size: Optional[str], cpus: Optional[float],
     mem_mb: Optional[int], image: Optional[str], disk_gb: Optional[int], persistent: Optional[bool],
     docker: Optional[bool], cpu: Optional[str], name: Optional[str], env: Optional[Mapping[str, str]],
     snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
@@ -922,7 +1032,7 @@ class CloudSandboxes:
         delete_after: Optional[int] = None,
         accept_price: Optional[float] = None,
         size: Optional[str] = None,
-        cpus: Optional[int] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         image: Optional[str] = None,
         disk_gb: Optional[int] = None,
@@ -951,10 +1061,11 @@ class CloudSandboxes:
         for :meth:`drain` and the RL runs dashboard. Inside ``with
         kosa8.rl.Run(cloud, ...)`` both default to the run's.
 
-        Sized and Docker sandboxes: ``size`` (``2x4``, ``4x8``, ``8x16`` or
-        ``16x32``) or ``cpus`` + ``mem_mb``, ``image`` (an OCI image such as
+        Sized and Docker sandboxes: ``size`` (one of :data:`CLOUD_SIZES`:
+        ``0.25x0.5``, ``0.5x1``, ``1x2``, ``2x4``, ``4x8``, ``8x16``, ``16x32``)
+        or ``cpus`` + ``mem_mb`` (``cpus=0.25, mem_mb=512`` is ``0.25x0.5``), ``image`` (an OCI image such as
         ``kosa8-template/universal-24.04-20261115.2``), ``disk_gb`` (8 to 200)
-        boot cold at that size (the API answers ``creating``; this polls until
+        boot at that size (the API answers ``creating``; this polls until
         it is running unless ``wait=False``). ``docker=True`` runs a Docker
         engine in it and makes it ``persistent`` (one long-lived container).
         ``cpu="dedicated"`` gives whole physical cores. ``env`` is given to
@@ -1011,7 +1122,7 @@ class CloudSandboxes:
         *,
         template: Optional[str] = None,
         image: Optional[str] = None,
-        cpus: Optional[int] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         region: Optional[str] = None,
         labels: Optional[Mapping[str, str]] = None,
@@ -1206,6 +1317,13 @@ class CloudSandbox:
     @property
     def state(self) -> str:
         return self.info.get("state", "")
+
+    @property
+    def overflow(self) -> bool:
+        """Whether it runs on kosa8's overflow capacity (Cloudflare), which has
+        no checkpoint, rewind, fork, sleep or snapshot (those answer 501
+        ``not_available``)."""
+        return self.info.get("region") == OVERFLOW_REGION
 
     @property
     def files(self) -> "CloudFiles":
@@ -1457,6 +1575,7 @@ class CloudSandbox:
         *,
         image: Optional[str] = None,
         env: Optional[Mapping[str, str]] = None,
+        timeout_s: Optional[int] = None,
     ) -> CloudBackgroundExec:
         """Start a command that keeps running after this returns; read it
         with ``.status()`` or wait for it with ``.wait()``::
@@ -1465,13 +1584,7 @@ class CloudSandbox:
             done = job.wait()
             print(done["exit"], done["output"])
         """
-        body: Dict[str, Any] = {"cmd": argv_of(cmd), "background": True}
-        if image is not None:
-            body["image"] = image
-        el = env_list(env)
-        if el:
-            body["env"] = el
-        r = self._cloud._request("POST", self._path("/exec"), body)
+        r = self._cloud._request("POST", self._path("/exec"), _background_body(cmd, image, env, timeout_s))
         return CloudBackgroundExec(self._cloud, self._path(), r["exec"])
 
     def get_exec(self, exec_id: str) -> CloudBackgroundExec:
@@ -1640,55 +1753,12 @@ class CloudFiles:
         """A presigned URL for one download (``GET``, the default) or upload
         (``PUT``) of ``path``, straight to the host: hand it to curl for big
         files. ``ttl_s`` is 10 to 300."""
-        if not path:
-            raise ValueError("a path is required, e.g. /workspace/app.py")
-        body: Dict[str, Any] = {"path": path}
-        if method is not None:
-            if method not in ("GET", "PUT"):
-                raise ValueError("method is GET or PUT")
-            body["method"] = method
-        if ttl_s is not None:
-            if not _is_int(ttl_s) or not 10 <= ttl_s <= 300:
-                raise ValueError("ttl_s must be a whole number from 10 to 300")
-            body["ttl_s"] = ttl_s
-        return self._sb._cloud._request("POST", self._sb._path("/files/link"), body)["link"]
+        return self._sb._cloud._request("POST", self._sb._path("/files/link"), _link_body(path, method, ttl_s))["link"]
 
     def delete(self, path: str, *, recursive: bool = False) -> None:
         """Remove a file, or a folder and everything in it with ``recursive``."""
         extra = {"recursive": "1"} if recursive else {}
         self._sb._cloud._request("DELETE", self._q("/files", path, **extra))
-
-
-class CloudFunctions:
-    def __init__(self, cloud: Kosa8Cloud) -> None:
-        self._cloud = cloud
-
-    def _path(self, name: str, suffix: str = "") -> str:
-        return f"/v1/functions/{urllib.parse.quote(name, safe='')}{suffix}"
-
-    def deploy(self, name: str, spec: Mapping[str, Any]) -> Dict[str, Any]:
-        """Deploy (create or replace) a function; every deploy bumps its version."""
-        return self._cloud._request("PUT", self._path(name), dict(spec))
-
-    def list(self) -> List[Dict[str, Any]]:
-        return self._cloud._request("GET", "/v1/functions")["functions"]
-
-    def get(self, name: str) -> Dict[str, Any]:
-        return self._cloud._request("GET", self._path(name))
-
-    def delete(self, name: str) -> None:
-        self._cloud._request("DELETE", self._path(name))
-
-    def invoke(self, name: str, event: Any = None) -> Dict[str, Any]:
-        """Call it once. A handler that raises answers ``ok: False``, not an exception."""
-        return self._cloud._request("POST", self._path(name, "/invoke"), {"event": event})
-
-    def map(self, name: str, events: Sequence[Any], *, concurrency: Optional[int] = None) -> Dict[str, Any]:
-        """One call per event, results in input order."""
-        body: Dict[str, Any] = {"events": list(events)}
-        if concurrency is not None:
-            body["concurrency"] = concurrency
-        return self._cloud._request("POST", self._path(name, "/map"), body)
 
 
 #: Drain calls at most (1000 sandboxes each).

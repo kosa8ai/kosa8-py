@@ -288,8 +288,12 @@ FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "oom", "infra", "quota", "cl
 _INFRA_CODES = frozenset({
     "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",
     "wake_failed", "try_again", "internal", "kernel_failed", "egress_failed", "dns_unreachable", "host_lost",
-    "host_removed", "insufficient_storage", "starting",
+    "host_removed", "insufficient_storage", "starting", "database_busy",
 })
+#: Refusals that pass with time whatever the body says: 503 ``database_busy``
+#: (the API's database is overloaded) and 409 ``template_building`` (the
+#: template is being built; ``retry_after_s`` is its ETA).
+_ALWAYS_RETRYABLE = frozenset({"database_busy", "template_building"})
 _RATE_CODES = frozenset({"rate_limited", "slow_down", "too_soon"})
 _QUOTA_CODES = frozenset({
     "quota_exceeded", "running_limit", "plan_required", "plan_limit", "plan_feature", "payment_required",
@@ -333,16 +337,23 @@ def classify_failure(exc: BaseException) -> "tuple[str, bool]":
     429 is ``quota`` and retryable unless it is a used-up quota; 501 is
     ``infra`` but not retryable (the host lacks the feature); any other 4xx is
     ``client``. ``409 idempotency_in_progress`` is retryable: the first
-    request with that key is still running. An exception that is not a
+    request with that key is still running; so are ``503 database_busy`` and
+    ``409 template_building``, and any answer whose body says
+    ``retryable: true``. An exception that is not a
     :class:`Kosa8Error` is ``error`` (not retryable): a bug in your code.
     """
     if isinstance(exc, Kosa8Error) and exc.code == IDEMPOTENCY_IN_PROGRESS:
         return "client", True
+    if isinstance(exc, Kosa8Error) and exc.code in _ALWAYS_RETRYABLE:
+        return "infra", True
     body = getattr(exc, "body", None)
     if isinstance(body, dict) and isinstance(body.get("failure_class"), str):
         fc = body["failure_class"]
         rt = body.get("retryable")
         return fc, bool(rt) if isinstance(rt, bool) else fc == "infra"
+    if isinstance(body, dict) and isinstance(body.get("retryable"), bool) and isinstance(exc, Kosa8Error) \
+            and exc.status is not None:
+        return failure_of(exc.status, exc.code)[0], body["retryable"]
     if not isinstance(exc, Kosa8Error):
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return "infra", True

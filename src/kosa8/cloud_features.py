@@ -8,11 +8,13 @@ fields, times as the API sends them).
 
 from __future__ import annotations
 
+import asyncio
 import time
 import urllib.parse
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-from .cloud_more import CloudPreviewDomains
+from ._calls import AsyncCalls, Calls, key
+from .cloud_more import AsyncCloudPreviewDomains, CloudPreviewDomains
 from .errors import Kosa8TimeoutError
 
 #: Pipelines run states that are final.
@@ -39,27 +41,45 @@ def _check_port(port: int) -> None:
         raise ValueError(f"port must be 1 to 65535, got {port!r}")
 
 
-class CloudBackgroundExec:
+def _sid(sandbox_path: str) -> str:
+    """The (encoded) id in ``/v1/sandboxes/{id}``."""
+    return sandbox_path.rstrip("/").rsplit("/", 1)[-1]
+
+
+class CloudBackgroundExec(Calls):
     """A command started with :meth:`CloudSandbox.exec_background`; it keeps
     running after the call returns. ``info`` is its state as of the last read.
     """
 
     def __init__(self, cloud: Any, sandbox_path: str, info: Dict[str, Any]) -> None:
-        self._cloud = cloud
+        super().__init__(cloud)
         self._base = sandbox_path
+        self._sid = _sid(sandbox_path)
         self.info = info
 
     def __repr__(self) -> str:
-        return f"CloudBackgroundExec(id={self.id!r}, state={self.info.get('state')!r})"
+        return f"{type(self).__name__}(id={self.id!r}, state={self.info.get('state')!r})"
 
     @property
     def id(self) -> str:
         return self.info["id"]
 
+    @property
+    def state(self) -> str:
+        return self.info.get("state", "")
+
+    def _set(self, answer: Any) -> Dict[str, Any]:
+        self.info = {**self.info, **(answer or {}).get("exec", {})}
+        return self.info
+
     def status(self) -> Dict[str, Any]:
         """``state`` (running or exited), ``exit`` and ``output`` so far."""
-        self.info = self._cloud._request("GET", f"{self._base}/exec/{_q(self.id)}")["exec"]
-        return self.info
+        return self._call("GET", f"/v1/sandboxes/{self._sid}/exec/{_q(self.id)}", then=self._set)
+
+    def stop(self) -> Dict[str, Any]:
+        """Stop it and what it started (SIGTERM, then SIGKILL 5 s later); its
+        state becomes ``stopping`` then ``exited`` (exit 143 or 137, ``stopped``)."""
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/exec/{_q(self.id)}/stop", {}, then=self._set)
 
     def wait(self, *, timeout: float = 600.0, interval: float = 1.0) -> Dict[str, Any]:
         """Poll until it exits; returns its final status (``exit``, ``output``)."""
@@ -73,38 +93,60 @@ class CloudBackgroundExec:
             time.sleep(interval)
 
 
-class CloudSnapshots:
+class AsyncCloudBackgroundExec(AsyncCalls, CloudBackgroundExec):
+    """:class:`CloudBackgroundExec` for :class:`~kosa8.AsyncCloudSandbox`."""
+
+    async def wait(self, *, timeout: float = 600.0, interval: float = 1.0) -> Dict[str, Any]:  # type: ignore[override]
+        deadline = time.monotonic() + timeout
+        while True:
+            s = await self.status()
+            if s.get("state") == "exited":
+                return s
+            if time.monotonic() + interval > deadline:
+                raise Kosa8TimeoutError(f"background command {self.id} still running after {timeout} s")
+            await asyncio.sleep(interval)
+
+
+class CloudSnapshots(Calls):
     """The org's durable snapshots: memory, processes and disk, kept until
     deleted. Start a sandbox from one with ``cloud.sandboxes.create(snapshot=...)``.
     """
 
-    def __init__(self, cloud: Any) -> None:
-        self._cloud = cloud
-
     def create(self, sandbox_id: str, *, name: Optional[str] = None) -> Dict[str, Any]:
         """Snapshot a sandbox by id (same as :meth:`CloudSandbox.snapshot`)."""
         body = {"name": name} if name is not None else {}
-        return self._cloud._request("POST", f"/v1/sandboxes/{_q(sandbox_id)}/snapshots", body)["snapshot"]
+        return self._call("POST", f"/v1/sandboxes/{_q(sandbox_id)}/snapshots", body, then=key("snapshot", dict))
 
     def list(self, *, sandbox_id: Optional[str] = None) -> List[Dict[str, Any]]:  # noqa: A003
         """Newest first; with ``sandbox_id`` only that sandbox's."""
         path = "/v1/snapshots" + (f"?sandbox_id={_q(sandbox_id)}" if sandbox_id else "")
-        return (self._cloud._request("GET", path) or {}).get("snapshots", [])
+        return self._call("GET", path, then=key("snapshots", list))
 
     def get(self, snapshot_id: str) -> Dict[str, Any]:
-        return self._cloud._request("GET", f"/v1/snapshots/{_q(snapshot_id)}")["snapshot"]
+        return self._call("GET", f"/v1/snapshots/{_q(snapshot_id)}", then=key("snapshot", dict))
 
     def delete(self, snapshot_id: str) -> None:
         """Delete it; sandboxes made from it keep running."""
-        self._cloud._request("DELETE", f"/v1/snapshots/{_q(snapshot_id)}")
+        return self._call("DELETE", f"/v1/snapshots/{_q(snapshot_id)}", then=_none)
 
 
-class CloudPreviews:
+class AsyncCloudSnapshots(AsyncCalls, CloudSnapshots):
+    """:class:`CloudSnapshots` for :class:`~kosa8.AsyncCloud`."""
+
+
+def _none(_answer: Any) -> None:
+    return None
+
+
+class CloudPreviews(Calls):
     """A sandbox's ports at https URLs: ``box.previews.create(3000)["url"]``."""
 
+    _domains = CloudPreviewDomains
+
     def __init__(self, cloud: Any, sandbox_path: str) -> None:
-        self._cloud = cloud
+        super().__init__(cloud)
         self._base = sandbox_path
+        self._sid = _sid(sandbox_path)
 
     def create(
         self,
@@ -122,42 +164,46 @@ class CloudPreviews:
         for k, v in (("public", public), ("expires_in_s", expires_in_s), ("wake", wake), ("wake_per_hour", wake_per_hour)):
             if v is not None:
                 body[k] = v
-        return self._cloud._request("POST", f"{self._base}/previews", body)["preview"]
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/previews", body, then=key("preview", dict))
 
     def list(self) -> List[Dict[str, Any]]:  # noqa: A003
         """Its previews (no tokens)."""
-        return (self._cloud._request("GET", f"{self._base}/previews") or {}).get("previews", [])
+        return self._call("GET", f"/v1/sandboxes/{self._sid}/previews", then=key("previews", list))
 
     def link(self, port: int, *, expires_in_s: Optional[int] = None) -> Dict[str, Any]:
         """A fresh signed link for a private preview."""
         _check_port(port)
         body = {"expires_in_s": expires_in_s} if expires_in_s is not None else {}
-        return self._cloud._request("POST", f"{self._base}/previews/{port}/link", body)["preview"]
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/previews/{port}/link", body, then=key("preview", dict))
 
     def rotate(self, port: int) -> Dict[str, Any]:
         """A new host name; links to the old one stop working."""
         _check_port(port)
-        return self._cloud._request("POST", f"{self._base}/previews/{port}/rotate", {})["preview"]
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/previews/{port}/rotate", {}, then=key("preview", dict))
 
     def delete(self, port: int) -> None:
+        """Close the port's preview."""
         _check_port(port)
-        self._cloud._request("DELETE", f"{self._base}/previews/{port}")
+        return self._call("DELETE", f"/v1/sandboxes/{self._sid}/previews/{port}", then=_none)
 
     def domains(self, port: int) -> CloudPreviewDomains:
         """The preview's custom domains: serve it at your own hostname."""
         _check_port(port)
-        return CloudPreviewDomains(self._cloud, f"{self._base}/previews/{port}")
+        return self._domains(self._cloud, f"/v1/sandboxes/{self._sid}/previews/{port}")
 
 
-class CloudSecrets:
+class AsyncCloudPreviews(AsyncCalls, CloudPreviews):
+    """:class:`CloudPreviews` for :class:`~kosa8.AsyncCloudSandbox`."""
+
+    _domains = AsyncCloudPreviewDomains  # type: ignore[assignment]
+
+
+class CloudSecrets(Calls):
     """The org's secrets, kept encrypted. A sandbox created with
     ``secrets=["NAME"]`` holds only a placeholder, swapped for the value on the
     way out to ``upstream``. A value goes in one request body and is never
     returned, logged or put in a URL.
     """
-
-    def __init__(self, cloud: Any) -> None:
-        self._cloud = cloud
 
     def set(  # noqa: A003
         self,
@@ -186,25 +232,30 @@ class CloudSecrets:
         ):
             if v is not None:
                 body[k] = v
-        r = self._cloud._request("PUT", f"/v1/secrets/{_q(name)}", body) or {}
-        return {"secret": r.get("secret", {}), "replaced": r.get("replaced") is True}
+        return self._call("PUT", f"/v1/secrets/{_q(name)}", body, then=lambda r: {
+            "secret": (r or {}).get("secret", {}), "replaced": (r or {}).get("replaced") is True})
 
     def list(self) -> List[Dict[str, Any]]:  # noqa: A003
         """Names and settings, never values."""
-        return (self._cloud._request("GET", "/v1/secrets") or {}).get("secrets", [])
+        return self._call("GET", "/v1/secrets", then=key("secrets", list))
 
     def delete(self, name: str) -> Dict[str, Any]:
         """Delete it; sandboxes holding it keep it until deleted (``still_held_by``)."""
-        r = self._cloud._request("DELETE", f"/v1/secrets/{_q(name)}") or {}
-        return {"deleted": r.get("deleted", name), "still_held_by": r.get("still_held_by", [])}
+        return self._call("DELETE", f"/v1/secrets/{_q(name)}", then=lambda r: {
+            "deleted": (r or {}).get("deleted", name), "still_held_by": (r or {}).get("still_held_by", [])})
 
 
-class CloudSchedules:
+class AsyncCloudSecrets(AsyncCalls, CloudSecrets):
+    """:class:`CloudSecrets` for :class:`~kosa8.AsyncCloud`."""
+
+
+class CloudSchedules(Calls):
     """Commands a sandbox runs on a cron schedule (UTC)."""
 
     def __init__(self, cloud: Any, sandbox_path: str) -> None:
-        self._cloud = cloud
+        super().__init__(cloud)
         self._base = sandbox_path
+        self._sid = _sid(sandbox_path)
 
     def create(
         self,
@@ -226,39 +277,50 @@ class CloudSchedules:
             body["name"] = name
         if wake is not None:
             body["wake"] = wake
-        return self._cloud._request("POST", f"{self._base}/schedules", body)["schedule"]
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/schedules", body, then=key("schedule", dict))
 
     def list(self) -> List[Dict[str, Any]]:  # noqa: A003
-        return (self._cloud._request("GET", f"{self._base}/schedules") or {}).get("schedules", [])
+        return self._call("GET", f"/v1/sandboxes/{self._sid}/schedules", then=key("schedules", list))
 
     def run(self, schedule_id: str) -> Dict[str, Any]:
         """Run it now; returns ``{"schedule": ..., "run": {status, exit, output, ...}}``."""
-        return self._cloud._request("POST", f"{self._base}/schedules/{_q(schedule_id)}/run", {})
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/schedules/{_q(schedule_id)}/run", {})
 
     def delete(self, schedule_id: str) -> None:
-        self._cloud._request("DELETE", f"{self._base}/schedules/{_q(schedule_id)}")
+        """Stop and remove it."""
+        return self._call("DELETE", f"/v1/sandboxes/{self._sid}/schedules/{_q(schedule_id)}", then=_none)
 
 
-class CloudCodeContexts:
+class AsyncCloudSchedules(AsyncCalls, CloudSchedules):
+    """:class:`CloudSchedules` for :class:`~kosa8.AsyncCloudSandbox`."""
+
+
+class CloudCodeContexts(Calls):
     """A sandbox's code-interpreter contexts; each keeps its own globals."""
 
     def __init__(self, cloud: Any, sandbox_path: str) -> None:
-        self._cloud = cloud
+        super().__init__(cloud)
         self._base = sandbox_path
+        self._sid = _sid(sandbox_path)
 
     def list(self) -> List[Dict[str, Any]]:  # noqa: A003
-        return (self._cloud._request("GET", f"{self._base}/code/contexts") or {}).get("contexts", [])
+        return self._call("GET", f"/v1/sandboxes/{self._sid}/code/contexts", then=key("contexts", list))
 
     def create(self, name: Optional[str] = None) -> Dict[str, Any]:
         body = {"name": name} if name is not None else {}
-        return self._cloud._request("POST", f"{self._base}/code/contexts", body)["context"]
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/code/contexts", body, then=key("context", dict))
 
     def reset(self, name: str) -> None:
         """Clear its globals."""
-        self._cloud._request("POST", f"{self._base}/code/contexts/{_q(name)}/reset", {})
+        return self._call("POST", f"/v1/sandboxes/{self._sid}/code/contexts/{_q(name)}/reset", {}, then=_none)
 
     def delete(self, name: str) -> None:
-        self._cloud._request("DELETE", f"{self._base}/code/contexts/{_q(name)}")
+        """End its process."""
+        return self._call("DELETE", f"/v1/sandboxes/{self._sid}/code/contexts/{_q(name)}", then=_none)
+
+
+class AsyncCloudCodeContexts(AsyncCalls, CloudCodeContexts):
+    """:class:`CloudCodeContexts` for :class:`~kosa8.AsyncCloudSandbox`."""
 
 
 _PIPELINE_FIELDS = (
@@ -401,6 +463,15 @@ class CloudPipelineHooks:
 
 __all__ = [
     "CloudBackgroundExec",
+    "AsyncCloudBackgroundExec",
+    "AsyncCloudSnapshots",
+    "AsyncCloudPreviews",
+    "AsyncCloudSecrets",
+    "AsyncCloudSchedules",
+    "AsyncCloudCodeContexts",
+    "CloudTemplates",
+    "AsyncCloudTemplates",
+    "TemplateBuildError",
     "CloudSnapshots",
     "CloudPreviews",
     "CloudSecrets",
@@ -413,7 +484,7 @@ __all__ = [
 ]
 
 
-class CloudTemplates:
+class CloudTemplates(Calls):
     """The org's own templates on kosa8 Cloud, built once and restored in about a
     second instead of pulling the image on every create (an uncached pull of an
     RL task image takes ~17 s).
@@ -422,14 +493,15 @@ class CloudTemplates:
     or a Dockerfile's text; ``import_images`` queues many images at once (say,
     a SWE-bench split by digest). A sandbox is then
     ``cloud.sandboxes.create(template=name)``. Reached as ``cloud.org_templates``.
+    A create from a template still building answers 409 ``template_building``
+    with a ``retry_after_s``, which the client waits out and retries.
     """
-
-    def __init__(self, cloud: Any) -> None:
-        self._cloud = cloud
 
     @staticmethod
     def _path(ref: str) -> str:
-        return "/v1/templates/" + urllib.parse.quote(ref, safe="")
+        if not ref:
+            raise ValueError("a template id or name is required")
+        return f"/v1/templates/{urllib.parse.quote(ref, safe='')}"
 
     def build(
         self,
@@ -437,7 +509,8 @@ class CloudTemplates:
         *,
         image: Optional[str] = None,
         dockerfile: Optional[str] = None,
-        cpus: Optional[int] = None,
+        size: Optional[str] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         build_args: Optional[Mapping[str, str]] = None,
         setup_cmd: Optional[Sequence[str]] = None,
@@ -447,42 +520,57 @@ class CloudTemplates:
         if (image is None) == (dockerfile is None):
             raise ValueError("give image or dockerfile, one of them")
         body: Dict[str, Any] = {"name": name}
-        for k, v in (("image", image), ("dockerfile", dockerfile), ("cpus", cpus), ("mem_mb", mem_mb),
+        for k, v in (("image", image), ("dockerfile", dockerfile), ("size", size), ("cpus", cpus), ("mem_mb", mem_mb),
                      ("setup_cmd", list(setup_cmd) if setup_cmd is not None else None), ("region", region)):
             if v is not None:
                 body[k] = v
         if build_args:
             body["build_args"] = [f"{k}={v}" for k, v in build_args.items()]
-        return (self._cloud._request("POST", "/v1/templates", body) or {}).get("template", {})
+        return self._call("POST", "/v1/templates", body, then=key("template", dict))
 
     def import_images(
         self,
         images: Union[Mapping[str, str], Sequence[Mapping[str, str]]],
         *,
-        cpus: Optional[int] = None,
+        size: Optional[str] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         setup_cmd: Optional[Sequence[str]] = None,
+        region: Optional[str] = None,
         partial_ok: bool = True,
     ) -> Dict[str, Any]:
         """Queue one build per image: ``{name: image}`` or ``[{"name", "image"}]``.
         Returns ``{import_id, queued, templates, failed}``."""
         items = [{"name": k, "image": v} for k, v in images.items()] if isinstance(images, Mapping) else [dict(i) for i in images]
         body: Dict[str, Any] = {"images": items, "partial_ok": partial_ok}
-        for k, v in (("cpus", cpus), ("mem_mb", mem_mb), ("setup_cmd", list(setup_cmd) if setup_cmd is not None else None)):
+        for k, v in (("size", size), ("cpus", cpus), ("mem_mb", mem_mb),
+                     ("setup_cmd", list(setup_cmd) if setup_cmd is not None else None), ("region", region)):
             if v is not None:
                 body[k] = v
-        return self._cloud._request("POST", "/v1/templates/import", body) or {}
+        return self._call("POST", "/v1/templates/import", body, then=lambda r: r or {})
 
     def get(self, ref: str) -> Dict[str, Any]:
         """One template by id or name, with its build log."""
-        return (self._cloud._request("GET", self._path(ref)) or {}).get("template", {})
+        return self._call("GET", self._path(ref), then=key("template", dict))
 
     def list(self) -> List[Dict[str, Any]]:  # noqa: A003
         """The org's own templates (``org_templates`` of ``GET /v1/templates``)."""
-        return (self._cloud._request("GET", "/v1/templates") or {}).get("org_templates", [])
+        return self._call("GET", "/v1/templates", then=key("org_templates", list))
+
+    def all(self) -> Dict[str, Any]:  # noqa: A003
+        """``GET /v1/templates`` as sent: ``templates`` (kosa8's) and ``org_templates``."""
+        return self._call("GET", "/v1/templates", then=lambda r: r or {})
 
     def delete(self, ref: str) -> None:
-        self._cloud._request("DELETE", self._path(ref))
+        return self._call("DELETE", self._path(ref), then=_none)
+
+    @staticmethod
+    def _settled(ref: str, t: Mapping[str, Any]) -> bool:
+        if t.get("state") == "ready":
+            return True
+        if t.get("state") == "failed":
+            raise TemplateBuildError(ref, t)
+        return False
 
     def wait(self, ref: str, *, timeout: float = 1800.0, interval: float = 5.0) -> Dict[str, Any]:
         """Poll until the template is ready; raise on ``failed`` (with the log's
@@ -490,13 +578,25 @@ class CloudTemplates:
         end = time.monotonic() + timeout
         while True:
             t = self.get(ref)
-            if t.get("state") == "ready":
+            if self._settled(ref, t):
                 return t
-            if t.get("state") == "failed":
-                raise TemplateBuildError(ref, t)
             if time.monotonic() >= end:
                 raise Kosa8TimeoutError(f"template {ref} not ready after {timeout} s (state {t.get('state')})")
             time.sleep(interval)
+
+
+class AsyncCloudTemplates(AsyncCalls, CloudTemplates):
+    """:class:`CloudTemplates` for :class:`~kosa8.AsyncCloud`."""
+
+    async def wait(self, ref: str, *, timeout: float = 1800.0, interval: float = 5.0) -> Dict[str, Any]:  # type: ignore[override]
+        end = time.monotonic() + timeout
+        while True:
+            t = await self.get(ref)
+            if self._settled(ref, t):
+                return t
+            if time.monotonic() >= end:
+                raise Kosa8TimeoutError(f"template {ref} not ready after {timeout} s (state {t.get('state')})")
+            await asyncio.sleep(interval)
 
 
 class TemplateBuildError(Exception):
