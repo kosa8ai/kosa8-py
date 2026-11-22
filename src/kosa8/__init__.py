@@ -42,6 +42,8 @@ from .cloud_features import (
     CloudSchedules,
     CloudSecrets,
     CloudSnapshots,
+    CloudTemplates,
+    TemplateBuildError,
     pipeline_run_done,
 )
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
@@ -78,6 +80,8 @@ Cloud = Kosa8Cloud
 __version__ = "0.5.1"
 
 __all__ = [
+    "CloudTemplates",
+    "TemplateBuildError",
     "Kosa8Client",
     "Kosa8Cloud",
     "Cloud",

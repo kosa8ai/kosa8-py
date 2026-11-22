@@ -177,6 +177,18 @@ answer. Other POSTs (an exec, recording rollouts) that failed with a 5xx are
 `Kosa8Cloud(retry=kosa8.RetryPolicy(attempts=5))` changes it;
 `retry=kosa8.NO_RETRY` turns it off.
 
+
+### Your own templates (Dockerfile builds, bulk image import)
+
+Build once, then every sandbox restores in about a second instead of pulling the image:
+
+```python
+cloud.org_templates.build("swe-base", dockerfile=open("Dockerfile").read())
+cloud.org_templates.import_images({"django-11099": "swebench/sweb.eval.x86_64.django_1776_django-11099@sha256:…"})
+cloud.org_templates.wait("swe-base")          # raises TemplateBuildError with the log on failure
+box = cloud.sandboxes.create(template="swe-base")
+```
+
 ## RL training
 
 `kosa8.rl` runs agent rollouts for RL and post-training: fan out from one

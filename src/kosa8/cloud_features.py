@@ -405,3 +405,98 @@ __all__ = [
     "pipeline_run_done",
     "PIPELINE_DONE_STATES",
 ]
+
+
+class CloudTemplates:
+    """The org's own templates on kosa8 Cloud, built once and restored in about a
+    second instead of pulling the image on every create (an uncached pull of an
+    RL task image takes ~17 s).
+
+    ``build`` takes an image reference (a tag, or ``name@sha256:…`` to pin it)
+    or a Dockerfile's text; ``import_images`` queues many images at once (say,
+    a SWE-bench split by digest). A sandbox is then
+    ``cloud.sandboxes.create(template=name)``. Reached as ``cloud.org_templates``.
+    """
+
+    def __init__(self, cloud: Any) -> None:
+        self._cloud = cloud
+
+    @staticmethod
+    def _path(ref: str) -> str:
+        return "/v1/templates/" + urllib.parse.quote(ref, safe="")
+
+    def build(
+        self,
+        name: str,
+        *,
+        image: Optional[str] = None,
+        dockerfile: Optional[str] = None,
+        cpus: Optional[int] = None,
+        mem_mb: Optional[int] = None,
+        build_args: Optional[Mapping[str, str]] = None,
+        setup_cmd: Optional[Sequence[str]] = None,
+        region: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Start a build; returns the template (state ``building``). ``wait`` it."""
+        if (image is None) == (dockerfile is None):
+            raise ValueError("give image or dockerfile, one of them")
+        body: Dict[str, Any] = {"name": name}
+        for k, v in (("image", image), ("dockerfile", dockerfile), ("cpus", cpus), ("mem_mb", mem_mb),
+                     ("setup_cmd", list(setup_cmd) if setup_cmd is not None else None), ("region", region)):
+            if v is not None:
+                body[k] = v
+        if build_args:
+            body["build_args"] = [f"{k}={v}" for k, v in build_args.items()]
+        return (self._cloud._request("POST", "/v1/templates", body) or {}).get("template", {})
+
+    def import_images(
+        self,
+        images: Union[Mapping[str, str], Sequence[Mapping[str, str]]],
+        *,
+        cpus: Optional[int] = None,
+        mem_mb: Optional[int] = None,
+        setup_cmd: Optional[Sequence[str]] = None,
+        partial_ok: bool = True,
+    ) -> Dict[str, Any]:
+        """Queue one build per image: ``{name: image}`` or ``[{"name", "image"}]``.
+        Returns ``{import_id, queued, templates, failed}``."""
+        items = [{"name": k, "image": v} for k, v in images.items()] if isinstance(images, Mapping) else [dict(i) for i in images]
+        body: Dict[str, Any] = {"images": items, "partial_ok": partial_ok}
+        for k, v in (("cpus", cpus), ("mem_mb", mem_mb), ("setup_cmd", list(setup_cmd) if setup_cmd is not None else None)):
+            if v is not None:
+                body[k] = v
+        return self._cloud._request("POST", "/v1/templates/import", body) or {}
+
+    def get(self, ref: str) -> Dict[str, Any]:
+        """One template by id or name, with its build log."""
+        return (self._cloud._request("GET", self._path(ref)) or {}).get("template", {})
+
+    def list(self) -> List[Dict[str, Any]]:  # noqa: A003
+        """The org's own templates (``org_templates`` of ``GET /v1/templates``)."""
+        return (self._cloud._request("GET", "/v1/templates") or {}).get("org_templates", [])
+
+    def delete(self, ref: str) -> None:
+        self._cloud._request("DELETE", self._path(ref))
+
+    def wait(self, ref: str, *, timeout: float = 1800.0, interval: float = 5.0) -> Dict[str, Any]:
+        """Poll until the template is ready; raise on ``failed`` (with the log's
+        tail) or past ``timeout``."""
+        end = time.monotonic() + timeout
+        while True:
+            t = self.get(ref)
+            if t.get("state") == "ready":
+                return t
+            if t.get("state") == "failed":
+                raise TemplateBuildError(ref, t)
+            if time.monotonic() >= end:
+                raise Kosa8TimeoutError(f"template {ref} not ready after {timeout} s (state {t.get('state')})")
+            time.sleep(interval)
+
+
+class TemplateBuildError(Exception):
+    """A template build failed; ``template`` holds its record and ``log``."""
+
+    def __init__(self, ref: str, template: Mapping[str, Any]) -> None:
+        self.template = dict(template)
+        tail = str(template.get("log") or "")[-1500:]
+        super().__init__(f"template {ref} failed to build:\n{tail}")

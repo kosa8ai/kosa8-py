@@ -56,6 +56,7 @@ from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
     CloudPipelines,
+    CloudTemplates,
     CloudPreviews,
     CloudSchedules,
     CloudSecrets,
@@ -496,6 +497,8 @@ class Kosa8Cloud:
         self.secrets = CloudSecrets(self)
         #: CI runs, logs, artifacts and triggers.
         self.pipelines = CloudPipelines(self)
+        #: The org's own templates: Dockerfile builds and bulk image imports.
+        self.org_templates = CloudTemplates(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"

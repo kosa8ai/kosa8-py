@@ -414,3 +414,47 @@ class Pipelines(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrgTemplates(unittest.TestCase):
+    def test_build_import_get_wait_delete(self):
+        states = iter(["building", "building", "ready"])
+
+        def answer(s):
+            r = route(s)
+            if r == "POST /v1/templates":
+                return 202, {"template": {"id": "tpl_1", "name": s["body"]["name"], "state": "building"}}
+            if r == "POST /v1/templates/import":
+                return 202, {"import_id": "imp_1", "queued": 2, "templates": [], "failed": []}
+            if r == "GET /v1/templates/swe%2Fx" or r == "GET /v1/templates/swe/x":
+                return 200, {"template": {"name": "swe/x", "state": next(states), "log": "ok"}}
+            if r == "GET /v1/templates":
+                return 200, {"templates": [{"key": "base"}], "org_templates": [{"name": "swe/x"}]}
+            if r.startswith("DELETE /v1/templates/"):
+                return 200, {"ok": True, "id": "tpl_1"}
+            return 404, {"error": "not_found"}
+
+        cloud, stub = make(answer)
+        t = cloud.org_templates.build("df", dockerfile="FROM python:3.12-slim\n", cpus=2, build_args={"V": "1"})
+        self.assertEqual(t["state"], "building")
+        self.assertEqual(stub.seen[-1]["body"], {"name": "df", "dockerfile": "FROM python:3.12-slim\n", "cpus": 2, "build_args": ["V=1"]})
+        with self.assertRaisesRegex(ValueError, "one of them"):
+            cloud.org_templates.build("x")
+        with self.assertRaisesRegex(ValueError, "one of them"):
+            cloud.org_templates.build("x", image="a", dockerfile="FROM a")
+        imp = cloud.org_templates.import_images({"a": "alpine@sha256:" + "0" * 64, "b": "python:3.12"}, mem_mb=2048)
+        self.assertEqual(imp["queued"], 2)
+        self.assertEqual(stub.seen[-1]["body"], {"images": [{"name": "a", "image": "alpine@sha256:" + "0" * 64}, {"name": "b", "image": "python:3.12"}], "partial_ok": True, "mem_mb": 2048})
+        with no_sleep():
+            self.assertEqual(cloud.org_templates.wait("swe/x")["state"], "ready")
+        self.assertEqual(stub.seen[-1]["path"], "/v1/templates/swe%2Fx")
+        self.assertEqual(cloud.org_templates.list(), [{"name": "swe/x"}])
+        self.assertEqual(cloud.templates(), [{"key": "base"}], "the built-in list is unchanged")
+        cloud.org_templates.delete("tpl_1")
+        self.assertEqual(route(stub.seen[-1]), "DELETE /v1/templates/tpl_1")
+
+    def test_wait_raises_on_failed_with_the_log(self):
+        cloud, _ = make(lambda s: (200, {"template": {"name": "x", "state": "failed", "log": "pull: manifest 404"}}))
+        from kosa8 import TemplateBuildError
+        with self.assertRaisesRegex(TemplateBuildError, "manifest 404"):
+            cloud.org_templates.wait("x")

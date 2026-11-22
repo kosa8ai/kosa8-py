@@ -2,6 +2,7 @@
 
 ## 0.5.1
 
+- `cloud.org_templates`: build a template on kosa8 Cloud from a Dockerfile or an image (pinned by `@sha256:` digest if you like), bulk `import_images` (a SWE-bench split), `get` (with the build log), `list`, `wait`, `delete`. `TemplateBuildError` carries the log.
 - Failure class `oom`: exit 137 with the guest kernel's OOM count raised (kosa8 Cloud reports it on exec and grade; a grade killed for memory has no reward). It can be added to a rollout mask.
 
 ## 0.5.0: RL training (unreleased)
