@@ -66,6 +66,7 @@ from .errors import (
 from . import retry as _retry
 from .retry import RetryPolicy, acall_with_retry
 from .jobs import AsyncCloudJobs
+from .cloud_more import AsyncCloudBurst, AsyncCloudRecordings, AsyncCloudTokens
 
 #: (method, url, headers, body bytes or None, timeout) -> awaitable of
 #: (status, body bytes[, response headers]).
@@ -160,6 +161,12 @@ class AsyncCloud:
         self.sandboxes = AsyncCloudSandboxes(self)
         #: Hosted jobs (see :class:`kosa8.jobs.CloudJobs`).
         self.jobs = AsyncCloudJobs(self)
+        #: Burst Passes (see :class:`kosa8.cloud_more.CloudBurst`).
+        self.burst = AsyncCloudBurst(self)
+        #: Capability tokens (see :class:`kosa8.cloud_more.CloudTokens`).
+        self.tokens = AsyncCloudTokens(self)
+        #: Desktop recordings (see :class:`kosa8.cloud_more.CloudRecordings`).
+        self.recordings = AsyncCloudRecordings(self)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"
@@ -269,6 +276,7 @@ class AsyncCloudSandboxes:
         labels: Optional[Mapping[str, str]] = None,
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
+        record: Optional[bool] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -279,7 +287,7 @@ class AsyncCloudSandboxes:
             self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
-            egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id,
+            egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
         )
         r = await self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = AsyncCloudSandbox(self._cloud, r["sandbox"])
@@ -510,6 +518,10 @@ class AsyncCloudSandbox:
     async def snapshot(self, name: Optional[str] = None) -> Dict[str, Any]:
         body = {"name": name} if name is not None else {}
         return (await self._cloud._request("POST", self._path("/snapshots"), body))["snapshot"]
+
+    async def recordings(self) -> List[Dict[str, Any]]:
+        """Its desktop recordings; see :meth:`kosa8.CloudSandbox.recordings`."""
+        return (await self._cloud._request("GET", self._path("/recordings")) or {}).get("recordings", [])
 
 
 class AsyncCloudFiles:

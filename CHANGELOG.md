@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- `cloud.tokens` (both clients): capability tokens. `create(scopes, sandbox_ids=, labels=, ttl_s=, name=)` (its `secret` is shown once), `list(all=)`, `revoke`. A `k8c_tok_` token is accepted as the client's key.
+- `cloud.burst` (both clients): Burst Passes. `get()` (the pass, held and active passes) and `activate(quantity)` (or a checkout URL for the rest).
+- `cloud.recordings` (both clients): desktop recordings. `list(sandbox_id=, limit=)`, `link(id, ttl_s=)` (a signed MP4 URL), `delete`. Also `box.recordings()` and `sandboxes.create(record=True)`.
+
 ## 0.5.2
 
 - `cloud.jobs` (both clients): hosted jobs on kosa8 Cloud. `submit` (tasks as a list or a `.jsonl` path, solver and sealed grader, grader files from bytes, text or a `Path`; sent with an Idempotency-Key), `get`, `list`, `cancel`, `wait(progress=)` and `estimate` (ranges of sandbox-hours and list USD, `sample=n` pilot jobs). Needs the kosa8 Cloud `/v1/jobs` routes.

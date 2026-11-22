@@ -46,6 +46,7 @@ from .cloud_features import (
     TemplateBuildError,
     pipeline_run_done,
 )
+from .cloud_more import CloudBurst, CloudRecordings, CloudTokens
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
 from .toolbox import Artifact, CodeResult, GitResult, ShellResult
 from .errors import (
@@ -81,6 +82,9 @@ __version__ = "0.5.2"
 
 __all__ = [
     "CloudTemplates",
+    "CloudBurst",
+    "CloudTokens",
+    "CloudRecordings",
     "TemplateBuildError",
     "Kosa8Client",
     "Kosa8Cloud",
