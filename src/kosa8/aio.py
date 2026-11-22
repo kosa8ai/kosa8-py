@@ -52,12 +52,35 @@ from .cloud import (
     _chunk_key,
     _drain_add,
     _DRAIN_ROUNDS,
+    _background_body,
+    _link_body,
+    OVERFLOW_REGION,
     _idem_headers,
     _reindex,
     MAX_FORK,
     MAX_FORK_PER_CALL,
 )
-from .cloud_features import argv_of, env_list
+from .cloud_features import (
+    AsyncCloudBackgroundExec,
+    AsyncCloudCodeContexts,
+    AsyncCloudPreviews,
+    AsyncCloudSchedules,
+    AsyncCloudSecrets,
+    AsyncCloudSnapshots,
+    AsyncCloudTemplates,
+    argv_of,
+    env_list,
+)
+from .cloud_api import (
+    AsyncCloudAccount,
+    AsyncCloudApiKeys,
+    AsyncCloudAudit,
+    AsyncCloudBenchmarks,
+    AsyncCloudFunctions,
+    AsyncCloudRL,
+    AsyncCloudWebhooks,
+)
+from .cloud_browser import AsyncCloudAI, AsyncCloudBrowser, AsyncCloudBrowsers
 from .errors import (
     Kosa8ConnectionError,
     Kosa8Error,
@@ -177,6 +200,30 @@ class AsyncCloud:
         self.tokens = AsyncCloudTokens(self)
         #: Desktop recordings (see :class:`kosa8.cloud_more.CloudRecordings`).
         self.recordings = AsyncCloudRecordings(self)
+        #: Functions (see :class:`kosa8.cloud_api.CloudFunctions`).
+        self.functions = AsyncCloudFunctions(self)
+        #: Durable snapshots (see :class:`kosa8.cloud_features.CloudSnapshots`).
+        self.snapshots = AsyncCloudSnapshots(self)
+        #: Org secrets (see :class:`kosa8.cloud_features.CloudSecrets`).
+        self.secrets = AsyncCloudSecrets(self)
+        #: The org's own templates (see :class:`kosa8.cloud_features.CloudTemplates`).
+        self.org_templates = AsyncCloudTemplates(self)
+        #: Headless Chromium browsers over CDP (see :class:`kosa8.cloud_browser.CloudBrowsers`).
+        self.browsers = AsyncCloudBrowsers(self)
+        #: The AI gateway (see :class:`kosa8.cloud_browser.CloudAI`).
+        self.ai = AsyncCloudAI(self)
+        #: Pricing, limits, usage insights, images, lineage, checkpoints.
+        self.account = AsyncCloudAccount(self)
+        #: API keys (see :class:`kosa8.cloud_api.CloudApiKeys`).
+        self.api_keys = AsyncCloudApiKeys(self)
+        #: Webhooks (see :class:`kosa8.cloud_api.CloudWebhooks`).
+        self.webhooks = AsyncCloudWebhooks(self)
+        #: The audit log (see :class:`kosa8.cloud_api.CloudAudit`).
+        self.audit = AsyncCloudAudit(self)
+        #: Ready-made benchmarks (see :class:`kosa8.cloud_api.CloudBenchmarks`).
+        self.benchmarks = AsyncCloudBenchmarks(self)
+        #: RL runs, compare and alerts (see :class:`kosa8.cloud_api.CloudRL`).
+        self.rl = AsyncCloudRL(self)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"
@@ -199,7 +246,62 @@ class AsyncCloud:
         return await self._request("GET", "/v1/me")
 
     async def usage(self) -> Dict[str, Any]:
-        return await self._request("GET", "/v1/usage")
+        return await self.account.usage()
+
+    async def usage_insights(self) -> Dict[str, Any]:
+        return await self.account.usage_insights()
+
+    async def pricing(self) -> Dict[str, Any]:
+        return await self.account.pricing()
+
+    async def limits(self) -> Dict[str, Any]:
+        return await self.account.limits()
+
+    async def request_limit(self, max_running: int, *, reason: Optional[str] = None) -> Dict[str, Any]:
+        return await self.account.request_limit(max_running, reason=reason)
+
+    async def images(self) -> List[Dict[str, Any]]:
+        return await self.account.images()
+
+    async def lineage(self) -> Dict[str, Any]:
+        return await self.account.lineage()
+
+    async def checkpoints(self) -> Dict[str, Any]:
+        return await self.account.checkpoints()
+
+    async def capabilities(self) -> Dict[str, Any]:
+        return await self._request("GET", "/v1/capabilities") or {}
+
+    async def browser(self, *, ttl_s: Optional[int] = None, sandbox_id: Optional[str] = None,
+                      name: Optional[str] = None) -> AsyncCloudBrowser:
+        """Open a headless Chromium browser: ``async with await cloud.browser() as b:``."""
+        return await self.browsers.create(ttl_s=ttl_s, sandbox_id=sandbox_id, name=name)
+
+    async def list_browsers(self, *, state: Optional[str] = None) -> List[AsyncCloudBrowser]:
+        return await self.browsers.list(state=state)
+
+    async def get_browser(self, browser_id: str) -> AsyncCloudBrowser:
+        return await self.browsers.get(browser_id)
+
+    async def set_ai_key(self, provider: str, key: str) -> Dict[str, Any]:
+        return await self.ai.set_key(provider, key)
+
+    async def list_ai_keys(self) -> List[Dict[str, Any]]:
+        return await self.ai.keys()
+
+    async def delete_ai_key(self, provider: str) -> Dict[str, Any]:
+        return await self.ai.delete_key(provider)
+
+    async def ai_settings(self) -> Dict[str, Any]:
+        return await self.ai.settings()
+
+    async def update_ai_settings(self, *, enabled: Optional[bool] = None, all_sandboxes: Optional[bool] = None,
+                                 cache_ttl_s: Optional[int] = None, rate_per_min: Optional[int] = None) -> Dict[str, Any]:
+        return await self.ai.update_settings(enabled=enabled, all_sandboxes=all_sandboxes, cache_ttl_s=cache_ttl_s,
+                                             rate_per_min=rate_per_min)
+
+    async def ai_usage(self, month: Optional[str] = None) -> Dict[str, Any]:
+        return await self.ai.usage(month)
 
     async def templates(self) -> List[Dict[str, Any]]:
         return (await self._request("GET", "/v1/templates") or {}).get("templates", [])
@@ -275,7 +377,7 @@ class AsyncCloudSandboxes:
         delete_after: Optional[int] = None,
         accept_price: Optional[float] = None,
         size: Optional[str] = None,
-        cpus: Optional[int] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         image: Optional[str] = None,
         disk_gb: Optional[int] = None,
@@ -321,7 +423,7 @@ class AsyncCloudSandboxes:
         *,
         template: Optional[str] = None,
         image: Optional[str] = None,
-        cpus: Optional[int] = None,
+        cpus: Optional[float] = None,
         mem_mb: Optional[int] = None,
         region: Optional[str] = None,
         labels: Optional[Mapping[str, str]] = None,
@@ -425,6 +527,57 @@ class AsyncCloudSandbox:
     @property
     def files(self) -> "AsyncCloudFiles":
         return AsyncCloudFiles(self)
+
+    @property
+    def overflow(self) -> bool:
+        """See :attr:`kosa8.CloudSandbox.overflow`."""
+        return self.info.get("region") == OVERFLOW_REGION
+
+    @property
+    def previews(self) -> AsyncCloudPreviews:
+        """Its ports at https URLs: ``(await box.previews.create(3000))["url"]``."""
+        return AsyncCloudPreviews(self._cloud, self._path())
+
+    @property
+    def schedules(self) -> AsyncCloudSchedules:
+        return AsyncCloudSchedules(self._cloud, self._path())
+
+    @property
+    def code_contexts(self) -> AsyncCloudCodeContexts:
+        return AsyncCloudCodeContexts(self._cloud, self._path())
+
+    async def exec_background(self, cmd: Union[str, Sequence[str]], *, image: Optional[str] = None,
+                              env: Optional[Mapping[str, str]] = None,
+                              timeout_s: Optional[int] = None) -> AsyncCloudBackgroundExec:
+        """Start a command that keeps running; ``await job.wait()`` / ``await job.stop()``."""
+        r = await self._cloud._request("POST", self._path("/exec"), _background_body(cmd, image, env, timeout_s))
+        return AsyncCloudBackgroundExec(self._cloud, self._path(), r["exec"])
+
+    async def get_exec(self, exec_id: str) -> AsyncCloudBackgroundExec:
+        """A background command by id (``bg_...``)."""
+        job = AsyncCloudBackgroundExec(self._cloud, self._path(), {"id": exec_id, "state": "running"})
+        await job.status()
+        return job
+
+    async def run_code(self, code: str, *, context: Optional[str] = None, language: Optional[str] = None,
+                       timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        """See :meth:`kosa8.CloudSandbox.run_code` (needs a persistent sandbox)."""
+        body: Dict[str, Any] = {"code": code}
+        for k, v in (("context", context), ("language", language), ("timeout_s", timeout_s)):
+            if v is not None:
+                body[k] = v
+        return await self._cloud._request("POST", self._path("/code"), body)
+
+    async def checkpoints(self) -> List[Dict[str, Any]]:
+        """Its checkpoints, oldest first. Does not wake a sleeping sandbox."""
+        return (await self._cloud._request("GET", self._path("/checkpoints")) or {}).get("checkpoints", [])
+
+    async def metrics(self) -> Dict[str, Any]:
+        return (await self._cloud._request("GET", self._path("/metrics")))["metrics"]
+
+    async def logs(self, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        q = f"?limit={int(limit)}" if limit is not None else ""
+        return (await self._cloud._request("GET", self._path(f"/logs{q}")) or {}).get("entries", [])
 
     @property
     def embeds(self) -> AsyncCloudEmbeds:
@@ -582,6 +735,21 @@ class AsyncCloudFiles:
     async def delete(self, path: str, *, recursive: bool = False) -> None:
         extra = {"recursive": "1"} if recursive else {}
         await self._sb._cloud._request("DELETE", self._q("/files", path, **extra))
+
+    async def read_raw(self, path: str) -> bytes:
+        """The file's bytes with no 8 MiB cap (the streamed endpoint)."""
+        return await self._sb._cloud._request("GET", self._q("/files/raw", path), raw=True)
+
+    async def write_raw(self, path: str, content: Union[bytes, str], encoding: str = "utf-8") -> Dict[str, Any]:
+        """Create or replace a file with no 8 MiB cap (the streamed endpoint)."""
+        data = content.encode(encoding) if isinstance(content, str) else bytes(content)
+        r = await self._sb._cloud._request("PUT", self._q("/files/raw", path), data=data)
+        return (r or {}).get("file", {}) if isinstance(r, dict) else {}
+
+    async def link(self, path: str, *, method: Optional[str] = None, ttl_s: Optional[int] = None) -> Dict[str, Any]:
+        """A presigned URL for one download or upload; see :meth:`kosa8.CloudFiles.link`."""
+        body = _link_body(path, method, ttl_s)
+        return (await self._sb._cloud._request("POST", self._sb._path("/files/link"), body))["link"]
 
 
 async def _aquiet_delete(box: AsyncCloudSandbox) -> None:

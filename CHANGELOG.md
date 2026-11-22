@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-22
+
+- Both clients (`Kosa8Cloud` and `AsyncCloud`) now cover the customer-facing Cloud API:
+  - Account: `pricing()`, `limits()`, `request_limit(max_running, reason=)`, `usage_insights()`, `images()`, `lineage()`, `checkpoints()` (also as `cloud.account.*`).
+  - `cloud.api_keys`: `list`, `create(name, scopes=, expires_in_s=)` (the secret is shown once), `rotate(id, grace_s=)`, `revoke(id)`.
+  - `cloud.webhooks`: `list`, `events`, `create(url, events=, description=)`, `delete`, `deliveries(id, limit=)`, `test`.
+  - `cloud.audit`: `list(sandbox_id=, actor=, action=, since=, until=, before_seq=, limit=)`, `verify()`, `export()` (parsed NDJSON) and `export_raw()`.
+  - `cloud.benchmarks`: `list`, `get`, `instances(name, state=, limit=, cursor=)`, `instance(name, id)`, `prepare(name, instances, seed=)`.
+  - `cloud.rl`: `runs`, `create_run`, `run`, `update_run`, `rollouts`, `export`, `compare(ids)` (2 to 4 runs), `alerts`, `create_alert`, `update_alert`, `delete_alert`.
+  - `cloud.functions.invocations(name, limit=)`.
+  - Background commands: `exec_background(cmd, timeout_s=)` (up to 24 h) and `job.stop()`.
+  - Browsers: `cloud.browsers.cdp_url(id)` (a fresh CDP WebSocket URL) and `kosa8.cloud_browser.cdp_path(id)`. AI gateway: `cloud.ai.gateway_url(provider)` (`.../v1/ai/gw/{provider}/`, the base URL for an OpenAI or Anthropic client) and `cloud.ai.call(provider, path, body)`.
+- `AsyncCloud` gains everything the sync client had and it lacked: browsers (`AsyncCloudBrowser`, `async with await cloud.browser() as b`), the AI gateway, functions, snapshots, secrets, `org_templates` (with `await wait()`), and on a sandbox `previews`, `schedules`, `code_contexts`, `exec_background` / `get_exec`, `run_code`, `checkpoints`, `metrics`, `logs`, `files.read_raw` / `write_raw` / `link`, and `overflow`.
+- Small sizes: `CLOUD_SIZES` adds `0.25x0.5`, `0.5x1` and `1x2` (`SMALL_SIZES`); `cpus` takes a fraction (`cpus=0.25, mem_mb=512`). `org_templates.build` / `import_images` take `size`.
+- Overflow capacity: `box.overflow` is `True` for a sandbox on kosa8's Cloudflare overflow (`region` `cf-auto`). Its checkpoint, rewind, fork, sleep and snapshot answer 501 `not_available`, raised as `Kosa8UnsupportedError` with the server's reason.
+- Retries: every request, POSTs without an Idempotency-Key included (an exec, a background start), is retried on refusals made before anything ran: 503 `database_busy`, 409 `template_building` and 409 `idempotency_in_progress` (`kosa8.PRE_EXECUTION_CODES`), as well as 429. The wait honours the `Retry-After` header and the body's `retry_after` and `retry_after_s`; `classify_failure` treats `database_busy` and `template_building` as retryable whatever the body says, and honours a body's `retryable` when it has no `failure_class`.
+- Docs: what persists between commands is stated the same way everywhere (each exec is a fresh process; files in `/workspace` persist for the sandbox's life; installed packages need `persistent=True`).
+
+### Also in 0.6.0 (merged after 0.5.5)
 
 - Cloud browsers: `cloud.browser(ttl_s=, sandbox_id=, name=)` opens headless Chromium and returns a `CloudBrowser` with `id`, `cdp_url` (for Playwright `connect_over_cdp` / Puppeteer), `refresh()`, `goto(url, text=True)`, `screenshot(url, full_page=False)` (PNG bytes), `page(...)` and `close()`; `with cloud.browser() as b:` closes it. Also `cloud.browsers.create/list/get/delete/info`, `cloud.list_browsers(state=)` and `cloud.get_browser(id)`. $0.12 per browser-hour, billed per second.
 - AI gateway: `cloud.ai` (`settings`, `update_settings`, `set_key`, `keys`, `delete_key`, `usage(month)`) and the shortcuts `cloud.set_ai_key`, `list_ai_keys`, `delete_ai_key`, `ai_settings`, `update_ai_settings`, `ai_usage`. `sandboxes.create(ai_gateway=True|False)` on both clients.
