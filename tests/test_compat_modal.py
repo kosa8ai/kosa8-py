@@ -32,14 +32,15 @@ class ModalTest(unittest.TestCase):
         self.assertEqual(self.created(), {
             "ttl_s": 1800, "image": "python:3.11-slim", "sleep_after_s": 120, "env": {"A": "1", "TOKEN": "t"},
             "secrets": ["db"], "cpus": 2, "mem_mb": 2048, "egress": {"internet": False}, "region": "us", "name": "worker",
+            "labels": {"team": "ml", "modal-app": "my-app"},
         })
-        self.assertEqual(self.f.last("PUT /v1/sandboxes/")["body"], {"labels": {"team": "ml", "modal-app": "my-app"}})
+        self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.assertTrue(sb.object_id.startswith("sbx_"))
         self.assertIsNone(sb.returncode)
 
     def test_create_defaults_images(self):
         modal.Sandbox.create(app=self.app)
-        self.assertEqual(self.created(), {"ttl_s": 300, "template": "python"})
+        self.assertEqual(self.created(), {"ttl_s": 300, "template": "python", "labels": {"modal-app": "my-app"}})
         modal.Sandbox.create(image=modal.Image.from_registry("node:22"), timeout=10, region=["eu"])
         self.assertEqual(self.created(), {"ttl_s": 60, "image": "node:22", "region": "eu"})
         modal.Sandbox.create(image=modal.Image.from_id("snap_3"))
@@ -190,7 +191,7 @@ class ModalTest(unittest.TestCase):
         img = sb.snapshot_filesystem()
         self.assertTrue(img.object_id.startswith("snap_"))
         modal.Sandbox.create(app=self.app, image=img)
-        self.assertEqual(self.created(), {"ttl_s": 300, "snapshot": img.object_id})
+        self.assertEqual(self.created(), {"ttl_s": 300, "snapshot": img.object_id, "labels": {"modal-app": "my-app"}})
 
     def test_filesystem(self):
         sb = modal.Sandbox.create(app=self.app)

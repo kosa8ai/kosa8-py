@@ -45,8 +45,9 @@ class DaytonaTest(unittest.TestCase):
             auto_stop_interval=15, ttl_minutes=120, network_block_all=True, target="us", language="javascript",
         ), timeout=40)
         self.assertEqual(self.created(), {"template": "node", "sleep_after_s": 900, "ttl_s": 7200, "env": {"DEBUG": "1"},
-                                          "name": "dev", "egress": {"internet": False}, "region": "us"})
-        self.assertEqual(self.f.last("PUT /v1/sandboxes/")["body"], {"labels": {"env": "dev"}})
+                                          "name": "dev", "egress": {"internet": False}, "region": "us",
+                                          "labels": {"env": "dev"}})
+        self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.d.create(CreateSandboxFromSnapshotParams(snapshot="snap_7", auto_pause_interval=5, auto_delete_interval=-1))
         self.assertEqual(self.created(), {"snapshot": "snap_7", "sleep_after_s": 300})
 

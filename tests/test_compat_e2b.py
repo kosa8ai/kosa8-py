@@ -26,8 +26,9 @@ class E2BTest(unittest.TestCase):
     def test_create_maps_arguments(self):
         sb = Sandbox.create("python", timeout=600, envs={"A": "1"}, metadata={"team": "ml"}, allow_internet_access=False)
         body = self.f.last("POST /v1/sandboxes")["body"]
-        self.assertEqual(body, {"template": "python", "ttl_s": 600, "env": {"A": "1"}, "egress": {"internet": False}})
-        self.assertEqual(self.f.last("PUT /v1/sandboxes/")["body"], {"labels": {"team": "ml"}})
+        self.assertEqual(body, {"template": "python", "ttl_s": 600, "env": {"A": "1"}, "egress": {"internet": False},
+                                "labels": {"team": "ml"}})
+        self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.assertTrue(sb.sandbox_id.startswith("sbx_"))
         self.assertIs(sb.kosa8.id, sb.sandbox_id)
 
