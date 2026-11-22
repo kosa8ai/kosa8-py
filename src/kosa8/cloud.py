@@ -24,6 +24,7 @@ Standard library only, like the rest of the SDK.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -38,10 +39,13 @@ from .errors import (
     Kosa8ConnectionError,
     Kosa8Error,
     Kosa8ExecTimeoutError,
+    Kosa8NotFoundError,
     Kosa8RateLimitError,
     Kosa8TimeoutError,
+    classify_failure,
     error_from_response,
 )
+from .retry import RetryPolicy, call_with_retry
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -58,15 +62,19 @@ DEFAULT_CLOUD_URL = "https://api.kosa8.com"
 CLOUD_KEY_PREFIX = "k8c_live_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
-USER_AGENT = "kosa8-python/0.4.0"
+USER_AGENT = "kosa8-python/0.5.0"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
 MAX_TTL_S = 7776000
 #: sleep_after_s is from 0 (never) to 7 days.
 MAX_SLEEP_AFTER_S = 604800
-#: A fork makes from 1 to 100 copies.
+#: A fork call makes from 1 to 100 copies (``fork`` makes more in several calls).
 MAX_FORK = 100
+#: A batch create makes from 1 to 1000 sandboxes.
+MAX_BATCH = 1000
+#: The label kosa8 Cloud groups a run's sandboxes by.
+RUN_LABEL = "kosa8.run"
 #: The limit kosa8 Cloud puts on a buffered exec, in seconds (504 exec_timeout past it).
 EXEC_LIMIT_S = 90
 #: vCPU x GiB sizes a sized create takes.
@@ -112,6 +120,201 @@ class CloudExecResult:
     stderr: str
     #: Set when the sandbox was asleep and woke for this command.
     woke_ms: Optional[int] = None
+    #: ``ok`` (exit 0) or ``exit_nonzero``, as the API sent it (worked out from
+    #: the exit code when it sent none).
+    failure_class: Optional[str] = None
+
+
+@dataclass
+class GradeResult:
+    """What :meth:`CloudSandbox.grade` answered.
+
+    ``reward`` is the grader's: the last stdout line that is JSON with a
+    numeric ``reward`` (and optional ``metrics``), else 1.0 for exit 0 and
+    0.0 otherwise. ``failure_class`` is ``ok``, ``exit_nonzero`` or ``timeout``.
+    """
+
+    reward: float
+    exit_code: Optional[int]
+    stdout: str
+    stderr: str
+    failure_class: str
+    metrics: Dict[str, Any]
+    ms: Optional[int] = None
+    #: The id of the sealed fork the grader ran in (deleted unless ``keep``).
+    grader_id: Optional[str] = None
+    #: The whole answer, for fields this SDK does not know yet.
+    raw: Optional[Dict[str, Any]] = None
+
+
+class SandboxBatch(list):
+    """The sandboxes a batch create or a fork made: a plain ``list`` of
+    :class:`CloudSandbox`, plus ``failed`` (one dict per sandbox that was not
+    made: ``index``, ``code``, ``message``, ``failure_class``, ``retryable``)
+    and ``requested``."""
+
+    def __init__(self, sandboxes: Sequence[Any] = (), *, failed: Optional[List[Dict[str, Any]]] = None,
+                 requested: Optional[int] = None) -> None:
+        super().__init__(sandboxes)
+        self.failed: List[Dict[str, Any]] = list(failed or [])
+        self.requested: int = len(self) + len(self.failed) if requested is None else requested
+
+    @property
+    def created(self) -> int:
+        return len(self)
+
+
+def _exec_result(r: Mapping[str, Any]) -> CloudExecResult:
+    code = r.get("exit")
+    fc = r.get("failure_class")
+    if not isinstance(fc, str):
+        fc = None if code is None else ("ok" if code == 0 else "exit_nonzero")
+    return CloudExecResult(
+        exit_code=code, stdout=r.get("stdout") or "", stderr=r.get("stderr") or "",
+        woke_ms=r.get("woke_ms"), failure_class=fc,
+    )
+
+
+def _grade_result(r: Mapping[str, Any]) -> GradeResult:
+    reward = r.get("reward")
+    code = r.get("exit")
+    if not isinstance(reward, (int, float)) or isinstance(reward, bool):
+        reward = 1.0 if code == 0 else 0.0
+    fc = r.get("failure_class")
+    if not isinstance(fc, str):
+        fc = "ok" if code == 0 else "exit_nonzero"
+    metrics = r.get("metrics")
+    return GradeResult(
+        reward=float(reward), exit_code=code, stdout=r.get("stdout") or "", stderr=r.get("stderr") or "",
+        failure_class=fc, metrics=dict(metrics) if isinstance(metrics, dict) else {}, ms=r.get("ms"),
+        grader_id=r.get("grader_id"), raw=dict(r),
+    )
+
+
+def _check_lease(lease_s: Optional[int]) -> None:
+    if lease_s is not None and (not _is_int(lease_s) or not MIN_TTL_S <= lease_s <= MAX_TTL_S):
+        raise ValueError(f"lease_s must be a whole number of seconds from {MIN_TTL_S} to {MAX_TTL_S}")
+
+
+def _check_labels(labels: Optional[Mapping[str, str]]) -> None:
+    if labels is not None and len(labels) > 16:
+        raise ValueError("a sandbox has at most 16 labels")
+
+
+def _selector(run_id: Optional[str], labels: Optional[Mapping[str, str]], ids: Optional[Sequence[str]]) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    if run_id:
+        body["run_id"] = run_id
+    if labels:
+        body["labels"] = dict(labels)
+    if ids:
+        body["ids"] = [i.id if hasattr(i, "id") else str(i) for i in ids]
+    if not body:
+        raise ValueError("give run_id, labels or ids: which sandboxes")
+    return body
+
+
+def _ambient(cloud: Any) -> Dict[str, Any]:
+    """The run :class:`kosa8.rl.Run` set on this client (run_id, lease_s), if any."""
+    return dict(getattr(cloud, "_run_defaults", None) or {})
+
+
+def _fork_body(n: int, labels: Optional[Mapping[str, str]], run_id: Optional[str], lease_s: Optional[int],
+               partial_ok: Optional[bool]) -> Dict[str, Any]:
+    _check_lease(lease_s)
+    _check_labels(labels)
+    body: Dict[str, Any] = {"n": n}
+    if labels:
+        body["labels"] = dict(labels)
+    if run_id:
+        body["run_id"] = run_id
+    if lease_s is not None:
+        body["lease_s"] = lease_s
+    if partial_ok is not None:
+        body["partial_ok"] = partial_ok
+    return body
+
+
+def _batch_body(
+    n: int, *, template: Optional[str], image: Optional[str], cpus: Optional[int], mem_mb: Optional[int],
+    region: Optional[str], labels: Optional[Mapping[str, str]], ttl_s: Optional[int], lease_s: Optional[int],
+    run_id: Optional[str], partial_ok: bool,
+) -> Dict[str, Any]:
+    if not _is_int(n) or not 1 <= n <= MAX_BATCH:
+        raise ValueError(f"n must be a whole number from 1 to {MAX_BATCH}")
+    if (cpus is None) != (mem_mb is None):
+        raise ValueError("give cpus and mem_mb together")
+    _check_lifetime(ttl_s, None)
+    _check_lease(lease_s)
+    _check_labels(labels)
+    body: Dict[str, Any] = {"count": n, "partial_ok": partial_ok}
+    for k, v in (("template", template), ("image", image), ("cpus", cpus), ("mem_mb", mem_mb),
+                 ("region", region), ("ttl_s", ttl_s), ("lease_s", lease_s), ("run_id", run_id)):
+        if v is not None:
+            body[k] = v
+    if labels:
+        body["labels"] = dict(labels)
+    return body
+
+
+def _grade_body(
+    cmd: Union[str, Sequence[str]], *, files: Optional[Mapping[str, Union[bytes, str]]], timeout_s: Optional[float],
+    env: Optional[Mapping[str, str]], keep: bool, run_id: Optional[str], rollout: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"cmd": argv_of(cmd)}
+    if files:
+        enc: Dict[str, str] = {}
+        for path, content in files.items():
+            if not isinstance(path, str) or not path.startswith("/"):
+                raise ValueError(f"a grader file path must be absolute, got {path!r}")
+            raw = content.encode() if isinstance(content, str) else bytes(content)
+            enc[path] = base64.b64encode(raw).decode("ascii")
+        body["files"] = enc
+    if timeout_s is not None:
+        if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a positive number of seconds")
+        body["timeout_s"] = timeout_s
+    el = env_list(env)
+    if el:
+        body["env"] = el
+    if keep:
+        body["keep"] = True
+    if run_id:
+        body["run_id"] = run_id
+    if rollout:
+        body["rollout"] = dict(rollout)
+    return body
+
+
+def _batch_from(cloud: Any, r: Mapping[str, Any], make: Callable[[Any, Dict[str, Any]], Any], n: int) -> SandboxBatch:
+    return SandboxBatch(
+        [make(cloud, s) for s in (r or {}).get("sandboxes", [])],
+        failed=list((r or {}).get("failed") or []),
+        requested=(r or {}).get("requested", n),
+    )
+
+
+#: Methods that are safe to send twice. POSTs are retried only on 429, which
+#: means the request was refused before anything was done.
+_IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE"})
+_IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
+
+
+class _ScopedRetry:
+    """A :class:`RetryPolicy` limited to what is safe for one request."""
+
+    def __init__(self, policy: RetryPolicy, method: str, path: str) -> None:
+        self.policy = policy
+        bare = path.split("?", 1)[0]
+        self.idempotent = method in _IDEMPOTENT or bare in _IDEMPOTENT_POSTS
+
+    def should_retry(self, exc: BaseException, attempt: int) -> bool:
+        if not self.policy.should_retry(exc, attempt):
+            return False
+        return self.idempotent or getattr(exc, "status", None) == 429
+
+    def delay(self, exc: Optional[BaseException], attempt: int) -> float:
+        return self.policy.delay(exc, attempt)
 
 
 @dataclass
@@ -146,7 +349,13 @@ class Kosa8Cloud:
         env: Optional[Mapping[str, str]] = None,
         timeout: float = 120.0,
         opener: Optional[Opener] = None,
+        retry: Optional[RetryPolicy] = None,
     ) -> None:
+        """``retry`` (default :class:`~kosa8.retry.RetryPolicy` ``()``: 3 tries,
+        backoff with jitter) is applied to every request where trying again is
+        safe: reads, deletes and heartbeats on infra failures, any request on a
+        429 (waiting at least its ``Retry-After``). ``RetryPolicy(attempts=1)``
+        turns it off."""
         env = os.environ if env is None else env
         key = (api_key if api_key is not None else env.get("KOSA8_API_KEY", "")).strip()
         if not key:
@@ -157,6 +366,7 @@ class Kosa8Cloud:
         self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or DEFAULT_CLOUD_URL)
         self.timeout = timeout
         self._open = opener or _urllib_open
+        self.retry = retry if retry is not None else RetryPolicy()
         self.sandboxes = CloudSandboxes(self)
         self.functions = CloudFunctions(self)
         #: Durable snapshots.
@@ -202,6 +412,34 @@ class Kosa8Cloud:
             body["enforce"] = enforce
         return self._request("PUT", "/v1/org/egress", body)
 
+    def fork_map(
+        self,
+        base: "CloudSandbox",
+        fn: Callable[["CloudSandbox", Any], Any],
+        items: Sequence[Any],
+        *,
+        concurrency: int = 16,
+        retries: int = 2,
+        timeout_s: Optional[float] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        run_id: Optional[str] = None,
+        lease_s: Optional[int] = None,
+    ) -> List["ForkResult"]:
+        """Run ``fn(child, item)`` for every item, each in its own fork of
+        ``base``, ``concurrency`` at a time; results in input order.
+
+        Children are forked in batches (up to 100 a call), always deleted when
+        ``fn`` returns or raises, and deleted on Ctrl-C too. A failure is not
+        raised: its :class:`ForkResult` has ``error`` and ``failure_class``.
+        ``infra`` failures and rate limits are retried ``retries`` times on a
+        fresh fork, with backoff and jitter. ``timeout_s`` gives up on an item
+        (``failure_class="timeout"``) and deletes its child.
+        """
+        from ._forkmap import fork_map
+
+        return fork_map(self, base, fn, items, concurrency=concurrency, retries=retries, timeout_s=timeout_s,
+                        labels=labels, run_id=run_id, lease_s=lease_s)
+
     def _request(
         self,
         method: str,
@@ -210,9 +448,15 @@ class Kosa8Cloud:
         *,
         data: Optional[bytes] = None,
         raw: bool = False,
+        retry: Optional[RetryPolicy] = None,
     ) -> Any:
-        """One call. ``body`` is sent as JSON and ``data`` as raw bytes; with
-        ``raw`` a successful answer's bytes are returned as they came."""
+        """One call, retried as :attr:`retry` allows. ``body`` is sent as JSON
+        and ``data`` as raw bytes; with ``raw`` a successful answer's bytes are
+        returned as they came."""
+        policy = _ScopedRetry(self.retry if retry is None else retry, method, path)
+        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw), policy)
+
+    def _headers_payload(self, body: Any, data: Optional[bytes], raw: bool) -> "tuple[Dict[str, str], Optional[bytes]]":
         headers = {
             "Authorization": f"Bearer {self._key}",
             "Accept": "application/octet-stream" if raw else "application/json",
@@ -225,6 +469,11 @@ class Kosa8Cloud:
         elif body is not None:
             headers["Content-Type"] = "application/json"
             payload = json.dumps(body).encode()
+        return headers, payload
+
+    def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
+                      raw: bool = False) -> Any:
+        headers, payload = self._headers_payload(body, data, raw)
         try:
             answer = self._open(method, self.base_url + path, headers, payload, self.timeout)
         except (socket.timeout, TimeoutError) as e:
@@ -236,18 +485,22 @@ class Kosa8Cloud:
             raise Kosa8TimeoutError(f"kosa8 Cloud did not answer within {self.timeout} s", method=method, path=path) from e
         except (urllib.error.URLError, OSError) as e:
             raise Kosa8ConnectionError(f"could not reach kosa8 Cloud at {self.base_url}: {e}", method=method, path=path) from e
-        status, content = answer[0], answer[1]
-        resp_headers = answer[2] if len(answer) > 2 and answer[2] else {}
-        if raw and status < 400:
-            return content or b""
-        text = content.decode("utf-8", "replace") if content else ""
-        try:
-            parsed: Any = json.loads(text) if text else None
-        except ValueError:
-            parsed = text
-        if status >= 400:
-            raise _cloud_error(status, parsed, method, path, resp_headers)
-        return parsed
+        return _parse_answer(answer, method, path, raw)
+
+
+def _parse_answer(answer: Any, method: str, path: str, raw: bool) -> Any:
+    status, content = answer[0], answer[1]
+    resp_headers = answer[2] if len(answer) > 2 and answer[2] else {}
+    if raw and status < 400:
+        return content or b""
+    text = content.decode("utf-8", "replace") if content else ""
+    try:
+        parsed: Any = json.loads(text) if text else None
+    except ValueError:
+        parsed = text
+    if status >= 400:
+        raise _cloud_error(status, parsed, method, path, resp_headers)
+    return parsed
 
 
 def _is_exec_path(path: str) -> bool:
@@ -320,6 +573,73 @@ def _check_sleep_after(sleep_after_s: Optional[int]) -> None:
         raise ValueError(f"sleep_after_s must be a whole number of seconds from 0 (never) to {MAX_SLEEP_AFTER_S}")
 
 
+def _create_body(
+    cloud: Any, *, template: Optional[str], region: Optional[str], sleep_after_s: Optional[int], ttl_s: Optional[int],
+    delete_after: Optional[int], accept_price: Optional[float], size: Optional[str], cpus: Optional[int],
+    mem_mb: Optional[int], image: Optional[str], disk_gb: Optional[int], persistent: Optional[bool],
+    docker: Optional[bool], cpu: Optional[str], name: Optional[str], env: Optional[Mapping[str, str]],
+    snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
+    secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
+    run_id: Optional[str],
+) -> "tuple[Dict[str, Any], Optional[Dict[str, str]]]":
+    """The body of ``POST /v1/sandboxes`` (checked), and the labels to set after it."""
+    _check_lifetime(ttl_s, delete_after)
+    _check_sleep_after(sleep_after_s)
+    amb = _ambient(cloud)
+    lease_s = amb.get("lease_s") if lease_s is None else lease_s
+    run_id = amb.get("run_id") if run_id is None else run_id
+    _check_lease(lease_s)
+    if run_id:
+        labels = {**(labels or {}), RUN_LABEL: run_id}
+    _check_labels(labels)
+    body: Dict[str, Any] = {}
+    if lease_s is not None:
+        body["lease_s"] = lease_s
+    if template is not None:
+        body["template"] = template
+    if region is not None:
+        body["region"] = region
+    if sleep_after_s is not None:
+        body["sleep_after_s"] = sleep_after_s
+    if ttl_s is not None:
+        body["ttl_s"] = ttl_s
+    if delete_after is not None:
+        body["delete_after"] = delete_after
+    if accept_price is not None:
+        body["accept_price"] = accept_price
+    if snapshot is not None:
+        clash = [k for k, v in (
+            ("template", template), ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image),
+            ("disk_gb", disk_gb), ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("region", region),
+        ) if v is not None]
+        if clash:
+            raise ValueError(
+                "a sandbox made from a snapshot takes its settings from the snapshot; leave out " + ", ".join(clash)
+            )
+        body["snapshot"] = snapshot if isinstance(snapshot, str) else snapshot["id"]
+    if (cpus is None) != (mem_mb is None):
+        raise ValueError("give cpus and mem_mb together")
+    if size is not None and cpus is not None:
+        raise ValueError("give size or cpus + mem_mb, not both")
+    if disk_gb is not None and (not _is_int(disk_gb) or not 8 <= disk_gb <= 200):
+        raise ValueError("disk_gb must be a whole number from 8 to 200")
+    if docker and persistent is False:
+        raise ValueError("a sandbox with docker is persistent; leave out persistent or set it to True")
+    for k, v in (
+        ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image), ("disk_gb", disk_gb),
+        ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name),
+    ):
+        if v is not None:
+            body[k] = v
+    if env is not None:
+        body["env"] = dict(env)
+    if egress is not None:
+        body["egress"] = dict(egress)
+    if secrets is not None:
+        body["secrets"] = list(secrets)
+    return body, (dict(labels) if labels is not None else None)
+
+
 class CloudSandboxes:
     def __init__(self, cloud: Kosa8Cloud) -> None:
         self._cloud = cloud
@@ -347,10 +667,18 @@ class CloudSandboxes:
         egress: Optional[Mapping[str, Any]] = None,
         secrets: Optional[Sequence[str]] = None,
         labels: Optional[Mapping[str, str]] = None,
+        lease_s: Optional[int] = None,
+        run_id: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
     ) -> "CloudSandbox":
         """Start a sandbox; returns once it is running.
+
+        ``lease_s`` (60 s up) deletes it that long after the last heartbeat
+        (:meth:`heartbeat`, or :func:`kosa8.rl.lease` in the background), so a
+        crashed trainer cannot leak it. ``run_id`` labels it ``kosa8.run=<id>``
+        for :meth:`drain` and the RL runs dashboard. Inside ``with
+        kosa8.rl.Run(cloud, ...)`` both default to the run's.
 
         Sized and Docker sandboxes: ``size`` (``2x4``, ``4x8``, ``8x16`` or
         ``16x32``) or ``cpus`` + ``mem_mb``, ``image`` (an OCI image such as
@@ -374,58 +702,107 @@ class CloudSandboxes:
         300). ``accept_price`` is a paid Store item's current price in USD,
         which the person agreed to.
         """
-        _check_lifetime(ttl_s, delete_after)
-        _check_sleep_after(sleep_after_s)
-        body: Dict[str, Any] = {}
-        if template is not None:
-            body["template"] = template
-        if region is not None:
-            body["region"] = region
-        if sleep_after_s is not None:
-            body["sleep_after_s"] = sleep_after_s
-        if ttl_s is not None:
-            body["ttl_s"] = ttl_s
-        if delete_after is not None:
-            body["delete_after"] = delete_after
-        if accept_price is not None:
-            body["accept_price"] = accept_price
-        if snapshot is not None:
-            clash = [k for k, v in (
-                ("template", template), ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image),
-                ("disk_gb", disk_gb), ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("region", region),
-            ) if v is not None]
-            if clash:
-                raise ValueError(
-                    "a sandbox made from a snapshot takes its settings from the snapshot; leave out " + ", ".join(clash)
-                )
-            body["snapshot"] = snapshot if isinstance(snapshot, str) else snapshot["id"]
-        if (cpus is None) != (mem_mb is None):
-            raise ValueError("give cpus and mem_mb together")
-        if size is not None and cpus is not None:
-            raise ValueError("give size or cpus + mem_mb, not both")
-        if disk_gb is not None and (not _is_int(disk_gb) or not 8 <= disk_gb <= 200):
-            raise ValueError("disk_gb must be a whole number from 8 to 200")
-        if docker and persistent is False:
-            raise ValueError("a sandbox with docker is persistent; leave out persistent or set it to True")
-        for k, v in (
-            ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image), ("disk_gb", disk_gb),
-            ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name),
-        ):
-            if v is not None:
-                body[k] = v
-        if env is not None:
-            body["env"] = dict(env)
-        if egress is not None:
-            body["egress"] = dict(egress)
-        if secrets is not None:
-            body["secrets"] = list(secrets)
+        body, labels = _create_body(
+            self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
+            delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
+            disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
+            egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id,
+        )
         r = self._cloud._request("POST", "/v1/sandboxes", body)
         box = CloudSandbox(self._cloud, r["sandbox"])
-        if wait and box.state not in _SETTLED:
-            box.wait_until_running(timeout=wait_timeout)
-        if labels is not None:
-            box.set_labels(labels)
+        try:
+            if wait and box.state not in _SETTLED:
+                box.wait_until_running(timeout=wait_timeout)
+            if labels is not None:
+                box.set_labels(labels)
+        except BaseException:
+            # It was made but cannot be handed back: do not leave it running.
+            _quiet_delete(box)
+            raise
         return box
+
+    def create_many(
+        self,
+        n: int,
+        *,
+        template: Optional[str] = None,
+        image: Optional[str] = None,
+        cpus: Optional[int] = None,
+        mem_mb: Optional[int] = None,
+        region: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        ttl_s: Optional[int] = None,
+        lease_s: Optional[int] = None,
+        run_id: Optional[str] = None,
+        partial_ok: bool = True,
+        wait: bool = True,
+        wait_timeout: float = 300.0,
+    ) -> SandboxBatch:
+        """Start ``n`` (1 to 1000) sandboxes in one call (``POST /v1/sandboxes/batch``).
+
+        kosa8 Cloud paces the creates itself, so there is no 429 storm to
+        retry. With ``partial_ok`` (the default) the ones it could not make
+        (for example past the plan's running limit, ``code="running_limit"``)
+        are in ``.failed``; with ``partial_ok=False`` it is all or nothing and
+        the first failure is raised. ``wait`` polls until each is running;
+        a sandbox that fails to boot is deleted and moved to ``.failed``.
+        """
+        amb = _ambient(self._cloud)
+        body = _batch_body(
+            n, template=template, image=image, cpus=cpus, mem_mb=mem_mb, region=region, labels=labels,
+            ttl_s=ttl_s, lease_s=amb.get("lease_s") if lease_s is None else lease_s,
+            run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok,
+        )
+        r = self._cloud._request("POST", "/v1/sandboxes/batch", body) or {}
+        batch = _batch_from(self._cloud, r, CloudSandbox, n)
+        if wait:
+            _wait_all(batch, wait_timeout, partial_ok)
+        return batch
+
+    def heartbeat(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        ids: Optional[Sequence[Union[str, "CloudSandbox"]]] = None,
+        extend_s: Optional[int] = None,
+    ) -> int:
+        """Push back the lease of the matching leased sandboxes to now +
+        ``extend_s`` (default: each one's own ``lease_s``). Returns how many.
+        :func:`kosa8.rl.lease` does this in the background."""
+        body = _selector(run_id, labels, ids)
+        if extend_s is not None:
+            _check_lease(extend_s)
+            body["extend_s"] = extend_s
+        return int((self._cloud._request("POST", "/v1/sandboxes/heartbeat", body) or {}).get("extended", 0))
+
+    def drain(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
+        ids: Optional[Sequence[Union[str, "CloudSandbox"]]] = None,
+    ) -> Dict[str, Any]:
+        """Delete every matching sandbox of the org: ``{"deleted": n, "failed": [...]}``.
+        Needs at least one of ``run_id``, ``labels`` or ``ids``."""
+        r = self._cloud._request("POST", "/v1/sandboxes/drain", _selector(run_id, labels, ids)) or {}
+        return {"deleted": int(r.get("deleted", 0)), "failed": list(r.get("failed") or [])}
+
+    def grade(
+        self,
+        sandbox: Union[str, "CloudSandbox"],
+        cmd: Union[str, Sequence[str]],
+        *,
+        files: Optional[Mapping[str, Union[bytes, str]]] = None,
+        timeout_s: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
+        keep: bool = False,
+        run_id: Optional[str] = None,
+        rollout: Optional[Mapping[str, Any]] = None,
+    ) -> GradeResult:
+        """Grade a solved sandbox in a sealed fork; see :meth:`CloudSandbox.grade`."""
+        box = sandbox if isinstance(sandbox, CloudSandbox) else CloudSandbox(self._cloud, {"id": sandbox})
+        return box.grade(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout)
 
     def list(  # noqa: A003
         self,
@@ -515,6 +892,13 @@ class CloudSandbox:
     def __repr__(self) -> str:
         return f"CloudSandbox(id={self.id!r}, state={self.state!r})"
 
+    def __enter__(self) -> "CloudSandbox":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        """``with cloud.sandboxes.create(...) as box:`` deletes it on the way out, error or not."""
+        _quiet_delete(self)
+
     @property
     def id(self) -> str:
         return self.info["id"]
@@ -555,12 +939,7 @@ class CloudSandbox:
         if env:
             body["env"] = [f"{k}={v}" for k, v in env.items()]
         r = self._cloud._request("POST", self._path("/exec"), body)
-        return CloudExecResult(
-            exit_code=r.get("exit"),
-            stdout=r.get("stdout") or "",
-            stderr=r.get("stderr") or "",
-            woke_ms=r.get("woke_ms"),
-        )
+        return _exec_result(r)
 
     def sleep(self) -> "CloudSandbox":
         """Snapshot it and free its VM; it then costs only snapshot storage."""
@@ -644,17 +1023,81 @@ class CloudSandbox:
             self.info = r["sandbox"]
         return CloudRewindResult(checkpoint=r.get("checkpoint") or {}, backup=r.get("backup"), ms=r.get("ms"))
 
-    def fork(self, n: int = 1) -> List["CloudSandbox"]:
-        """``n`` (1 to 100) live copies of the sandbox as it is now, on its
-        host. Each is held to the rules of a create (payment, quotas); all or
-        nothing.
+    def fork(
+        self,
+        n: int = 1,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
+        run_id: Optional[str] = None,
+        lease_s: Optional[int] = None,
+        partial_ok: Optional[bool] = None,
+    ) -> SandboxBatch:
+        """``n`` live copies of the sandbox as it is now, on its host, as a
+        :class:`SandboxBatch` (a list, with ``.failed``). Each is held to the
+        rules of a create (payment, quotas).
+
+        One API call makes at most 100; for more this makes several calls,
+        and if one of them raises, the copies already made are deleted.
+        ``labels`` go on every copy, ``run_id`` labels them ``kosa8.run``,
+        ``lease_s`` leases them (see :meth:`CloudSandboxes.create`). With
+        ``partial_ok=True`` copies that could not be made are reported in
+        ``.failed`` instead of failing the call; ``False`` (and the API's
+        default) is all or nothing.
 
         Data plane: may answer 501 ``not_supported`` on current hosts.
         """
-        if not _is_int(n) or not 1 <= n <= MAX_FORK:
-            raise ValueError(f"n must be a whole number from 1 to {MAX_FORK}")
-        r = self._cloud._request("POST", self._path("/fork"), {"n": n}) or {}
-        return [CloudSandbox(self._cloud, s) for s in r.get("sandboxes", [])]
+        if not _is_int(n) or n < 1:
+            raise ValueError("n must be a whole number of at least 1")
+        amb = _ambient(self._cloud)
+        run_id = amb.get("run_id") if run_id is None else run_id
+        lease_s = amb.get("lease_s") if lease_s is None else lease_s
+        out = SandboxBatch(requested=n)
+        try:
+            left = n
+            while left > 0:
+                k = min(left, MAX_FORK)
+                body = _fork_body(k, labels, run_id, lease_s, partial_ok)
+                r = self._cloud._request("POST", self._path("/fork"), body) or {}
+                part = _batch_from(self._cloud, r, CloudSandbox, k)
+                out.extend(part)
+                out.failed.extend(part.failed)
+                left -= k
+        except BaseException:
+            for child in out:
+                _quiet_delete(child)
+            raise
+        return out
+
+    def grade(
+        self,
+        cmd: Union[str, Sequence[str]],
+        *,
+        files: Optional[Mapping[str, Union[bytes, str]]] = None,
+        timeout_s: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
+        keep: bool = False,
+        run_id: Optional[str] = None,
+        rollout: Optional[Mapping[str, Any]] = None,
+    ) -> GradeResult:
+        """Grade this sandbox's state with hidden tests, in a sealed fork.
+
+        kosa8 Cloud forks one copy, denies it all network access, writes
+        ``files`` (``{"/grader/test.py": b"..."}``; the agent's sandbox never
+        sees them), runs ``cmd`` and deletes the copy (unless ``keep``). The
+        reward is the last stdout line that is JSON with a numeric
+        ``"reward"`` (``{"reward": 0.5, "metrics": {...}}``), else 1.0 for
+        exit 0 and 0.0 otherwise. With ``run_id`` it is recorded as a rollout
+        of that run (``rollout``: ``step``, ``group``, ``index``, ``meta``).
+        The request, files included (base64), is at most 64 KiB.
+        """
+        amb = _ambient(self._cloud)
+        run_id = amb.get("run_id") if run_id is None else run_id
+        body = _grade_body(cmd, files=files, timeout_s=timeout_s, env=env, keep=keep, run_id=run_id, rollout=rollout)
+        return _grade_result(self._cloud._request("POST", self._path("/grade"), body) or {})
+
+    def heartbeat(self, *, extend_s: Optional[int] = None) -> int:
+        """Push back this sandbox's lease; see :meth:`CloudSandboxes.heartbeat`."""
+        return self._cloud.sandboxes.heartbeat(ids=[self.id], extend_s=extend_s)
 
     def ports(self) -> List[Dict[str, Any]]:
         """TCP ports listening in its running containers (``port``, ``address``, ``container``, ``loopback``).
@@ -902,3 +1345,61 @@ class CloudFunctions:
         if concurrency is not None:
             body["concurrency"] = concurrency
         return self._cloud._request("POST", self._path(name, "/map"), body)
+
+
+def _quiet_delete(box: Any) -> None:
+    """Delete, ignoring a sandbox that is already gone or an API that will not
+    answer (its lease or ttl then deletes it)."""
+    try:
+        box._cloud._request("DELETE", box._path())
+    except Kosa8NotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 (cleanup is best effort)
+        pass
+
+
+def _wait_all(batch: SandboxBatch, timeout: float, partial_ok: bool) -> None:
+    """Poll every not-yet-running sandbox of ``batch`` until each settles."""
+    deadline = time.monotonic() + timeout
+    keep: List[CloudSandbox] = []
+    try:
+        for i, box in enumerate(list(batch)):
+            try:
+                if box.state not in _SETTLED:
+                    box.wait_until_running(timeout=max(1.0, deadline - time.monotonic()))
+                elif box.state == "error":
+                    raise Kosa8Error(f"sandbox {box.id} failed to start: {box.info.get('last_error') or 'no reason'}")
+                keep.append(box)
+            except Kosa8Error as e:
+                if not partial_ok:
+                    raise
+                _quiet_delete(box)
+                fc, rt = classify_failure(e)
+                batch.failed.append({"index": i, "id": box.id, "code": e.code or "not_ready", "message": str(e),
+                                     "failure_class": "infra" if fc == "error" else fc, "retryable": True})
+    except BaseException:
+        for box in batch:
+            _quiet_delete(box)
+        raise
+    batch[:] = keep
+
+
+@dataclass
+class ForkResult:
+    """One item of :meth:`Kosa8Cloud.fork_map`."""
+
+    item: Any
+    #: What ``fn`` returned (``None`` when it failed).
+    value: Any = None
+    #: The exception of the last attempt, when it failed.
+    error: Optional[BaseException] = None
+    #: ``ok``, or the failure's class (``infra``, ``timeout``, ``quota``, ``client``, ``error``).
+    failure_class: str = "ok"
+    attempts: int = 0
+    #: The child of the last attempt (already deleted).
+    sandbox_id: Optional[str] = None
+    ms: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_class == "ok"

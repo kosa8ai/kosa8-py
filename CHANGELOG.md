@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0: RL training (unreleased)
+
+`kosa8.rl` adds RL rollouts at scale. It needs the kosa8 Cloud API routes for
+batch create, leases, drain, grade and RL runs.
+
+- **`kosa8.rl.Run`**: `with Run(cloud, "name") as run:` creates the run (or attaches to `run_id`), and `run.map(base, tasks, solve, grade_cmd=...)` runs one step. Each rollout forks `base`, runs `solve`, grades in a sealed fork with the task's hidden files, is recorded and is deleted. Infra failures are retried, and anything still failing comes back `masked=True` with `reward=None`, never 0. `record` (batched, 500 a call), `flush`, `finish`, `summary`, `rollouts`, `export`, `drain`. There is also `AsyncRun`.
+- **Leases**: `kosa8.rl.lease(...)` / `Lease` send heartbeats on a thread and drain on exit, on an exception, on Ctrl-C, on SIGTERM and at interpreter exit. Inside a `Run`, every sandbox the client makes is labelled `kosa8.run=<id>` and leased.
+- **`kosa8.rl.map_rollouts`**: the asyncio rollout engine (`group_size`, `retries`, `timeout_s`, `mask`, `keep`).
+- **`kosa8.AsyncCloud`**: the async client. It uses `httpx` (`pip install 'kosa8[async]'`) or the standard library in threads, with sandboxes, exec, files, fork, grade, batch, heartbeat, drain and `async with` cleanup.
+- **On both clients**: `sandboxes.create_many(n, ...)` (`POST /v1/sandboxes/batch`, returns a `SandboxBatch` with `.failed`), `create(lease_s=, run_id=)`, `box.fork(n, labels=, run_id=, lease_s=, partial_ok=)` (more than 100 is split into several calls, and the copies are deleted if one call fails), `sandboxes.heartbeat(...)`, `sandboxes.drain(...)`, `box.grade(cmd, files=, run_id=, rollout=)` returning a `GradeResult`, `cloud.fork_map(base, fn, items, concurrency=)` returning a `ForkResult` per item, and `with box:` deletes the sandbox.
+- **Failure classes**: every error has `.failure_class` and `.retryable` (the server's own, else worked out from the status and code), and `CloudExecResult.failure_class` is set. Also `kosa8.classify_failure`.
+- **Retries**: `RetryPolicy` (exponential backoff with full jitter that honours `Retry-After`) applies to safe requests by default: reads, deletes, heartbeats and drains on infra failures, and any request on a 429. `retry=kosa8.NO_RETRY` turns it off. A create whose wait or labels fail now deletes the sandbox before raising.
+- **Adapters** (lazy imports): `kosa8.rl.trl` (TRL `environment_factory`), `kosa8.rl.verifiers` (verifiers v1 custom runtime), `kosa8.rl.nemo_gym` (NeMo Gym sandbox provider, with an entry point), `kosa8.rl.openenv` (OpenEnv `Environment` and `create_app`), `kosa8.rl.gym` (Gymnasium-style env) and `kosa8.rl.swebench`.
+- `kosa8.Cloud` is an alias of `Kosa8Cloud`. New examples are in `examples/rl/`.
+- **Changed**: `box.fork(n)` now accepts more than 100 and returns a `SandboxBatch`, which is a `list`.
+
 The rest of the kosa8 Cloud API, and a fix that makes the Cloud client work at all.
 
 - **Fix:** every Cloud request now sends `User-Agent: kosa8-python/<version>`. The API's edge refuses Python-urllib's default User-Agent with a bare 403 (Cloudflare error 1010), which 0.4.0 raised as `Kosa8PolicyError` on every call.

@@ -149,7 +149,8 @@ print(hook["url"], hook["secret"])                    # give both to the reposit
   most 8 MiB.
 - Set `ttl_s` (60 s to 90 days) or `delete_after` on create so a crashed script
   cannot leave a sandbox running.
-- The Cloud API has no sandbox labels or metadata.
+- Labels (up to 16) go on with `labels=` at create or `box.set_labels()`;
+  `list(labels=...)`, `heartbeat` and `drain` select by them.
 
 ### Cloud errors
 
@@ -161,8 +162,113 @@ print(hook["url"], hook["secret"])                    # give both to the reposit
 | `Kosa8ExecTimeoutError` (504 `exec_timeout`, or today's 502 "timed out") | a buffered exec ran past its 90 s limit | run it in the background and poll |
 | `Kosa8UnsupportedError` (501) | the host has no data plane yet (files, checkpoints, fork, ports) | use `exec`, or try later |
 
-Every Cloud error carries the server's stable `e.code` and its message.
+Every Cloud error carries the server's stable `e.code` and its message, and
+`e.failure_class` / `e.retryable` (see RL training below).
 `KOSA8_CLOUD_URL` overrides the address (https only, except localhost).
+
+Since 0.5.0 the client retries what is safe to send again: reads, deletes,
+heartbeats and drains on infra failures (no answer, 5xx, host or capacity
+codes), and any request on a 429, waiting at least its `Retry-After`. Waits
+are exponential with full jitter, 3 tries by default. A create, exec or grade
+that failed with a 5xx is **not** resent, since it may have run.
+`Kosa8Cloud(retry=kosa8.RetryPolicy(attempts=5))` changes it;
+`retry=kosa8.NO_RETRY` turns it off.
+
+## RL training
+
+`kosa8.rl` runs agent rollouts for RL and post-training: fan out from one
+prepared sandbox, grade each rollout in a sealed fork with tests the agent
+never sees, keep infra failures out of the gradient, and never leak a
+sandbox. Each run shows up at app.kosa8.com under **RL runs**.
+
+```python
+import kosa8
+from kosa8.rl import Run
+cloud = kosa8.Cloud()
+with Run(cloud, "my-grpo-run") as run:
+    base = cloud.sandboxes.create(template="python")
+    results = run.map(base, tasks, solve, grade_cmd=["python", "/grader/test.py"], concurrency=64)
+```
+
+Here `tasks` is a list (dicts with a hidden `files` map such as
+`{"/grader/test.py": GRADER}`), and `solve(sandbox, task)` runs your agent in
+its own fork of `base`. `run.map` does one step. For each rollout it forks
+`base` (forks are made up to 100 per call), calls `solve`, grades the result
+with `grade_cmd` in a fork that has no network and the task's hidden files,
+records the rollout on the run, and deletes the sandbox. The results come
+back in task order as `Rollouts`, with `.rewards`, `.mask`, `.groups()` (for
+GRPO advantages), `.mean_reward` and `.by_class`. Each `RolloutResult` has
+`reward`, `failure_class`, `masked`, `metrics`, `stdout`, `attempts` and
+`sandbox_id`. See [examples/rl/quickstart.py](examples/rl/quickstart.py).
+
+| Option | |
+|---|---|
+| `group_size=8` | samples per task (GRPO's G); results stay grouped by task |
+| `base=` | a sandbox to fork, a `snap_` id, create options (`{"image": ...}`), or `make(task)` (one image per task, as in SWE-bench) |
+| `grade_cmd=`, `files=` | the sealed grader. Its reward is the last stdout line that is JSON with a numeric `"reward"` (plus optional `"metrics"`), else exit 0 scores 1.0 and anything else 0.0 |
+| `reward=fn(sandbox, task, output)` | your own reward, in place of a grader; `solve` may also return a number or `{"reward": x}` |
+| `retries=2` | infra failures and 429s are retried on a fresh sandbox, with backoff and jitter. A failed grade is retried on its own first, so the agent does not run again |
+| `mask=("infra", "quota", "error")` | these failure classes come back `masked=True, reward=None`, never 0. Add `"timeout"` for DeepSWE-style filtering |
+| `timeout_s=` | caps `solve`; past it, the sandbox is deleted and the result is `timeout` |
+| `keep=True` | keeps solved sandboxes until the run drains them (to inspect or fork them) |
+
+**No leaks.** Inside `with Run(...)`, every sandbox the client makes is
+labelled `kosa8.run=<id>` and leased (`lease_s`, default 600). A background
+heartbeat keeps the lease alive. Leaving the block drains the run's sandboxes,
+whether the exit is normal, an exception, Ctrl-C, SIGTERM or interpreter
+exit. If the process is killed outright, kosa8 Cloud deletes the sandboxes
+`lease_s` after the last heartbeat. Without a `Run`, use
+`kosa8.rl.lease(cloud, labels={...})` as a context manager.
+
+**Failure classes.** Every API error and exec answer carries a
+`failure_class`, so a trainer can mask the rollout instead of scoring it 0:
+
+| Class | Means | Retryable |
+|---|---|---|
+| `ok` / `exit_nonzero` | the command or grader ran (it passed or failed) | - |
+| `timeout` | an exec or grader ran past its limit | no |
+| `infra` | host failed, not ready, no capacity, 5xx, no answer | yes |
+| `quota` | running or plan limit, payment (402), frozen org; a 429 rate limit | only 429 |
+| `client` | a bad request, 404 or 409 | no |
+| `error` | your own code raised (SDK-side class) | no |
+
+`kosa8.classify_failure(exc)` gives `(failure_class, retryable)` for any exception.
+
+**Building blocks.** These work on both `kosa8.Cloud` and `kosa8.AsyncCloud`:
+
+```python
+batch = cloud.sandboxes.create_many(256, template="python", run_id=run.id, lease_s=600)  # .failed lists the rest
+kids = base.fork(300, labels={"step": "4"}, lease_s=600)    # 3 calls of 100; all deleted if one fails
+g = kids[0].grade(["pytest", "-q", "/grader"], files={"/grader/test_x.py": b"..."}, run_id=run.id,
+                  rollout={"step": 4, "group": 0, "index": 0})   # g.reward, g.metrics, g.failure_class
+cloud.sandboxes.heartbeat(run_id=run.id)            # what lease() sends for you
+cloud.sandboxes.drain(labels={"job": "exp-7"})      # delete every match
+results = cloud.fork_map(base, fn, items, concurrency=32, timeout_s=300)   # fn(child, item), children always deleted
+run.record({"step": 4, "reward": 0.5, "failure_class": "ok"})   # buffered, sent 500 at a time
+run.summary(); run.rollouts(step=4, failure_class="infra"); run.export("run.jsonl")
+```
+
+**Async.** `kosa8.AsyncCloud` is the asyncio twin. It uses `httpx` with a
+pooled client when `pip install 'kosa8[async]'` is installed, and otherwise
+the standard library in threads. `async with` on a sandbox deletes it.
+`AsyncRun` and `kosa8.rl.map_rollouts(solve, tasks, base=..., run=...)` run
+the same loop with `async def solve` ([examples/rl/async_rollouts.py](examples/rl/async_rollouts.py)).
+
+**Frameworks.** Each adapter imports its framework only when it is used:
+
+| Module | Plugs into |
+|---|---|
+| `kosa8.rl.trl` | TRL `GRPOTrainer(environment_factory=environment_factory(cloud, base, grade_cmd=...), reward_funcs=reward_func)`. Tools are `bash` and `write_file`; a masked episode's reward is `None`, which TRL leaves out of the loss ([grpo_trl.py](examples/rl/grpo_trl.py)) |
+| `kosa8.rl.verifiers` | Prime Intellect verifiers v1, as a custom runtime: `import_path = "kosa8.rl.verifiers.Kosa8Backend"` ([verifiers_env.py](examples/rl/verifiers_env.py)) |
+| `kosa8.rl.nemo_gym` | NeMo Gym, as the sandbox provider `kosa8` (registered by entry point) ([nemo_gym.yaml](examples/rl/nemo_gym.yaml)) |
+| `kosa8.rl.openenv` | OpenEnv: `make_environment(...)` gives an `Environment`, and `create_app(...)` serves one sandbox per session |
+| `kosa8.rl.gym` | a Gymnasium-style `SandboxEnv`: the actions are shell commands and `submit` grades |
+| `kosa8.rl.swebench` | SWE-bench: `create` (the instance image), `apply_patch`, `grade` and `tasks` with the hidden tests ([swebench_grade.py](examples/rl/swebench_grade.py)) |
+
+Limits to plan around: a buffered exec runs at most 90 s, and a request body
+(grader files included, as base64) is at most 64 KiB. One fork call makes 100
+sandboxes and one batch call makes 1000. Your plan's running limit also
+applies; past it, a batch reports the rest as `running_limit` in `.failed`.
 
 ## Quickstart: local daemon
 

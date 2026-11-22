@@ -42,6 +42,20 @@ class Kosa8Error(Exception):
         #: kosa8 Cloud's stable error code (payment_required, quota_exceeded, ...).
         self.code = code
 
+    @property
+    def failure_class(self) -> str:
+        """What kind of failure this is, for an RL trainer deciding whether to
+        mask a rollout: ``infra``, ``timeout``, ``quota``, ``client`` (or
+        ``exit_nonzero``). The server's own ``failure_class`` wins when it sent one;
+        otherwise it is worked out from the status and code the same way."""
+        return classify_failure(self)[0]
+
+    @property
+    def retryable(self) -> bool:
+        """Whether trying again (after a pause) can help: infra failures and
+        rate limits, not quota, payment or a bad request."""
+        return classify_failure(self)[1]
+
 
 class Kosa8ConnectionError(Kosa8Error):
     """The daemon could not be reached (no socket, connection refused, ...)."""
@@ -223,3 +237,53 @@ def error_from_response(
     if status == 403 and _is_refusal(approval):
         return Kosa8ApprovalRequiredError(message, approval, **kw)
     return _BY_STATUS.get(status, Kosa8ApiError)(message, **kw)
+
+
+#: Failure classes, as kosa8 Cloud sends them in ``failure_class``.
+#: ``error`` is the SDK's own: your code raised something that is not a kosa8 error.
+FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "infra", "quota", "client", "error")
+
+_INFRA_CODES = frozenset({
+    "host_failed", "not_ready", "host_gone", "host_lost", "host_removed", "capacity", "no_capacity",
+    "placement", "placement_failed", "unavailable", "internal", "upstream",
+})
+_QUOTA_CODES = frozenset({
+    "running_limit", "quota_exceeded", "plan_limit", "payment_required", "spending_cap_reached", "org_frozen",
+})
+
+
+def classify_failure(exc: BaseException) -> "tuple[str, bool]":
+    """``(failure_class, retryable)`` for any exception.
+
+    A kosa8 Cloud error body's ``failure_class`` and ``retryable`` are used as
+    sent. Otherwise: no answer, a 5xx (not 501) or a host/capacity code is
+    ``infra`` (retryable); an exec past its limit is ``timeout``; 402, 423 and
+    plan/running limits are ``quota``; 429 is ``quota`` and retryable unless it
+    is a used-up quota; any other 4xx and 501 are ``client``. An exception that
+    is not a :class:`Kosa8Error` is ``error`` (not retryable): a bug in your code.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("failure_class"), str):
+        fc = body["failure_class"]
+        rt = body.get("retryable")
+        return fc, bool(rt) if isinstance(rt, bool) else fc == "infra"
+    if not isinstance(exc, Kosa8Error):
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return "infra", True
+        return "error", False
+    if isinstance(exc, Kosa8ExecTimeoutError):
+        return "timeout", False
+    if isinstance(exc, (Kosa8ConnectionError, Kosa8TimeoutError)):
+        return "infra", True
+    status, code = exc.status, exc.code
+    if code in _INFRA_CODES:
+        return "infra", True
+    if status == 429:
+        return "quota", code != "quota_exceeded"
+    if code in _QUOTA_CODES or status in (402, 423):
+        return "quota", False
+    if status is not None and status >= 500 and status != 501:
+        return "infra", True
+    if status is not None:
+        return "client", False
+    return "error", False
