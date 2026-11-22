@@ -1,9 +1,12 @@
 # Changelog
 
-## 0.5.1
+## 0.5.2
 
 - `cloud.jobs` (both clients): hosted jobs on kosa8 Cloud. `submit` (tasks as a list or a `.jsonl` path, solver and sealed grader, grader files from bytes, text or a `Path`; sent with an Idempotency-Key), `get`, `list`, `cancel`, `wait(progress=)` and `estimate` (ranges of sandbox-hours and list USD, `sample=n` pilot jobs). Needs the kosa8 Cloud `/v1/jobs` routes.
 - `kosa8.rl.Run.compare(runs)`: one row per run for a dataframe. `Run.rollouts(as_="records" | "pandas" | "arrow")` reads every matching rollout across pages; pandas and pyarrow are optional.
+
+## 0.5.1
+
 - `fork(prefix=)` on both clients: the copies are named `<prefix>-0001`, … as with `create_many`.
 - `cloud.org_templates`: build a template on kosa8 Cloud from a Dockerfile or an image (pinned by `@sha256:` digest if you like), bulk `import_images` (a SWE-bench split), `get` (with the build log), `list`, `wait`, `delete`. `TemplateBuildError` carries the log.
 - Failure class `oom`: exit 137 with the guest kernel's OOM count raised (kosa8 Cloud reports it on exec and grade; a grade killed for memory has no reward). It can be added to a rollout mask.
