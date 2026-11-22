@@ -38,7 +38,7 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 KEY_RE = re.compile(r"^[\x21-\x7e]{1,255}$")
 IDEM_ROUTES = [re.compile(r"^/v1/sandboxes$"), re.compile(r"^/v1/sandboxes/batch$"),
                re.compile(r"^/v1/sandboxes/[A-Za-z0-9_]{1,64}/(fork|grade)$"),
-               re.compile(r"^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$")]
+               re.compile(r"^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$"), re.compile(r"^/v1/jobs$")]
 
 INFRA_CODES = {
     "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",
@@ -145,6 +145,10 @@ class FakeCloud:
         self.create_state = "running"
         self.running_limit = None
         self.drain_max = DRAIN_MAX
+        #: Hosted jobs (jobs.js): id -> job; each GET of a running job finishes
+        #: ``job_step`` more tasks (reward 1.0, ok).
+        self.jobs = {}
+        self.job_step = 1
 
     # -- helpers ------------------------------------------------------------
 
@@ -307,6 +311,8 @@ class FakeCloud:
         parts = path.strip("/").split("/")
         if parts[:2] == ["v1", "rl"]:
             return self._rl(method, parts[2:], query, body)
+        if parts[:2] == ["v1", "jobs"]:
+            return self._jobs(method, parts[2:], query, body)
         if parts[:2] != ["v1", "sandboxes"]:
             return err(404, "not_found", path)
         rest = parts[2:]
@@ -604,6 +610,11 @@ class FakeCloud:
                     self.rollouts.append({"run_id": rid, "from": "sdk", "source": "api", "id": ids[-1], **r})
                 return 200, {"recorded": len(rows), "ids": ids}
             rows = [r for r in self.rollouts if r["run_id"] == rid]
+            if "limit" in query:
+                start = int(query.get("cursor") or 0)
+                end = start + int(query["limit"])
+                return 200, {"rollouts": rows[start:end], "next_cursor": str(end) if end < len(rows) else None,
+                             "query": query}
             return 200, {"rollouts": rows, "next_cursor": None, "query": query}
         if parts[2:] == ["export"]:
             rows = [r for r in self.rollouts if r["run_id"] == rid]
@@ -612,3 +623,93 @@ class FakeCloud:
 
     def _count(self, rid):
         return len([r for r in self.rollouts if r["run_id"] == rid])
+
+    # -- /v1/jobs (jobs.js) -----------------------------------------------------
+
+    JOB_DONE = ("done", "failed", "cancelled", "budget_reached")
+
+    def _job_public(self, j):
+        n = j["total"]
+        done = j["done"]
+        out = {k: v for k, v in j.items() if k not in ("done", "body")}
+        out.update(
+            counts={"queued": n - done - j["cancelled"], "running": 0, "done": done, "masked": 0,
+                    "cancelled": j["cancelled"]},
+            by_failure_class={"ok": done, "exit_nonzero": 0, "timeout": 0, "oom": 0, "infra": 0, "quota": 0, "client": 0},
+            progress={"done": done, "total": n, "fraction": round(done / n, 4)},
+            reward={"mean": 1.0 if done else None, "count": done},
+            cost_usd=round(0.01 * done, 4), sandbox_hours=round(0.1 * done, 4), eta_s=None if done == n else 10 * (n - done),
+        )
+        return out
+
+    @staticmethod
+    def _check_job(b):
+        if not isinstance(b, dict) or not isinstance(b.get("name"), str):
+            return err(400, "invalid_name", "name is required")
+        if sum(k in b for k in ("template", "image", "snapshot")) != 1:
+            return err(400, "invalid_source", "give one of template, image or snapshot")
+        tasks = b.get("tasks")
+        if not isinstance(tasks, list) or not 1 <= len(tasks) <= 10000:
+            return err(400, "invalid_tasks", "tasks must be a list of 1 to 10000")
+        if not isinstance(b.get("solver"), dict) or not isinstance(b["solver"].get("timeout_s"), int):
+            return err(400, "invalid_solver", "solver needs cmd and timeout_s")
+        for p, v in ((b.get("grader") or {}).get("files") or {}).items():
+            try:
+                base64.b64decode(v, validate=True)
+            except (binascii.Error, ValueError):
+                return err(400, "invalid_files", f"file {p} must be base64")
+        return None
+
+    def _jobs(self, method, parts, query, body):
+        if parts == [] and method == "POST":
+            bad = self._check_job(body)
+            if bad:
+                return bad
+            jid, rid = f"job_{next(self.ids)}", f"run_{next(self.ids)}"
+            self.runs[rid] = {"id": rid, "name": body["name"], "project": body.get("project"), "status": "running",
+                              "config": {"job_id": jid}, "label": {"kosa8.run": rid}, "finished_at": None}
+            self.jobs[jid] = {"id": jid, "run_id": rid, "name": body["name"], "project": body.get("project"),
+                              "status": "queued", "total": len(body["tasks"]), "tasks": len(body["tasks"]), "done": 0,
+                              "cancelled": 0, "concurrency": body.get("concurrency", 16),
+                              "retries_on_infra": body.get("retries_on_infra", 2), "lease_s": body.get("lease_s", 900),
+                              "budget_usd": body.get("budget_usd"), "error": None, "body": body}
+            return 202, {"job_id": jid, "run_id": rid, "job": self._job_public(self.jobs[jid])}
+        if parts == [] and method == "GET":
+            jobs = [j for j in reversed(list(self.jobs.values()))
+                    if all(j.get(k) == query[k] for k in ("status", "project") if k in query)]
+            if "limit" in query:
+                jobs = jobs[:int(query["limit"])]
+            return 200, {"jobs": [self._job_public(j) for j in jobs], "next_cursor": None}
+        if parts == ["estimate"] and method == "POST":
+            bad = self._check_job(body)
+            if bad:
+                return bad
+            n, t = len(body["tasks"]), body["solver"]["timeout_s"] + (body.get("grader") or {}).get("timeout_s", 60)
+            out = {"tasks": n, "basis": "sample" if body.get("sample_job_id") else "timeout",
+                   "per_task_s": {"low": 30, "high": t + 30},
+                   "sandbox_hours": {"low": round(n * 30 / 3600, 4), "high": round(n * (t + 30) / 3600, 4)},
+                   "usd_list": {"low": round(n * 30 / 3600 * 0.127, 4), "high": round(n * (t + 30) / 3600 * 0.127, 4)},
+                   "included_hours_left": 100.0, "size": body.get("size", "2x4"), "note": "fake"}
+            if body.get("sample"):
+                st, made = self._jobs("POST", [], {}, {**body, "tasks": body["tasks"][:body["sample"]],
+                                                        "name": body["name"] + " (sample)"})
+                out["sample"] = {"job_id": made["job_id"], "run_id": made["run_id"], "status": "queued"}
+                return 202, out
+            return 200, out
+        j = self.jobs.get(parts[0]) if parts else None
+        if j is None:
+            return err(404, "not_found", "no such job")
+        if parts[1:] == [] and method == "GET":
+            if j["status"] not in self.JOB_DONE:
+                j["status"] = "running"
+                j["done"] = min(j["total"], j["done"] + self.job_step)
+                if j["done"] == j["total"]:
+                    j["status"] = "done"
+                    self.runs[j["run_id"]]["status"] = "finished"
+            return 200, {"job": self._job_public(j)}
+        if parts[1:] == ["cancel"] and method == "POST":
+            if j["status"] not in self.JOB_DONE:
+                j["status"] = "cancelled"
+                j["cancelled"] = j["total"] - j["done"]
+            return 200, {"job": self._job_public(j)}
+        return err(404, "not_found", "/".join(parts))

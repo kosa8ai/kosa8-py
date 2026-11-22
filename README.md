@@ -309,6 +309,44 @@ Cloud itself (`GradeResult.recorded`), so `Run.map` does not record it again.
 A grade whose command did not finish has `reward=None` and failure class
 `timeout` or `infra`: masked, never scored 0.
 
+### Hosted jobs: kosa8 runs the rollouts
+
+When you only have tasks, a solver command and a grader, `cloud.jobs` hands
+the whole loop to kosa8 Cloud: every task gets its own sandbox, the solver
+runs there (as a background command, so it may run for hours) with the
+task's input in `$KOSA8_TASK_INPUT` and a file, the sealed grader scores a
+copy with no network and the hidden files, and each rollout lands in an RL
+run (step 0, group = the task id). Infra failures are retried
+`retries_on_infra` times, then recorded masked. The job keeps going if your
+laptop closes.
+
+```python
+est = cloud.jobs.estimate(name="swe-eval", template="python", tasks="tasks.jsonl",
+                          solver={"cmd": "python /workspace/solve.py", "timeout_s": 1800},
+                          grader={"cmd": "pytest -q /hidden/test.py", "timeout_s": 60},
+                          grader_files={"/hidden/test.py": pathlib.Path("tests/test.py")})
+print(est["sandbox_hours"], est["usd_list"], est["included_hours_left"])   # {"low", "high"} ranges
+job = cloud.jobs.submit(name="swe-eval", template="python", tasks="tasks.jsonl",
+                        solver={"cmd": "python /workspace/solve.py", "timeout_s": 1800},
+                        grader="pytest -q /hidden/test.py",
+                        grader_files={"/hidden/test.py": pathlib.Path("tests/test.py")},
+                        concurrency=64, budget_usd=20)
+final = cloud.jobs.wait(job["id"], progress=lambda j: print(j["status"], j["progress"]))
+```
+
+`cloud.jobs.get`, `.list`, `.cancel` (stops new rollouts and deletes the
+job's sandboxes) and the same calls on `AsyncCloud` are there too. A job
+past `budget_usd` stops with status `budget_reached`.
+
+Compare runs and load rollouts into a dataframe (pandas and pyarrow are
+optional and imported only when asked for):
+
+```python
+import pandas as pd
+pd.DataFrame(Run.compare([run_a, "run_…"], cloud=cloud))
+df = Run.attach(cloud, final["run_id"]).rollouts(as_="pandas")   # or "arrow", "records"
+```
+
 ## Quickstart: local daemon
 
 ```python

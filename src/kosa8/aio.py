@@ -65,6 +65,7 @@ from .errors import (
 )
 from . import retry as _retry
 from .retry import RetryPolicy, acall_with_retry
+from .jobs import AsyncCloudJobs
 
 #: (method, url, headers, body bytes or None, timeout) -> awaitable of
 #: (status, body bytes[, response headers]).
@@ -157,6 +158,8 @@ class AsyncCloud:
 
             self._aopen = threaded
         self.sandboxes = AsyncCloudSandboxes(self)
+        #: Hosted jobs (see :class:`kosa8.jobs.CloudJobs`).
+        self.jobs = AsyncCloudJobs(self)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"

@@ -52,6 +52,7 @@ from .errors import (
     error_from_response,
 )
 from .retry import RetryPolicy, call_with_retry
+from .jobs import CloudJobs
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -406,7 +407,7 @@ _IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
 #: The POSTs kosa8 Cloud keeps an Idempotency-Key for (24 hours): a retry with
 #: the same key and body gets the first answer (``Idempotent-Replayed: true``).
 _KEYED_POSTS = re.compile(
-    r"^/v1/sandboxes(/batch|/[A-Za-z0-9_]{1,64}/(fork|grade))?$|^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$")
+    r"^/v1/sandboxes(/batch|/[A-Za-z0-9_]{1,64}/(fork|grade))?$|^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$|^/v1/jobs$")
 
 
 def keyed_route(method: str, path: str) -> bool:
@@ -503,6 +504,8 @@ class Kosa8Cloud:
         self.pipelines = CloudPipelines(self)
         #: The org's own templates: Dockerfile builds and bulk image imports.
         self.org_templates = CloudTemplates(self)
+        #: Hosted jobs: kosa8 runs every task's rollout and grade server-side.
+        self.jobs = CloudJobs(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"

@@ -5,12 +5,14 @@ app.kosa8.com (RL runs)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 from ..cloud import RUN_LABEL, new_idempotency_key
+from ..errors import FAILURE_CLASSES
 from ._lease import DEFAULT_LEASE_S, Lease
 from ._rollouts import DEFAULT_MASK, MapSpec, RolloutResult, Rollouts, run_map
 
@@ -256,15 +258,68 @@ class Run:
     def rollouts(
         self, *, step: Optional[int] = None, failure_class: Optional[str] = None, min_reward: Optional[float] = None,
         max_reward: Optional[float] = None, sandbox_id: Optional[str] = None, limit: Optional[int] = None,
-        cursor: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """One page of recorded rollouts (at most 500), oldest first:
-        ``{"rollouts": [...], "next_cursor": ...}``. Each has ``source``:
-        ``grade`` (recorded by the sealed grader) or ``api`` (by :meth:`record`)."""
-        q = {k: str(v) for k, v in (("step", step), ("failure_class", failure_class), ("min_reward", min_reward),
-                                     ("max_reward", max_reward), ("sandbox_id", sandbox_id), ("limit", limit),
-                                     ("cursor", cursor)) if v is not None}
-        return self.cloud._request("GET", self._path("/rollouts" + ("?" + urllib.parse.urlencode(q) if q else ""))) or {}
+        cursor: Optional[str] = None, as_: Optional[str] = None,
+    ) -> Any:
+        """Recorded rollouts. Each has ``source``: ``grade`` (recorded by the
+        sealed grader) or ``api`` (by :meth:`record`).
+
+        Without ``as_``: one page (at most 500), newest first,
+        ``{"rollouts": [...], "next_cursor": ...}``.
+
+        With ``as_``, every matching rollout (all pages; ``limit`` caps the
+        total): ``"records"`` a list of dicts, ``"pandas"`` a DataFrame (the
+        ``metrics`` flattened into ``metrics.<name>`` columns; needs pandas),
+        ``"arrow"`` a ``pyarrow.Table`` (``meta`` and ``metrics`` as JSON
+        strings; needs pyarrow)."""
+        filters = (("step", step), ("failure_class", failure_class), ("min_reward", min_reward),
+                   ("max_reward", max_reward), ("sandbox_id", sandbox_id))
+        if as_ is None:
+            q = {k: str(v) for k, v in filters + (("limit", limit), ("cursor", cursor)) if v is not None}
+            return self.cloud._request("GET", self._path("/rollouts" + ("?" + urllib.parse.urlencode(q) if q else ""))) or {}
+        if as_ not in ("records", "pandas", "arrow"):
+            raise ValueError('as_ is "records", "pandas" or "arrow"')
+        conv = _converter(as_)  # the missing import fails before any request
+        rows: List[Dict[str, Any]] = []
+        nxt = cursor
+        while True:
+            page = min(MAX_ROWS_PER_CALL, limit - len(rows)) if limit is not None else MAX_ROWS_PER_CALL
+            if page <= 0:
+                break
+            q = {k: str(v) for k, v in filters + (("limit", page), ("cursor", nxt)) if v is not None}
+            r = self.cloud._request("GET", self._path("/rollouts?" + urllib.parse.urlencode(q))) or {}
+            rows.extend(r.get("rollouts") or [])
+            nxt = r.get("next_cursor")
+            if not nxt or not r.get("rollouts"):
+                break
+        if limit is not None:
+            rows = rows[:limit]
+        return conv(rows)
+
+    @staticmethod
+    def compare(runs: Iterable[Any], *, cloud: Any = None) -> List[Dict[str, Any]]:
+        """One row per run, side by side, for ``pandas.DataFrame(Run.compare(...))``.
+
+        ``runs`` are :class:`Run` objects, run ids (then ``cloud`` is
+        needed) or answers of ``GET /v1/rl/runs/{id}``. Each row: ``id``,
+        ``name``, ``project``, ``status``, ``rollouts``, ``ok``,
+        ``success_rate``, ``infra_rate``, ``reward_mean``, ``reward_p50``,
+        ``reward_min``, ``reward_max``, ``steps``, ``sandboxes``,
+        ``sandbox_hours``, ``cost_usd``, ``fc_<class>`` (a count per failure
+        class), ``recommendations`` and ``created_at``."""
+        out: List[Dict[str, Any]] = []
+        for r in runs:
+            if isinstance(r, Run):
+                ans = r.summary()
+            elif isinstance(r, str):
+                if cloud is None:
+                    raise ValueError("comparing runs by id needs cloud=")
+                ans = cloud._request("GET", f"/v1/rl/runs/{_q(r)}") or {}
+            elif isinstance(r, Mapping):
+                ans = dict(r)
+            else:
+                raise TypeError(f"compare takes Run objects, run ids or run answers, got {type(r).__name__}")
+            out.append(_compare_row(ans))
+        return out
 
     def export(self, path: Optional[str] = None) -> bytes:
         """Every rollout as JSON lines; written to ``path`` when given."""
@@ -326,6 +381,49 @@ class Run:
                        retries=retries, timeout_s=timeout_s, mask=tuple(mask), keep=keep, meta=meta)
         return run_map(self, self.cloud, base, tasks, solve, spec, concurrency=concurrency,
                        record=lambda r: self.record(r), run_id=self.id, lease_s=self.lease_s)
+
+
+def _compare_row(ans: Mapping[str, Any]) -> Dict[str, Any]:
+    run = _run_of(ans)
+    summ = ans.get("summary") if isinstance(ans.get("summary"), dict) else (run.get("summary") or {})
+    reward = summ.get("reward") if isinstance(summ.get("reward"), dict) else {}
+    usage = summ.get("usage") if isinstance(summ.get("usage"), dict) else {}
+    recs = ans.get("recommendations", run.get("recommendations"))
+    row: Dict[str, Any] = {
+        "id": run.get("id"), "name": run.get("name"), "project": run.get("project"), "status": run.get("status"),
+        "rollouts": summ.get("rollouts"), "ok": summ.get("ok"),
+        "success_rate": summ.get("success_rate"), "infra_rate": summ.get("infra_rate"),
+        "reward_mean": reward.get("mean", summ.get("reward_mean")), "reward_p50": reward.get("p50"),
+        "reward_min": reward.get("min"), "reward_max": reward.get("max"),
+        "steps": summ.get("steps"), "sandboxes": usage.get("sandboxes"),
+        "sandbox_hours": usage.get("sandbox_hours"), "cost_usd": usage.get("cost_usd"),
+    }
+    for fc in FAILURE_CLASSES:
+        row[f"fc_{fc}"] = (summ.get("by_failure_class") or {}).get(fc)
+    row["recommendations"] = len(recs) if isinstance(recs, list) else (recs or {}).get("count") if isinstance(recs, dict) else None
+    row["created_at"] = run.get("created_at")
+    return row
+
+
+def _converter(as_: str) -> Callable[[List[Dict[str, Any]]], Any]:
+    if as_ == "records":
+        return lambda rows: rows
+    if as_ == "pandas":
+        try:
+            import pandas as pd  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError("Run.rollouts(as_=\"pandas\") needs pandas: pip install pandas") from e
+        return lambda rows: pd.json_normalize(rows, max_level=1) if rows else pd.DataFrame()
+    try:
+        import pyarrow as pa  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ImportError("Run.rollouts(as_=\"arrow\") needs pyarrow: pip install pyarrow") from e
+
+    def to_arrow(rows: List[Dict[str, Any]]) -> Any:
+        flat = [{**r, **{k: json.dumps(r[k]) if r.get(k) is not None else None for k in ("meta", "metrics")}} for r in rows]
+        return pa.Table.from_pylist(flat)
+
+    return to_arrow
 
 
 class AsyncRun:
