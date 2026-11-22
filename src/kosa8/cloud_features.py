@@ -12,6 +12,7 @@ import time
 import urllib.parse
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+from .cloud_more import CloudPreviewDomains
 from .errors import Kosa8TimeoutError
 
 #: Pipelines run states that are final.
@@ -141,6 +142,11 @@ class CloudPreviews:
     def delete(self, port: int) -> None:
         _check_port(port)
         self._cloud._request("DELETE", f"{self._base}/previews/{port}")
+
+    def domains(self, port: int) -> CloudPreviewDomains:
+        """The preview's custom domains: serve it at your own hostname."""
+        _check_port(port)
+        return CloudPreviewDomains(self._cloud, f"{self._base}/previews/{port}")
 
 
 class CloudSecrets:

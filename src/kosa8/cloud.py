@@ -53,6 +53,7 @@ from .errors import (
 )
 from .retry import RetryPolicy, call_with_retry
 from .jobs import CloudJobs
+from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens, preview_path
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -68,6 +69,8 @@ from .cloud_features import (
 
 DEFAULT_CLOUD_URL = "https://api.kosa8.com"
 CLOUD_KEY_PREFIX = "k8c_live_"
+#: A capability token (``cloud.tokens.create``) works as a key too.
+CLOUD_TOKEN_PREFIX = "k8c_tok_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
 USER_AGENT = "kosa8-python/0.5.2"
@@ -487,8 +490,9 @@ class Kosa8Cloud:
         key = (api_key if api_key is not None else env.get("KOSA8_API_KEY", "")).strip()
         if not key:
             raise Kosa8Error("no kosa8 Cloud API key: pass api_key or set KOSA8_API_KEY")
-        if not key.startswith(CLOUD_KEY_PREFIX):
-            raise Kosa8Error(f"a kosa8 Cloud API key starts with {CLOUD_KEY_PREFIX}")
+        if not key.startswith((CLOUD_KEY_PREFIX, CLOUD_TOKEN_PREFIX)):
+            raise Kosa8Error(
+                f"a kosa8 Cloud API key starts with {CLOUD_KEY_PREFIX} (a capability token with {CLOUD_TOKEN_PREFIX})")
         self._key = key
         self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or DEFAULT_CLOUD_URL)
         self.timeout = timeout
@@ -506,6 +510,12 @@ class Kosa8Cloud:
         self.org_templates = CloudTemplates(self)
         #: Hosted jobs: kosa8 runs every task's rollout and grade server-side.
         self.jobs = CloudJobs(self)
+        #: Burst Passes: a raised running limit for some hours.
+        self.burst = CloudBurst(self)
+        #: Short-lived capability tokens limited to some scopes and sandboxes.
+        self.tokens = CloudTokens(self)
+        #: Desktop session recordings.
+        self.recordings = CloudRecordings(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -521,6 +531,11 @@ class Kosa8Cloud:
     def templates(self) -> List[Dict[str, Any]]:
         """The templates the org can start: ``key``, ``cpus``, ``mem_mb``, ``image``, ``regions``, ``warm``."""
         return (self._request("GET", "/v1/templates") or {}).get("templates", [])
+
+    def preview_domains(self, preview_id: str) -> CloudPreviewDomains:
+        """The custom domains of a preview by its id (``{sandbox_id}:{port}``,
+        the ``id`` of a preview). ``box.previews.domains(port)`` is the same."""
+        return CloudPreviewDomains(self, preview_path(preview_id))
 
     def capabilities(self) -> Dict[str, Any]:
         """What this API offers, for feature detection."""
@@ -729,7 +744,7 @@ def _create_body(
     docker: Optional[bool], cpu: Optional[str], name: Optional[str], env: Optional[Mapping[str, str]],
     snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
     secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
-    run_id: Optional[str],
+    run_id: Optional[str], record: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """The body of ``POST /v1/sandboxes`` (checked). Labels, ``kosa8.run``
     included, go in the body: kosa8 Cloud stores them before it answers, so a
@@ -778,7 +793,7 @@ def _create_body(
         raise ValueError("a sandbox with docker is persistent; leave out persistent or set it to True")
     for k, v in (
         ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image), ("disk_gb", disk_gb),
-        ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name),
+        ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name), ("record", record),
     ):
         if v is not None:
             body[k] = v
@@ -822,6 +837,7 @@ class CloudSandboxes:
         labels: Optional[Mapping[str, str]] = None,
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
+        record: Optional[bool] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -846,7 +862,9 @@ class CloudSandboxes:
         then takes no template, size, image, disk, docker, persistent, cpu or
         region. ``egress`` is its starting network policy, ``secrets`` names
         org secrets it holds, ``labels`` are sent with the create (stored
-        before it answers, so they are there while it boots).
+        before it answers, so they are there while it boots). ``record=True``
+        (the kosa8-desktop image, persistent only) records its desktop to MP4,
+        saved to ``cloud.recordings`` when it is deleted.
 
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
@@ -868,7 +886,7 @@ class CloudSandboxes:
             self._cloud, template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s,
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
-            egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id,
+            egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
         )
         r = self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = CloudSandbox(self._cloud, r["sandbox"])
@@ -1360,6 +1378,11 @@ class CloudSandbox:
         return CloudPreviews(self._cloud, self._path())
 
     @property
+    def embeds(self) -> CloudEmbeds:
+        """Signed, expiring iframe URLs for its terminal or desktop."""
+        return CloudEmbeds(self._cloud, self._path())
+
+    @property
     def schedules(self) -> CloudSchedules:
         """Commands it runs on a cron schedule."""
         return CloudSchedules(self._cloud, self._path())
@@ -1440,6 +1463,11 @@ class CloudSandbox:
         """Its last commands, with exit codes and output tails."""
         q = f"?limit={int(limit)}" if limit is not None else ""
         return (self._cloud._request("GET", self._path(f"/logs{q}")) or {}).get("entries", [])
+
+    def recordings(self) -> List[Dict[str, Any]]:
+        """Its desktop recordings (made when it is deleted, for a sandbox
+        created with ``record=True``); fetch one with ``cloud.recordings.link``."""
+        return (self._cloud._request("GET", self._path("/recordings")) or {}).get("recordings", [])
 
 
 class CloudFiles:
