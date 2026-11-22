@@ -27,6 +27,9 @@ print(r.exit_code, r.stdout)          # 0 42
 box.exec("echo hello > /workspace/hello.txt")   # /workspace is kept between commands
 print(box.exec("cat /workspace/hello.txt").stdout)
 
+small = cloud.sandboxes.create(size="0.25x0.5", ttl_s=600)   # 0.25 vCPU, 512 MB (or cpus=0.25, mem_mb=512)
+small.delete()
+
 box.sleep()                           # costs only snapshot storage while asleep
 box.exec("ls /workspace")             # wakes it, files and all
 box.delete()
@@ -74,7 +77,7 @@ print(out["ok"], out["result"])  # True {'hello': 'kosa8'}
 ```python
 # 4 vCPU / 8 GiB, Ubuntu with common toolchains, its own Docker engine and env.
 box = cloud.sandboxes.create(
-    size="4x8",                                       # 2x4, 4x8, 8x16 or 16x32 (CLOUD_SIZES)
+    size="4x8",                                       # 0.25x0.5, 0.5x1, 1x2, 2x4, 4x8, 8x16 or 16x32 (CLOUD_SIZES)
     image="kosa8-template/universal-24.04-20261115.2",
     docker=True,                                      # implies persistent
     env={"NODE_ENV": "production"},                   # every command gets it; never logged
@@ -84,6 +87,8 @@ box = cloud.sandboxes.create(
 job = box.exec_background("dockerd > /var/log/dockerd.log 2>&1 & sleep 3; docker run --rm hello-world")
 done = job.wait()                                     # or job.status() to poll yourself
 print(done["exit"], done["output"])
+long = box.exec_background("make test", timeout_s=3600)   # the host ends it after an hour
+long.stop()                                           # SIGTERM, then SIGKILL 5 s later
 
 snap = box.snapshot("web-ready")                      # durable: memory, processes and disk
 copy = cloud.sandboxes.create(snapshot=snap["id"], ttl_s=600)
@@ -150,7 +155,10 @@ with cloud.browser(ttl_s=300) as b:                   # closed on the way out
         print(browser.contexts[0].pages[0].title() if browser.contexts and browser.contexts[0].pages else "")
 
 cloud.list_browsers(state="all"); cloud.get_browser("brw_..."); cloud.browsers.delete("brw_...")
+cloud.browsers.cdp_url("brw_...")   # a fresh wss://.../v1/browsers/{id}/cdp?token=... for an open browser
 ```
+
+`AsyncCloud` has the same: `async with await cloud.browser() as b: await b.goto(url)`.
 
 ### AI gateway
 
@@ -163,6 +171,37 @@ cloud.update_ai_settings(enabled=True, cache_ttl_s=3600, rate_per_min=120)
 box = cloud.sandboxes.create(ai_gateway=True)   # OPENAI_BASE_URL, ANTHROPIC_BASE_URL, KOSA8_AI_GATEWAY_URL, KOSA8_AI_TOKEN set
 print(cloud.ai_usage("2026-11")["total"])       # calls, cost_usd, tokens_in, tokens_out, cached, errors
 cloud.delete_ai_key("openai")
+
+# Outside a sandbox: point the provider's SDK at the gateway, with your kosa8 key as its key.
+from openai import OpenAI
+llm = OpenAI(base_url=cloud.ai.gateway_url("openai"), api_key=os.environ["KOSA8_API_KEY"])   # .../v1/ai/gw/openai/
+```
+
+### Account, keys, webhooks, audit, benchmarks, RL
+
+Each is on `Kosa8Cloud` and, awaited, on `AsyncCloud`.
+
+```python
+cloud.pricing()["rates"]; cloud.limits(); cloud.usage_insights()
+cloud.images(); cloud.lineage(); cloud.checkpoints()        # every sandbox's checkpoints
+cloud.request_limit(100, reason="RL sweep")                 # ask for a higher running limit
+
+k = cloud.api_keys.create("ci", scopes=["sandboxes:read", "sandboxes:write"])   # k["api_key"]["secret"], once
+cloud.api_keys.rotate(k["api_key"]["id"], grace_s=3600); cloud.api_keys.revoke(k["api_key"]["id"])
+
+wh = cloud.webhooks.create("https://me.example/kosa8", events=["sandbox.created"])   # wh["secret"], once
+cloud.webhooks.test(wh["id"]); cloud.webhooks.deliveries(wh["id"]); cloud.webhooks.delete(wh["id"])
+
+page = cloud.audit.list(limit=50)            # page["events"], page["next_before_seq"]
+cloud.audit.verify()["ok"]; cloud.audit.export()
+
+cloud.benchmarks.list(); cloud.benchmarks.instances("swe-bench-verified", limit=10)
+cloud.benchmarks.prepare("swe-bench-verified", 20, seed=1)   # build 20 environments ahead of use
+
+cloud.rl.compare(["run_a", "run_b"]); cloud.rl.alerts()
+cloud.rl.create_alert("infra_rate", 0.2, run_id="run_a")
+cloud.functions.invocations("hello", limit=20)
+box.previews.delete(3000); box.schedules.delete("sch_..."); box.code_contexts.delete("default")
 ```
 
 ### How Cloud sandboxes run commands
@@ -170,7 +209,8 @@ cloud.delete_ai_key("openai")
 - The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`,
   `python` or `git`. Use `template="python"` (or another key from `cloud.templates()`)
   for Python, or pass `image=` to `exec`.
-- **Only `/workspace` is sure to persist between commands.** A command may run in
+- **Each exec is a fresh process; files in `/workspace` persist for the sandbox's
+  life; installed packages need `persistent=True`.** A command may run in
   a fresh container, so `cd`, `export`, processes it leaves running and anything
   written or installed outside `/workspace` (`apk add`, `pip install` into the
   system) may be gone by the next command. Create with `persistent=True` (one
@@ -194,6 +234,11 @@ cloud.delete_ai_key("openai")
 - Labels (up to 16) go on with `labels=` at create or `box.set_labels()`;
   `list(labels=...)`, `heartbeat` and `drain` select by them.
 
+- **Overflow capacity.** When kosa8's own hosts are full, a plain sandbox may run
+  on overflow capacity (Cloudflare; `box.overflow` is `True`, `region` is
+  `cf-auto`). It has no checkpoint, rewind, fork, sleep or snapshot: those raise
+  `Kosa8UnsupportedError` (501 `not_available`) with the server's reason.
+
 ### Cloud errors
 
 | Error | When | What to do |
@@ -215,7 +260,12 @@ are exponential with full jitter, 3 tries by default. Creates, batches, forks
 and grades carry an `Idempotency-Key` that their retries reuse, so they are
 retried on infra failures too and kosa8 Cloud answers a retry with the first
 answer. Other POSTs (an exec, recording rollouts) that failed with a 5xx are
-**not** resent, since they may have run.
+**not** resent, since they may have run. Since 0.6.0 every request, those
+POSTs included, is also retried on refusals made before anything ran: 503
+`database_busy`, 409 `template_building` (waiting its `retry_after_s`, the
+build's ETA, up to 60 s) and 409 `idempotency_in_progress`; and any read on an
+answer whose body says `retryable: true`. The wait honours the `Retry-After`
+header and the body's `retry_after` / `retry_after_s`.
 `Kosa8Cloud(retry=kosa8.RetryPolicy(attempts=5))` changes it;
 `retry=kosa8.NO_RETRY` turns it off.
 

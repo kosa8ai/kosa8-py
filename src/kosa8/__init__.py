@@ -33,9 +33,38 @@ from .cloud import (
     CloudSandboxPage,
     Kosa8Cloud,
     CLOUD_SIZES,
+    SMALL_SIZES,
+    OVERFLOW_REGION,
+    PRE_EXECUTION_CODES,
 )
-from .cloud_browser import BROWSER_PRICE_PER_HOUR_USD, CloudAI, CloudBrowser, CloudBrowsers
+from .cloud_browser import (
+    AI_PROVIDERS,
+    BROWSER_PRICE_PER_HOUR_USD,
+    AsyncCloudAI,
+    AsyncCloudBrowser,
+    AsyncCloudBrowsers,
+    CloudAI,
+    CloudBrowser,
+    CloudBrowsers,
+)
+from .cloud_api import (
+    AsyncCloudAccount,
+    AsyncCloudApiKeys,
+    AsyncCloudAudit,
+    AsyncCloudBenchmarks,
+    AsyncCloudFunctions,
+    AsyncCloudRL,
+    AsyncCloudWebhooks,
+    CloudAccount,
+    CloudApiKeys,
+    CloudAudit,
+    CloudBenchmarks,
+    CloudRL,
+    CloudWebhooks,
+)
 from .cloud_features import (
+    AsyncCloudBackgroundExec,
+    AsyncCloudTemplates,
     CloudBackgroundExec,
     CloudCodeContexts,
     CloudPipelineHooks,
@@ -80,9 +109,31 @@ from .aio import AsyncCloud, AsyncCloudFiles, AsyncCloudSandbox, AsyncCloudSandb
 #: ``kosa8.Cloud()`` is :class:`Kosa8Cloud`.
 Cloud = Kosa8Cloud
 
-__version__ = "0.5.5"
+__version__ = "0.6.0"
 
 __all__ = [
+    "AI_PROVIDERS",
+    "AsyncCloudAI",
+    "AsyncCloudBrowser",
+    "AsyncCloudBrowsers",
+    "AsyncCloudAccount",
+    "AsyncCloudApiKeys",
+    "AsyncCloudAudit",
+    "AsyncCloudBenchmarks",
+    "AsyncCloudFunctions",
+    "AsyncCloudRL",
+    "AsyncCloudWebhooks",
+    "AsyncCloudBackgroundExec",
+    "AsyncCloudTemplates",
+    "CloudAccount",
+    "CloudApiKeys",
+    "CloudAudit",
+    "CloudBenchmarks",
+    "CloudRL",
+    "CloudWebhooks",
+    "SMALL_SIZES",
+    "OVERFLOW_REGION",
+    "PRE_EXECUTION_CODES",
     "CloudBrowser",
     "CloudBrowsers",
     "CloudAI",
