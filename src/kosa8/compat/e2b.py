@@ -37,7 +37,9 @@ E2B                            kosa8 Cloud
                                background exec
 ``files.*``                    the sandbox's files API; relative paths are
                                under /workspace
-``run_code`` (interpreter)     the code interpreter (Python only)
+``run_code`` (interpreter)     the code interpreter (Python only); the
+                               code-interpreter ``Sandbox`` is created
+                               persistent, which the interpreter needs
 =============================  ==============================================
 
 Everything else raises :class:`kosa8.compat.Unsupported`. Differences to know:
@@ -580,8 +582,10 @@ def _create_body(
         body["ttl_s"] = _ttl(timeout)
     if template and template.startswith("snap_"):
         body["snapshot"] = template
-    elif template and template not in ("base",):
-        body["template"] = template
+    elif template:
+        # E2B's own default ("base") has Python in it; kosa8's base is Alpine
+        # without it, so E2B's "base" starts kosa8's "python" template.
+        body["template"] = "python" if template == "base" else template
     if envs:
         body["env"] = dict(envs)
     if metadata:
@@ -605,7 +609,12 @@ class Sandbox:
     ``sandbox.kosa8`` is the :class:`kosa8.CloudSandbox` underneath.
     """
 
-    _default_template: Optional[str] = None
+    #: E2B's default image has Python, so the shim starts kosa8's ``python``
+    #: template unless ``template=`` says otherwise.
+    _default_template: Optional[str] = "python"
+    #: Whether create() asks for a persistent sandbox (one long-lived
+    #: container); the code interpreter needs one.
+    _persistent: bool = False
 
     def __init__(self, *, _box: Optional[CloudSandbox] = None, **opts: Any) -> None:
         if _box is None:
@@ -668,12 +677,15 @@ class Sandbox:
         api_key: Optional[str] = None,
         **opts: Any,
     ) -> "Sandbox":
-        """Start a sandbox (``template`` is a kosa8 template key, ``base`` the
-        default; a ``snap_...`` id starts from that snapshot). ``secure`` is
+        """Start a sandbox (``template`` is a kosa8 template key; the default,
+        and E2B's ``base``, is kosa8's ``python``; a ``snap_...`` id starts
+        from that snapshot). ``secure`` is
         ignored, as E2B now ignores it; ``logger`` is not used."""
         body = _create_body(template if template is not None else cls._default_template, timeout, metadata, envs,
                             allow_internet_access, mcp, network, iam, lifecycle, volume_mounts, idempotency_key,
                             cpu_count, opts)
+        if cls._persistent and "snapshot" not in body:
+            body["persistent"] = True
         cloud = get_cloud(api_key)
         labels = body.pop("labels", None)
         box = cloud.sandboxes.create(labels=labels, **body)

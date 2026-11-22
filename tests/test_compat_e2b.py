@@ -33,14 +33,19 @@ class E2BTest(unittest.TestCase):
         self.assertIs(sb.kosa8.id, sb.sandbox_id)
 
     def test_create_defaults_and_minimum_ttl(self):
+        # E2B's default image has Python, so the shim's default (and E2B's
+        # "base") is kosa8's python template, not kosa8's Alpine base.
         Sandbox.create()
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"ttl_s": 300})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 300})
         Sandbox.create("base", timeout=5)
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"ttl_s": 60})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 60})
+        Sandbox.create("node")
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["template"], "node")
+        self.assertNotIn("persistent", self.f.last("POST /v1/sandboxes")["body"])
 
     def test_create_pause_on_timeout_and_from_snapshot(self):
         Sandbox.create(timeout=120, lifecycle={"on_timeout": "pause"})
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"sleep_after_s": 120})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "sleep_after_s": 120})
         Sandbox.create("snap_9")
         self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["snapshot"], "snap_9")
 
@@ -281,9 +286,25 @@ class E2BTest(unittest.TestCase):
 
     # code interpreter -------------------------------------------------------------------
 
+    def test_code_interpreter_readme_example(self):
+        # The README's first run_code works on a sandbox the shim created itself.
+        with CISandbox.create() as sb:
+            self.assertEqual(sb.run_code("6 * 7").error, None)
+        snap = CISandbox.create("snap_1")
+        self.assertNotIn("persistent", self.f.last("POST /v1/sandboxes")["body"])  # a snapshot keeps its own kind
+        del snap
+
+    def test_plain_e2b_run_code_on_non_persistent_is_a_clear_error(self):
+        sb = Sandbox.create()
+        with self.assertRaises(Exception) as c:
+            sb.run_code("1")
+        self.assertIn("persistent", str(c.exception))
+
     def test_code_interpreter(self):
         sb = CISandbox.create()
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["template"], "python")
+        body = self.f.last("POST /v1/sandboxes")["body"]
+        self.assertEqual(body["template"], "python")
+        self.assertIs(body["persistent"], True)  # the interpreter refuses a non-persistent sandbox (409)
         self.f.code_answer = {
             "execution_count": 4, "stdout": "a\nb\n", "stderr": "warn\n",
             "results": [{"type": "text", "data": "<display>"}, {"type": "image/png", "data": "iVBOR"},

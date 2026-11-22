@@ -8,7 +8,7 @@ No dependencies. It talks to **kosa8 Cloud** (`https://api.kosa8.com`) with an A
 key, or to the local kosa8 daemon over its unix socket, or to a remote kosa8 worker.
 
 ```sh
-pip install "kosa8>=0.4"
+pip install kosa8
 ```
 
 ## Quickstart: kosa8 Cloud
@@ -24,7 +24,7 @@ box = cloud.sandboxes.create(template="python", ttl_s=3600)   # deleted automati
 r = box.exec(["python3", "-c", "print(6 * 7)"])
 print(r.exit_code, r.stdout)          # 0 42
 
-box.exec("echo hello > /workspace/hello.txt")   # only /workspace persists between commands
+box.exec("echo hello > /workspace/hello.txt")   # /workspace is kept between commands
 print(box.exec("cat /workspace/hello.txt").stdout)
 
 box.sleep()                           # costs only snapshot storage while asleep
@@ -102,8 +102,9 @@ box.previews.create(8080, public=True, wake=True)
 box.previews.list(); box.previews.link(3000, expires_in_s=600); box.previews.rotate(3000); box.previews.delete(3000)
 
 print(box.terminal(cols=120, rows=32)["url"])         # wss:// URL for a PTY WebSocket
-r = box.run_code("import math; math.pi")              # stateful Python; charts come back as image/png
-box.code_contexts.create("nb"); box.code_contexts.reset("nb")
+nb = cloud.sandboxes.create(template="python", persistent=True)   # the code interpreter needs a persistent sandbox
+r = nb.run_code("import math; math.pi")               # stateful Python; charts come back as image/png
+nb.code_contexts.create("nb"); nb.code_contexts.reset("nb")
 
 box.set_egress(internet=False, presets=["pypi"], allow=["api.example.com"])
 box.reset_egress(); cloud.egress_presets(); cloud.set_org_egress({"internet": False}, enforce=True)
@@ -137,13 +138,18 @@ print(hook["url"], hook["secret"])                    # give both to the reposit
 - The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`,
   `python` or `git`. Use `template="python"` (or another key from `cloud.templates()`)
   for Python, or pass `image=` to `exec`.
-- **Each `exec` runs in a fresh container, and only `/workspace` persists.** `cd`,
-  `export` and anything installed outside `/workspace` (`apk add`, `pip install`
-  into the system) are gone by the next command. Install into `/workspace`, for
+- **Only `/workspace` is sure to persist between commands.** A command may run in
+  a fresh container, so `cd`, `export`, processes it leaves running and anything
+  written or installed outside `/workspace` (`apk add`, `pip install` into the
+  system) may be gone by the next command. Create with `persistent=True` (one
+  long-lived container) to keep the whole filesystem and background processes;
+  the code interpreter (`run_code`) needs it, and it counts against your plan's
+  persistent-sandbox limit. Install into `/workspace`, for
   example `pip install --target /workspace/lib ...` with `PYTHONPATH=/workspace/lib`,
   or chain the steps in one `sh -c`.
 - **A buffered `exec` runs at most 90 seconds** and raises
-  `Kosa8ExecTimeoutError`. Run long work in the background and poll it:
+  `Kosa8ExecTimeoutError`. `exec(cmd, timeout_s=30)` stops a command sooner, in
+  the sandbox (1 to 90 whole seconds). Run long work in the background and poll it:
   `box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1; echo $? > /workspace/test.exit' &")`.
 - A request body (command and env) is at most 64 KiB; a file read or write is at
   most 8 MiB.
@@ -411,11 +417,22 @@ from kosa8.compat.e2b_code_interpreter import Sandbox   # was: from e2b_code_int
 from kosa8.compat.daytona import Daytona, CreateSandboxFromImageParams   # was: from daytona import ...
 import kosa8.compat.modal as modal                      # was: import modal
 
-sbx = Sandbox.create(timeout=600)
+sbx = Sandbox.create(timeout=600)                       # kosa8's python template, like E2B's default image
 print(sbx.commands.run("echo hi").stdout)
 sbx.files.write("app.py", "print(6 * 7)")               # relative paths go under /workspace
+print(sbx.commands.run("python3 /workspace/app.py").stdout)   # 42
 sbx.kill()
+
+from kosa8.compat.e2b_code_interpreter import Sandbox as CodeSandbox
+with CodeSandbox.create() as nb:                         # persistent: the interpreter keeps Python running
+    nb.run_code("x = 6 * 7")
+    print(nb.run_code("x").text)                         # 42
 ```
+
+The E2B shims start kosa8's `python` template when you give no template (or E2B's `base`), since
+E2B's default image has Python and kosa8's `base` is Alpine without it. The code-interpreter
+`Sandbox` is created `persistent`, which `run_code` needs; it counts against your plan's
+persistent-sandbox limit.
 
 | Shim (mirrors) | What maps onto kosa8 Cloud |
 |---|---|
@@ -429,7 +446,8 @@ pretends a call worked. Errors come back as the other SDK's exceptions (`e2b.Tim
 `DaytonaNotFoundError`, `modal.exception.NotFoundError`), with the kosa8 error as `__cause__`.
 Every shim object has `.kosa8`, the `CloudSandbox` underneath, for anything else.
 
-How kosa8 differs, whichever shim you use: only `/workspace` outlives a command; a foreground
+How kosa8 differs, whichever shim you use: only `/workspace` is sure to outlive a command (unless
+the sandbox is persistent); a foreground
 command runs at most 90 s (use E2B `background=True` or a Modal entrypoint for longer work); output
 arrives when a command ends, so callbacks such as E2B's `on_stdout` run once, with all of it; a
 background command's stdout and stderr come back together (a Modal entrypoint's stderr is kept
@@ -452,7 +470,13 @@ only the Python shims. For new code, use `Kosa8Cloud` directly.
 ## Agent frameworks
 
 These adapters drive the local daemon (`Kosa8Client`). For kosa8 Cloud with LangChain,
-Inspect or Harbor, see `langchain-kosa8`, `inspect-kosa8` and `harbor-kosa8` on GitHub (kosa8ai).
+Inspect or Harbor, install the adapter from PyPI (source on GitHub under kosa8ai):
+
+```sh
+pip install langchain-kosa8   # deepagents / LangChain sandbox backend
+pip install inspect-kosa8     # Inspect AI: sandbox="kosa8"
+pip install harbor-kosa8      # Harbor: -e harbor_kosa8:Kosa8Environment
+```
 
 ```python
 from kosa8.integrations.openai_agents import sandbox_tools   # pip install 'kosa8[openai-agents]'
@@ -483,6 +507,28 @@ CLI saved (`kosa8 wsl setup` on Windows, where the engine runs in WSL2, or
 `kosa8 worker join` anywhere), with its token; else the local daemon's socket.
 So on Windows, once `kosa8 wsl setup` has run, `Kosa8Client()` reaches the WSL2
 engine with no configuration.
+
+## The same thing in each language
+
+The five kosa8 SDKs (Python `kosa8`, JS `@kosa8/sdk`, Go `kosa8-go`, Ruby `kosa8`, Java
+`com.kosa8:kosa8`) call the same kosa8 Cloud API, but some names differ by language. The ones
+that catch people switching:
+
+| | Python | JS / TS | Go | Ruby | Java |
+|---|---|---|---|---|---|
+| client | `Kosa8Cloud()` | `new Kosa8Cloud()` | `kosa8.NewCloud(kosa8.CloudOptions{})`, returns `(cloud, err)` | `Kosa8::Cloud.new` | `Kosa8Cloud.builder().build()` |
+| lifetime on create | `ttl_s=3600` | `{ ttlS: 3600 }` | `CloudCreateOptions{TTLSeconds: 3600}` | `ttl_s: 3600` | `new CloudOptions.Create().ttlSeconds(3600)` |
+| persistent sandbox | `persistent=True` | `{ persistent: true }` | `CloudCreateOptions{Persistent: true}` | `persistent: true` | `.persistent(true)` |
+| sandbox id | `box.id` | `box.id` | `box.ID()`, a method (`fmt.Println(box.ID)` prints a func value; `go vet` reports it) | `box.id` | `box.id()` |
+| shell command | `box.exec("ls /")` | `box.exec('ls /')` | `box.ExecShell(ctx, "ls /", nil)` | `box.exec("ls /")` | `box.exec("ls /")` |
+| argv command | `box.exec(["ls", "/"])` | `box.exec(['ls', '/'])` | `box.Exec(ctx, []string{"ls", "/"}, nil)` | `box.exec(["ls", "/"])` | `box.exec(List.of("ls", "/"))` |
+| per-exec timeout | `exec(cmd, timeout_s=30)` | `exec(cmd, { timeoutS: 30 })` | `&kosa8.CloudExecOptions{TimeoutS: 30}` | `exec(cmd, timeout_s: 30)` | `exec(cmd, null, null, 30)` |
+| exit code | `r.exit_code` | `r.exitCode` | `r.ExitCode`, an `*int` (nil when the cloud sent none; `r.OK()` checks for 0) | `r.exit_code` | `r.exitCode()`, an `Integer` (may be null) |
+| files | `box.files.write` / `read_text` / `list` | `box.files.write` / `readText` / `list` | `box.Files().WriteString` / `ReadText` / `List(ctx, "")` | `box.files.write` / `read_text` / `list` | `box.files().write` / `readText` / `list()` |
+| no such sandbox | `Kosa8NotFoundError` | `Kosa8NotFoundError` | `*kosa8.Error` with `Kind` `KindNotFound` (`errors.Is(err, kosa8.ErrNotFound)`) | `Kosa8::NotFoundError` | `Kosa8Exception.NotFoundException` |
+
+In every SDK a non-zero exit is returned in the result, not raised. Only `/workspace` is sure to
+persist between commands, unless the sandbox is persistent.
 
 ## Errors
 
