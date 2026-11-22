@@ -281,6 +281,10 @@ Your plan's running limit also applies: past it, a batch or fork reports the
 rest as `running_limit` in `.failed`, and one that made none raises the first
 refusal (with `requested`, `created: 0` and `failed` in the error's `.body`).
 
+The sealed grader's 90 s cap stays for now: split a long test suite into
+several grades (`swebench.grade` raises `GradeTooLong` with that advice).
+Longer grading comes with the upcoming kosa8 Jobs API.
+
 **Safe retries.** Creates, batches, forks and grades send an
 `Idempotency-Key` (a new UUID, or `idempotency_key=` yours) that every retry
 reuses; kosa8 Cloud keeps the answer for 24 hours and replays it. So the SDK

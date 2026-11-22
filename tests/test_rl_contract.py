@@ -340,6 +340,72 @@ class Recording(unittest.TestCase):
         self.assertEqual(fit_meta({"o": object()}).keys(), {"o"})
 
 
+class FlushKeysPrefixSwebench(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeCloud()
+        self.cloud = Kosa8Cloud(KEY, env={}, base_url=LOCAL, opener=self.fake)
+        self.waits = no_sleep(self)
+
+    def test_flush_key_is_kept_with_its_rows_until_answered(self):
+        with Run(self.cloud, "f") as run:
+            path = f"/v1/rl/runs/{run.id}/rollouts"
+            # Every answer of the first flush is lost (the server stored the rows on the first try).
+            self.fake.lose_answer = lambda m, p: m == "POST" and p == path
+            run.record([{"step": 0, "reward": 1.0}] * 3, flush=False)
+            with self.assertRaises(Kosa8Error):
+                run.flush()
+            self.assertEqual(run.pending, 3)
+            self.fake.lose_answer = None
+            run.record({"step": 1}, flush=False)
+            self.assertEqual(run.flush(), 4)  # the 3 again (a replay), then the new one
+            ks = keys(self.fake, "POST", "/rollouts")
+            self.assertEqual(len(ks), 5)  # 3 tries, the resend, the new batch
+            self.assertEqual(len(set(ks[:4])), 1)
+            self.assertNotEqual(ks[4], ks[0])
+        self.assertEqual(len([r for r in self.fake.rollouts if r["source"] == "api"]), 4)  # stored once
+        self.assertEqual(self.fake.replays, 3)
+
+    def test_flush_retried_on_5xx(self):
+        n = {"i": 0}
+
+        def once(m, p, b):
+            if p.endswith("/rollouts") and m == "POST" and n["i"] == 0:
+                n["i"] += 1
+                return 502, {"error": "internal", "message": "x"}
+            return None
+
+        with Run(self.cloud, "f") as run:
+            self.fake.before = once
+            run.record([{"step": 0}] * 2, flush=False)
+            self.assertEqual(run.flush(), 2)
+            self.fake.before = None
+        self.assertEqual(len(keys(self.fake, "POST", "/rollouts")), 2)
+
+    def test_prefix(self):
+        batch = self.cloud.sandboxes.create_many(2, prefix="w")
+        self.assertEqual([self.fake.sandboxes[b.id]["name"] for b in batch], ["w-0001", "w-0002"])
+        self.assertEqual([b for m, p, b in self.fake.calls if p.endswith("/batch")][-1]["prefix"], "w")
+        for bad in ("-x", "a b", "x" * 60):
+            with self.assertRaises(ValueError):
+                self.cloud.sandboxes.create_many(1, prefix=bad)
+
+    def test_swebench_grade_too_long(self):
+        from kosa8.rl import swebench
+        from kosa8.rl.swebench import GradeTooLong
+
+        inst = {"instance_id": "a__b-1", "test_patch": "diff", "FAIL_TO_PASS": ["t::x"], "PASS_TO_PASS": []}
+        box = self.cloud.sandboxes.create()
+        n0 = len(self.fake.calls)
+        with self.assertRaisesRegex(GradeTooLong, "split"):
+            swebench.grade(box, inst, timeout_s=600)
+        self.assertEqual(len(self.fake.calls), n0)
+        self.fake.on_grade = lambda sb, b, f: {"error": "exec_timeout", "message": "90 s", "status": 504}
+        with self.assertRaises(GradeTooLong) as cm:
+            swebench.grade(box, inst)
+        self.assertIn("Jobs API", str(cm.exception))
+        self.assertEqual(classify_failure(cm.exception), ("timeout", False))
+
+
 class AsyncContract(unittest.TestCase):
     def setUp(self):
         self.fake = FakeCloud()

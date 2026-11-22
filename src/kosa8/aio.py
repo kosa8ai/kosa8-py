@@ -304,6 +304,7 @@ class AsyncCloudSandboxes:
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
         partial_ok: bool = True,
+        prefix: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -313,7 +314,7 @@ class AsyncCloudSandboxes:
         body = _batch_body(
             n, template=template, image=image, cpus=cpus, mem_mb=mem_mb, region=region, labels=labels,
             ttl_s=ttl_s, lease_s=amb.get("lease_s") if lease_s is None else lease_s,
-            run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok,
+            run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok, prefix=prefix,
         )
         r = await self._cloud._request("POST", "/v1/sandboxes/batch", body, idempotency_key=idempotency_key) or {}
         batch = _batch_from(self._cloud, r, AsyncCloudSandbox, n)

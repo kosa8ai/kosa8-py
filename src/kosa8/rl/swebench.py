@@ -20,8 +20,12 @@ from the ``swebench`` package's own test spec. No SWE-bench import is needed.
 Sandboxes are ``persistent`` (one long-lived container), so changes outside
 ``/workspace`` (the repository is at ``/testbed``) stay between commands.
 The hidden files (test patch and runner) are at most 64 and 8 MiB in all,
-and the grader's command runs at most 90 s (a buffered exec); a test run
-that needs longer is reported ``timeout``, not reward 0.
+and the grader's command runs at most 90 s (a buffered exec). :func:`grade`
+raises :class:`GradeTooLong` for a test run that needs longer: split the
+instance's tests (``test_cmd`` over a part of ``FAIL_TO_PASS`` /
+``PASS_TO_PASS``) into several grades. Longer grading comes with the
+upcoming kosa8 Jobs API. In :meth:`kosa8.rl.Run.map` such a rollout is
+``timeout`` (``reward=None``), not reward 0.
 """
 
 from __future__ import annotations
@@ -29,6 +33,19 @@ from __future__ import annotations
 import json
 import shlex
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from ..cloud import EXEC_LIMIT_S
+from ..errors import Kosa8ExecTimeoutError
+
+_SPLIT_HINT = (
+    "the sealed grader runs at most {s} s: split the instance's tests into several grades "
+    "(test_cmd over part of FAIL_TO_PASS / PASS_TO_PASS each), or run the long suite in the "
+    "sandbox with exec_background; longer grading comes with the upcoming kosa8 Jobs API"
+)
+
+
+class GradeTooLong(Kosa8ExecTimeoutError):
+    """The instance's tests need longer than the sealed grader's 90 s."""
 
 #: Where SWE-bench images keep the repository.
 REPO_DIR = "/testbed"
@@ -104,10 +121,20 @@ def grade(sandbox: Any, instance: Mapping[str, Any], *, patch: Optional[str] = N
           timeout_s: Optional[float] = 90, run_id: Optional[str] = None,
           rollout: Optional[Mapping[str, Any]] = None) -> Any:
     """Grade the sandbox's ``/testbed`` (after applying ``patch``, if given)
-    with the instance's hidden tests, in a sealed fork; a :class:`~kosa8.GradeResult`."""
+    with the instance's hidden tests, in a sealed fork; a :class:`~kosa8.GradeResult`.
+
+    Raises :class:`GradeTooLong` (a :class:`~kosa8.Kosa8ExecTimeoutError`)
+    when ``timeout_s`` is over 90 s or the tests ran past it."""
+    if timeout_s is not None and timeout_s > EXEC_LIMIT_S:
+        raise GradeTooLong(f"timeout_s={timeout_s} is over the limit: " + _SPLIT_HINT.format(s=EXEC_LIMIT_S),
+                           code="exec_timeout")
     if patch is not None:
         r = apply_patch(sandbox, patch)
         if r.exit_code != 0:
             raise ValueError(f"the patch does not apply: {r.stderr.strip()[-500:]}")
-    return sandbox.grade(GRADE_CMD, files=grader_files(instance, test_cmd=test_cmd), timeout_s=timeout_s,
-                         run_id=run_id, rollout=rollout)
+    g = sandbox.grade(GRADE_CMD, files=grader_files(instance, test_cmd=test_cmd), timeout_s=timeout_s,
+                      run_id=run_id, rollout=rollout)
+    if g.failure_class == "timeout":
+        raise GradeTooLong(f"the tests of {instance.get('instance_id', 'this instance')} did not finish: "
+                           + _SPLIT_HINT.format(s=timeout_s or EXEC_LIMIT_S), code="exec_timeout")
+    return g

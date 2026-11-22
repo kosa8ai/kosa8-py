@@ -10,7 +10,7 @@ import threading
 import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
-from ..cloud import RUN_LABEL
+from ..cloud import RUN_LABEL, new_idempotency_key
 from ._lease import DEFAULT_LEASE_S, Lease
 from ._rollouts import DEFAULT_MASK, MapSpec, RolloutResult, Rollouts, run_map
 
@@ -90,6 +90,9 @@ class Run:
         self.recorded = 0
         self.status: Optional[str] = None
         self._buf: List[Dict[str, Any]] = []
+        # The chunk being sent and its Idempotency-Key: kept until kosa8 Cloud
+        # answers, so a resend (a retry, the next flush) is the same request.
+        self._inflight: Optional["tuple[List[Dict[str, Any]], str]"] = None
         self._buf_lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._lease: Optional[Lease] = None
@@ -206,22 +209,25 @@ class Run:
     def flush(self) -> int:
         """Send every buffered rollout now; returns how many were recorded.
         On an error the unsent rows stay buffered and the error is raised.
-        (Recording carries no Idempotency-Key on kosa8 Cloud, so a call is not
-        resent after a 5xx; a call whose answer was lost and is sent again by
-        the next flush may record its rows twice.)"""
+
+        Each call of up to 500 rows carries an Idempotency-Key that stays with
+        those rows until kosa8 Cloud answers: the client's retries (timeouts,
+        5xx) and a later flush resend the same rows with the same key, and
+        kosa8 Cloud stores them once."""
         sent = 0
         with self._flush_lock:
             while True:
-                with self._buf_lock:
-                    chunk, self._buf = self._buf[:MAX_ROWS_PER_CALL], self._buf[MAX_ROWS_PER_CALL:]
-                if not chunk:
-                    return sent
-                try:
-                    r = self.cloud._request("POST", self._path("/rollouts"), {"rollouts": chunk}) or {}
-                except BaseException:
+                if self._inflight is None:
                     with self._buf_lock:
-                        self._buf[:0] = chunk
-                    raise
+                        chunk, self._buf = self._buf[:MAX_ROWS_PER_CALL], self._buf[MAX_ROWS_PER_CALL:]
+                    if not chunk:
+                        return sent
+                    self._inflight = (chunk, new_idempotency_key())
+                chunk, key = self._inflight
+                # On an error the chunk stays in flight with its key, for the next flush.
+                r = self.cloud._request("POST", self._path("/rollouts"), {"rollouts": chunk},
+                                        idempotency_key=key) or {}
+                self._inflight = None
                 n = int(r.get("recorded", len(chunk)))
                 sent += n
                 self.recorded += n
@@ -230,7 +236,7 @@ class Run:
     def pending(self) -> int:
         """Rollouts buffered, not yet sent."""
         with self._buf_lock:
-            return len(self._buf)
+            return len(self._buf) + (len(self._inflight[0]) if self._inflight else 0)
 
     # -- reading -------------------------------------------------------------
 

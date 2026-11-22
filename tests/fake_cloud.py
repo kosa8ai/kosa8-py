@@ -37,7 +37,8 @@ FAILURE_CLASSES = ["ok", "exit_nonzero", "timeout", "infra", "quota", "client"]
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 KEY_RE = re.compile(r"^[\x21-\x7e]{1,255}$")
 IDEM_ROUTES = [re.compile(r"^/v1/sandboxes$"), re.compile(r"^/v1/sandboxes/batch$"),
-               re.compile(r"^/v1/sandboxes/[A-Za-z0-9_]{1,64}/(fork|grade)$")]
+               re.compile(r"^/v1/sandboxes/[A-Za-z0-9_]{1,64}/(fork|grade)$"),
+               re.compile(r"^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$")]
 
 INFRA_CODES = {
     "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",

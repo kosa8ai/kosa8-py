@@ -289,7 +289,7 @@ def _fork_body(n: int, labels: Optional[Mapping[str, str]], run_id: Optional[str
 def _batch_body(
     n: int, *, template: Optional[str], image: Optional[str], cpus: Optional[int], mem_mb: Optional[int],
     region: Optional[str], labels: Optional[Mapping[str, str]], ttl_s: Optional[int], lease_s: Optional[int],
-    run_id: Optional[str], partial_ok: bool,
+    run_id: Optional[str], partial_ok: bool, prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not _is_int(n) or not 1 <= n <= MAX_BATCH:
         raise ValueError(f"n must be a whole number from 1 to {MAX_BATCH}")
@@ -300,7 +300,11 @@ def _batch_body(
     _check_labels(labels)
     if lease_s is not None and ttl_s is not None:
         raise ValueError("give lease_s or ttl_s, not both: a lease is a TTL that heartbeats move forward")
+    if prefix is not None and (not isinstance(prefix, str) or not _PREFIX_RE.match(prefix)):
+        raise ValueError("prefix must be 1-59 letters, digits, '.', '_' or '-', starting with a letter or digit")
     body: Dict[str, Any] = {"count": n, "partial_ok": partial_ok}
+    if prefix is not None:
+        body["prefix"] = prefix
     for k, v in (("template", template), ("image", image), ("cpus", cpus), ("mem_mb", mem_mb),
                  ("region", region), ("ttl_s", ttl_s), ("lease_s", lease_s), ("run_id", run_id)):
         if v is not None:
@@ -308,6 +312,9 @@ def _batch_body(
     if labels:
         body["labels"] = dict(labels)
     return body
+
+
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,58}$")
 
 
 def _grade_body(
@@ -393,7 +400,8 @@ _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 _IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
 #: The POSTs kosa8 Cloud keeps an Idempotency-Key for (24 hours): a retry with
 #: the same key and body gets the first answer (``Idempotent-Replayed: true``).
-_KEYED_POSTS = re.compile(r"^/v1/sandboxes(/batch|/[A-Za-z0-9_]{1,64}/(fork|grade))?$")
+_KEYED_POSTS = re.compile(
+    r"^/v1/sandboxes(/batch|/[A-Za-z0-9_]{1,64}/(fork|grade))?$|^/v1/rl/runs/[A-Za-z0-9_]{1,64}/rollouts$")
 
 
 def keyed_route(method: str, path: str) -> bool:
@@ -874,6 +882,7 @@ class CloudSandboxes:
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
         partial_ok: bool = True,
+        prefix: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -889,13 +898,13 @@ class CloudSandboxes:
         and ``failed``). ``wait`` polls until each is running; a sandbox that
         fails to boot is deleted and moved to ``.failed``. The call carries an
         ``Idempotency-Key`` (``idempotency_key``, default a new UUID) that its
-        retries reuse.
+        retries reuse. ``prefix`` names them ``<prefix>-0001``, ``<prefix>-0002``, ...
         """
         amb = _ambient(self._cloud)
         body = _batch_body(
             n, template=template, image=image, cpus=cpus, mem_mb=mem_mb, region=region, labels=labels,
             ttl_s=ttl_s, lease_s=amb.get("lease_s") if lease_s is None else lease_s,
-            run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok,
+            run_id=amb.get("run_id") if run_id is None else run_id, partial_ok=partial_ok, prefix=prefix,
         )
         r = self._cloud._request("POST", "/v1/sandboxes/batch", body, idempotency_key=idempotency_key) or {}
         batch = _batch_from(self._cloud, r, CloudSandbox, n)
