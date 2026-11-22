@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.4 — unreleased
+## 0.5.4
 
 - Actionable kosa8 Cloud errors. `str(e)` is the server's sentence followed by what to do with it: `no capacity: fork fewer or retry in 10 s [HTTP 503 no_capacity; retry in 10 s; request a5e77ddee9ef8120-BOS]` (a 402 adds `upgrade: <url>` when the sentence lacks it). `e.message` is still the sentence alone.
 - `Kosa8Error.request_id`: the request's `X-Request-Id`, else Cloudflare's `cf-ray`; quote it to support.

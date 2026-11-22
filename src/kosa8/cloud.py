@@ -74,7 +74,7 @@ CLOUD_KEY_PREFIX = "k8c_live_"
 CLOUD_TOKEN_PREFIX = "k8c_tok_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
-USER_AGENT = "kosa8-python/0.5.3"
+USER_AGENT = "kosa8-python/0.5.4"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
