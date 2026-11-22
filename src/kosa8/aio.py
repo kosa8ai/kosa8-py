@@ -66,7 +66,14 @@ from .errors import (
 from . import retry as _retry
 from .retry import RetryPolicy, acall_with_retry
 from .jobs import AsyncCloudJobs
-from .cloud_more import AsyncCloudBurst, AsyncCloudRecordings, AsyncCloudTokens
+from .cloud_more import (
+    AsyncCloudBurst,
+    AsyncCloudEmbeds,
+    AsyncCloudPreviewDomains,
+    AsyncCloudRecordings,
+    AsyncCloudTokens,
+    preview_path,
+)
 
 #: (method, url, headers, body bytes or None, timeout) -> awaitable of
 #: (status, body bytes[, response headers]).
@@ -193,6 +200,10 @@ class AsyncCloud:
 
     async def templates(self) -> List[Dict[str, Any]]:
         return (await self._request("GET", "/v1/templates") or {}).get("templates", [])
+
+    def preview_domains(self, preview_id: str) -> AsyncCloudPreviewDomains:
+        """A preview's custom domains; see :meth:`kosa8.Kosa8Cloud.preview_domains`."""
+        return AsyncCloudPreviewDomains(self, preview_path(preview_id))
 
     async def fork_map(
         self,
@@ -409,6 +420,11 @@ class AsyncCloudSandbox:
     @property
     def files(self) -> "AsyncCloudFiles":
         return AsyncCloudFiles(self)
+
+    @property
+    def embeds(self) -> AsyncCloudEmbeds:
+        """Signed, expiring iframe URLs for its terminal or desktop; see :class:`kosa8.cloud_more.CloudEmbeds`."""
+        return AsyncCloudEmbeds(self._cloud, self._path())
 
     def _path(self, suffix: str = "") -> str:
         return f"/v1/sandboxes/{urllib.parse.quote(self.id, safe='')}{suffix}"

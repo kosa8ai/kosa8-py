@@ -5,6 +5,8 @@
 - `cloud.tokens` (both clients): capability tokens. `create(scopes, sandbox_ids=, labels=, ttl_s=, name=)` (its `secret` is shown once), `list(all=)`, `revoke`. A `k8c_tok_` token is accepted as the client's key.
 - `cloud.burst` (both clients): Burst Passes. `get()` (the pass, held and active passes) and `activate(quantity)` (or a checkout URL for the rest).
 - `cloud.recordings` (both clients): desktop recordings. `list(sandbox_id=, limit=)`, `link(id, ttl_s=)` (a signed MP4 URL), `delete`. Also `box.recordings()` and `sandboxes.create(record=True)`.
+- `box.embeds` (both clients): signed iframe URLs for a sandbox's terminal or desktop. `create(origins, mode=, ui=, ttl_s=, command=)`, `list`, `revoke`.
+- Custom preview domains: `box.previews.domains(port)` and `cloud.preview_domains(preview_id)` (both clients) with `list`, `add(hostname, ssl_method=)`, `get`, `remove`.
 
 ## 0.5.2
 

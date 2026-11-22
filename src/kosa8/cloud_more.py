@@ -1,7 +1,10 @@
 # Copyright (c) 2026 kosa8. Licensed under the MIT License; see LICENSE.
-"""More kosa8 Cloud org features: Burst Passes, capability tokens and desktop
-recordings. :mod:`kosa8.cloud` wires these onto :class:`~kosa8.Kosa8Cloud` as
-``cloud.burst``, ``cloud.tokens`` and ``cloud.recordings`` (and
+"""More kosa8 Cloud features: Burst Passes, capability tokens, desktop
+recordings, embeds and custom preview domains. :mod:`kosa8.cloud` wires these
+onto :class:`~kosa8.Kosa8Cloud` as ``cloud.burst``, ``cloud.tokens``,
+``cloud.recordings`` and ``cloud.preview_domains(id)``, and onto
+:class:`~kosa8.CloudSandbox` as ``box.embeds`` and
+``box.previews.domains(port)`` (and
 :mod:`kosa8.aio` onto :class:`~kosa8.AsyncCloud`, where every call is a
 coroutine). Answers are the API's own dicts.
 """
@@ -234,6 +237,186 @@ class AsyncCloudRecordings:
         await self._cloud._request("DELETE", f"/v1/recordings/{_q(recording_id)}")
 
 
+# ---------------------------------------------------------------------------
+# Embeds
+
+
+def _embed_body(
+    origins: Sequence[str],
+    mode: Optional[str],
+    ui: Optional[str],
+    ttl_s: Optional[int],
+    command: Optional[Sequence[str]],
+) -> Dict[str, Any]:
+    if isinstance(origins, str):
+        origins = [origins]
+    if not origins or len(origins) > 10:
+        raise ValueError("an embed takes 1 to 10 origins")
+    body: Dict[str, Any] = {"origins": list(origins)}
+    if mode is not None:
+        if mode not in ("view", "interact"):
+            raise ValueError("mode is view or interact")
+        body["mode"] = mode
+    if ui is not None:
+        if ui not in ("terminal", "desktop"):
+            raise ValueError("ui is terminal or desktop")
+        body["ui"] = ui
+    if ttl_s is not None:
+        _check_range("ttl_s", ttl_s, 60, 604_800)
+        body["ttl_s"] = ttl_s
+    if command is not None:
+        body["command"] = list(command)
+    return body
+
+
+class CloudEmbeds:
+    """A sandbox's embeds (``box.embeds``): signed, expiring iframe URLs for its
+    terminal or desktop. The framed page posts ``{source: "kosa8", type}``
+    messages to the listed origins: ``ready``, ``exited`` ``{code}``,
+    ``approval_requested`` ``{approval}``, ``expired``."""
+
+    def __init__(self, cloud: Any, sandbox_path: str) -> None:
+        self._cloud = cloud
+        self._base = sandbox_path
+
+    def create(
+        self,
+        origins: Sequence[str],
+        *,
+        mode: Optional[str] = None,
+        ui: Optional[str] = None,
+        ttl_s: Optional[int] = None,
+        command: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Make one; the answer's ``url`` (and ``snippet``, an ``<iframe>``
+        tag) is shown only here, and the URL is the credential: give it only
+        to pages you trust. ``origins`` (1 to 10, e.g.
+        ``https://app.example.com``) may frame it; ``mode`` ``view`` (default,
+        watch only) or ``interact``; ``ui`` ``terminal`` (default) or
+        ``desktop`` (the kosa8-desktop image); ``ttl_s`` 60 to 604800
+        (default 3600, never past the sandbox's ``delete_after``);
+        ``command`` the terminal's program instead of the default."""
+        body = _embed_body(origins, mode, ui, ttl_s, command)
+        return (self._cloud._request("POST", f"{self._base}/embed", body) or {}).get("embed", {})
+
+    def list(self) -> List[Dict[str, Any]]:  # noqa: A003
+        """Its live embeds (no URLs)."""
+        return list((self._cloud._request("GET", f"{self._base}/embeds") or {}).get("embeds", []))
+
+    def revoke(self, embed_id: str) -> None:
+        """End an embed's URL before it expires."""
+        self._cloud._request("DELETE", f"{self._base}/embeds/{_q(embed_id)}")
+
+
+class AsyncCloudEmbeds:
+    """:class:`CloudEmbeds` for :class:`~kosa8.AsyncCloudSandbox`: every call is a coroutine."""
+
+    def __init__(self, cloud: Any, sandbox_path: str) -> None:
+        self._cloud = cloud
+        self._base = sandbox_path
+
+    async def create(
+        self,
+        origins: Sequence[str],
+        *,
+        mode: Optional[str] = None,
+        ui: Optional[str] = None,
+        ttl_s: Optional[int] = None,
+        command: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        body = _embed_body(origins, mode, ui, ttl_s, command)
+        return (await self._cloud._request("POST", f"{self._base}/embed", body) or {}).get("embed", {})
+
+    async def list(self) -> List[Dict[str, Any]]:  # noqa: A003
+        return list((await self._cloud._request("GET", f"{self._base}/embeds") or {}).get("embeds", []))
+
+    async def revoke(self, embed_id: str) -> None:
+        await self._cloud._request("DELETE", f"{self._base}/embeds/{_q(embed_id)}")
+
+
+# ---------------------------------------------------------------------------
+# Custom preview domains
+
+
+def preview_path(preview_id: str) -> str:
+    """``/v1/previews/{id}`` for a preview id (``{sandbox_id}:{port}``)."""
+    if not preview_id:
+        raise ValueError("a preview id is required, e.g. sbx_1:3000")
+    return f"/v1/previews/{_q(preview_id)}"
+
+
+def _domains_of(answer: Any) -> Dict[str, Any]:
+    r = answer if isinstance(answer, dict) else {}
+    return {
+        "domains": list(r.get("domains") or []),
+        "configured": r.get("configured") is True,
+        "cname_target": r.get("cname_target"),
+    }
+
+
+def _domain_body(hostname: str, ssl_method: Optional[str]) -> Dict[str, Any]:
+    if not hostname:
+        raise ValueError("a hostname is required, e.g. app.example.com")
+    body: Dict[str, Any] = {"hostname": hostname}
+    if ssl_method is not None:
+        if ssl_method not in ("http", "txt"):
+            raise ValueError("ssl_method is http or txt")
+        body["ssl_method"] = ssl_method
+    return body
+
+
+class CloudPreviewDomains:
+    """A preview's custom domains (at most 5 a preview, 50 an org):
+    ``box.previews.domains(port)`` or ``cloud.preview_domains(preview_id)``.
+    The domain serves the preview as it is, private or public, and follows it
+    across a rotate. 501 ``not_available`` where custom hostnames are not
+    configured."""
+
+    def __init__(self, cloud: Any, preview_path: str) -> None:
+        self._cloud = cloud
+        self._base = preview_path
+
+    def list(self) -> Dict[str, Any]:  # noqa: A003
+        """``{domains, configured, cname_target}``."""
+        return _domains_of(self._cloud._request("GET", f"{self._base}/domains"))
+
+    def add(self, hostname: str, *, ssl_method: Optional[str] = None) -> Dict[str, Any]:
+        """Serve the preview at ``hostname`` (under your own domain); make the
+        ``records`` it answers at your DNS provider. ``ssl_method`` is
+        ``http`` or ``txt``."""
+        body = _domain_body(hostname, ssl_method)
+        return (self._cloud._request("POST", f"{self._base}/domains", body) or {}).get("domain", {})
+
+    def get(self, hostname: str) -> Dict[str, Any]:
+        """Its status, asked of the certificate provider again."""
+        return (self._cloud._request("GET", f"{self._base}/domains/{_q(hostname)}") or {}).get("domain", {})
+
+    def remove(self, hostname: str) -> None:
+        """Stop serving the preview at ``hostname``."""
+        self._cloud._request("DELETE", f"{self._base}/domains/{_q(hostname)}")
+
+
+class AsyncCloudPreviewDomains:
+    """:class:`CloudPreviewDomains` for :class:`~kosa8.AsyncCloud`: every call is a coroutine."""
+
+    def __init__(self, cloud: Any, preview_path: str) -> None:
+        self._cloud = cloud
+        self._base = preview_path
+
+    async def list(self) -> Dict[str, Any]:  # noqa: A003
+        return _domains_of(await self._cloud._request("GET", f"{self._base}/domains"))
+
+    async def add(self, hostname: str, *, ssl_method: Optional[str] = None) -> Dict[str, Any]:
+        body = _domain_body(hostname, ssl_method)
+        return (await self._cloud._request("POST", f"{self._base}/domains", body) or {}).get("domain", {})
+
+    async def get(self, hostname: str) -> Dict[str, Any]:
+        return (await self._cloud._request("GET", f"{self._base}/domains/{_q(hostname)}") or {}).get("domain", {})
+
+    async def remove(self, hostname: str) -> None:
+        await self._cloud._request("DELETE", f"{self._base}/domains/{_q(hostname)}")
+
+
 __all__ = [
     "CloudBurst",
     "AsyncCloudBurst",
@@ -241,5 +424,10 @@ __all__ = [
     "AsyncCloudTokens",
     "CloudRecordings",
     "AsyncCloudRecordings",
+    "CloudEmbeds",
+    "AsyncCloudEmbeds",
+    "CloudPreviewDomains",
+    "AsyncCloudPreviewDomains",
+    "preview_path",
     "TOKEN_SCOPES",
 ]

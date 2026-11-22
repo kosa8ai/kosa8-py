@@ -53,7 +53,7 @@ from .errors import (
 )
 from .retry import RetryPolicy, call_with_retry
 from .jobs import CloudJobs
-from .cloud_more import CloudBurst, CloudRecordings, CloudTokens
+from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens, preview_path
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -531,6 +531,11 @@ class Kosa8Cloud:
     def templates(self) -> List[Dict[str, Any]]:
         """The templates the org can start: ``key``, ``cpus``, ``mem_mb``, ``image``, ``regions``, ``warm``."""
         return (self._request("GET", "/v1/templates") or {}).get("templates", [])
+
+    def preview_domains(self, preview_id: str) -> CloudPreviewDomains:
+        """The custom domains of a preview by its id (``{sandbox_id}:{port}``,
+        the ``id`` of a preview). ``box.previews.domains(port)`` is the same."""
+        return CloudPreviewDomains(self, preview_path(preview_id))
 
     def capabilities(self) -> Dict[str, Any]:
         """What this API offers, for feature detection."""
@@ -1371,6 +1376,11 @@ class CloudSandbox:
     def previews(self) -> CloudPreviews:
         """Its ports at https URLs: ``box.previews.create(3000)["url"]``."""
         return CloudPreviews(self._cloud, self._path())
+
+    @property
+    def embeds(self) -> CloudEmbeds:
+        """Signed, expiring iframe URLs for its terminal or desktop."""
+        return CloudEmbeds(self._cloud, self._path())
 
     @property
     def schedules(self) -> CloudSchedules:

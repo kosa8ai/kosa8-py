@@ -1,5 +1,6 @@
 # Copyright (c) 2026 kosa8. Licensed under the MIT License; see LICENSE.
-"""Burst Passes, capability tokens and desktop recordings, on both clients."""
+"""Burst Passes, capability tokens, desktop recordings, embeds and custom
+preview domains, on both clients."""
 import asyncio
 import json
 import unittest
@@ -13,6 +14,8 @@ LOCAL = "http://127.0.0.1:9"
 
 TOKEN = {"id": "tok_1", "name": "agent", "prefix": "k8c_tok_ab", "scopes": ["sandboxes:read"], "state": "active"}
 REC = {"id": "rec_1", "sandbox_id": "sbx_1", "state": "ready", "bytes": 1024, "error": None}
+EMBED = {"id": "emb_1", "sandbox_id": "sbx_1", "mode": "view", "ui": "terminal", "origins": ["https://a.example"]}
+DOMAIN = {"hostname": "app.example.com", "status": "pending", "records": [], "preview_id": "sbx_1:3000"}
 LINK = {"url": "https://r2.example/rec_1.mp4?sig=x", "expires_at": 1, "bytes": 1024}
 
 
@@ -37,6 +40,21 @@ def answer(s):
         return 204, None
     if r == "GET /v1/sandboxes/sbx_1/recordings":
         return 200, {"recordings": [REC]}
+    if r == "POST /v1/sandboxes/sbx_1/embed":
+        return 201, {"embed": {**EMBED, "url": "https://embed.example/x", "snippet": "<iframe>"}}
+    if r == "GET /v1/sandboxes/sbx_1/embeds":
+        return 200, {"embeds": [EMBED]}
+    if r == "DELETE /v1/sandboxes/sbx_1/embeds/emb_1":
+        return 204, None
+    if r in ("GET /v1/sandboxes/sbx_1/previews/3000/domains", "GET /v1/previews/sbx_1%3A3000/domains",
+             "GET /v1/previews/sbx_1:3000/domains"):
+        return 200, {"domains": [DOMAIN], "configured": True, "cname_target": "previews.kosa8.app"}
+    if r.endswith("/domains") and s["method"] == "POST":
+        return 201, {"domain": DOMAIN}
+    if r.endswith("/domains/app.example.com") and s["method"] == "GET":
+        return 200, {"domain": {**DOMAIN, "status": "active"}}
+    if r.endswith("/domains/app.example.com") and s["method"] == "DELETE":
+        return 204, None
     if r == "POST /v1/sandboxes":
         return 201, {"sandbox": {"id": "sbx_1", "state": "running"}}
     return 404, {"error": {"code": "not_found", "message": r}}
@@ -144,6 +162,55 @@ class Recordings(unittest.TestCase):
         self.assertEqual(stub.seen[-1]["path"], "/v1/sandboxes/sbx_1/recordings")
 
 
+class Embeds(unittest.TestCase):
+    def test_create_list_revoke(self):
+        cloud, stub = make()
+        box = cloud.sandboxes.create()
+        e = box.embeds.create(["https://a.example"], mode="interact", ui="desktop", ttl_s=600, command=["htop"])
+        self.assertEqual(e["url"], "https://embed.example/x")
+        self.assertEqual(stub.seen[-1]["body"], {"origins": ["https://a.example"], "mode": "interact", "ui": "desktop",
+                                                  "ttl_s": 600, "command": ["htop"]})
+        self.assertEqual(box.embeds.list(), [EMBED])
+        self.assertIsNone(box.embeds.revoke("emb_1"))
+        self.assertEqual(stub.seen[-1]["method"], "DELETE")
+
+    def test_checks(self):
+        cloud, stub = make()
+        box = cloud.sandboxes.create()
+        n = len(stub.seen)
+        for kw in ({"origins": []}, {"origins": ["https://a"] * 11}, {"origins": ["https://a"], "mode": "edit"},
+                   {"origins": ["https://a"], "ui": "web"}, {"origins": ["https://a"], "ttl_s": 59}):
+            with self.assertRaises(ValueError):
+                box.embeds.create(**kw)
+        self.assertEqual(len(stub.seen), n)
+
+
+class PreviewDomains(unittest.TestCase):
+    def test_by_port_and_by_id(self):
+        cloud, stub = make()
+        box = cloud.sandboxes.create()
+        d = box.previews.domains(3000)
+        self.assertEqual(d.list(), {"domains": [DOMAIN], "configured": True, "cname_target": "previews.kosa8.app"})
+        self.assertEqual(d.add("app.example.com", ssl_method="txt"), DOMAIN)
+        self.assertEqual(stub.seen[-1]["path"], "/v1/sandboxes/sbx_1/previews/3000/domains")
+        self.assertEqual(stub.seen[-1]["body"], {"hostname": "app.example.com", "ssl_method": "txt"})
+        self.assertEqual(d.get("app.example.com")["status"], "active")
+        self.assertIsNone(d.remove("app.example.com"))
+        by_id = cloud.preview_domains("sbx_1:3000")
+        self.assertTrue(by_id.list()["configured"])
+        self.assertTrue(stub.seen[-1]["path"].startswith("/v1/previews/sbx_1"))
+
+    def test_checks(self):
+        cloud, stub = make()
+        with self.assertRaises(ValueError):
+            cloud.preview_domains("")
+        with self.assertRaises(ValueError):
+            cloud.preview_domains("sbx_1:3000").add("")
+        with self.assertRaises(ValueError):
+            cloud.preview_domains("sbx_1:3000").add("a.example.com", ssl_method="dns")
+        self.assertEqual(stub.seen, [])
+
+
 class AsyncTwins(unittest.TestCase):
     def test_async_twin(self):
         stub = Stub()
@@ -160,9 +227,23 @@ class AsyncTwins(unittest.TestCase):
                 await cloud.recordings.delete("rec_1")
                 box = await cloud.sandboxes.create(record=True)
                 mine = await box.recordings()
-                return burst, act, tok, toks, rev, recs, link, mine
+                emb = await box.embeds.create(["https://a.example"])
+                embs = await box.embeds.list()
+                await box.embeds.revoke("emb_1")
+                dom = cloud.preview_domains("sbx_1:3000")
+                doms = await dom.list()
+                added = await dom.add("app.example.com")
+                got = await dom.get("app.example.com")
+                await dom.remove("app.example.com")
+                return burst, act, tok, toks, rev, recs, link, mine, (emb, embs, doms, added, got)
 
-        burst, act, tok, toks, rev, recs, link, mine = asyncio.run(main())
+        burst, act, tok, toks, rev, recs, link, mine, more = asyncio.run(main())
+        emb, embs, doms, added, got = more
+        self.assertEqual(emb["url"], "https://embed.example/x")
+        self.assertEqual(embs, [EMBED])
+        self.assertTrue(doms["configured"])
+        self.assertEqual(added, DOMAIN)
+        self.assertEqual(got["status"], "active")
         self.assertTrue(burst["available"])
         self.assertEqual(act["activated"], 3)
         self.assertEqual(tok["secret"], "k8c_tok_secret")
