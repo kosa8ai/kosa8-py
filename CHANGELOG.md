@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.3 (unreleased)
+## 0.5.3
 
 - `cloud.tokens` (both clients): capability tokens. `create(scopes, sandbox_ids=, labels=, ttl_s=, name=)` (its `secret` is shown once), `list(all=)`, `revoke`. A `k8c_tok_` token is accepted as the client's key.
 - `cloud.burst` (both clients): Burst Passes. `get()` (the pass, held and active passes) and `activate(quantity)` (or a checkout URL for the rest).
