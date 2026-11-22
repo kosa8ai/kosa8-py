@@ -351,6 +351,54 @@ print(sbx.preview(8000)["url"])                           # signed, expiring lin
 client.create_sandbox(name="scratch", ephemeral=True, auto_stop_min=15)
 ```
 
+## Switching from E2B, Daytona or Modal
+
+Change one import; the rest of your code stays. Set `KOSA8_API_KEY` (a `k8c_live_` key):
+
+```python
+from kosa8.compat.e2b import Sandbox                    # was: from e2b import Sandbox
+from kosa8.compat.e2b_code_interpreter import Sandbox   # was: from e2b_code_interpreter import Sandbox
+from kosa8.compat.daytona import Daytona, CreateSandboxFromImageParams   # was: from daytona import ...
+import kosa8.compat.modal as modal                      # was: import modal
+
+sbx = Sandbox.create(timeout=600)
+print(sbx.commands.run("echo hi").stdout)
+sbx.files.write("app.py", "print(6 * 7)")               # relative paths go under /workspace
+sbx.kill()
+```
+
+| Shim (mirrors) | What maps onto kosa8 Cloud |
+|---|---|
+| `kosa8.compat.e2b` (`e2b` 2.64.0, `e2b-code-interpreter` 2.11.10) | `Sandbox.create`, `connect`, `kill`, `set_timeout`, `get_info`, `is_running`, `pause`, `fork`, `create_snapshot` / `list_snapshots` / `delete_snapshot`, `Sandbox.list`, `download_url`; `commands.run` (foreground and `background=True`), `connect`, `kill`; `files.read` / `write` / `write_files` / `list` / `exists` / `get_info` / `remove` / `rename` / `make_dir`; `run_code` and code contexts (Python) |
+| `kosa8.compat.daytona` (`daytona` 2.1.0) | `Daytona().create` (snapshot / image params, `Resources`), `get`, `list`, `delete`, `start`, `stop`; `sandbox.process.exec` / `code_run`; `sandbox.fs` upload / download / list / info / folders / permissions / move / delete; `sandbox.fork`, `create_snapshot`, `set_labels`, `set_autostop_interval`, `set_ttl`, `get_preview_link`; `daytona.snapshot.list` / `get` / `delete` |
+| `kosa8.compat.modal` (`modal` 1.6.4) | `App.lookup`, `Image.from_registry` / `debian_slim` / `from_id`, `Secret.from_dict` / `from_name`; `Sandbox.create(*entrypoint, ...)`, `exec`, `wait`, `poll`, `returncode`, `terminate`, `stdout` / `stderr` reading, `snapshot_filesystem`, `from_id`, `from_name`, `list`, `set_tags` / `get_tags`; `sandbox.filesystem` read / write / list / stat / make_directory / remove / copy |
+
+What kosa8 cannot do raises `kosa8.compat.Unsupported`, naming the method and the kosa8 way to do it
+(for example Modal's `Image.pip_install`: kosa8 boots images, it does not build them). A shim never
+pretends a call worked. Errors come back as the other SDK's exceptions (`e2b.TimeoutException`,
+`DaytonaNotFoundError`, `modal.exception.NotFoundError`), with the kosa8 error as `__cause__`.
+Every shim object has `.kosa8`, the `CloudSandbox` underneath, for anything else.
+
+How kosa8 differs, whichever shim you use: only `/workspace` outlives a command; a foreground
+command runs at most 90 s (use E2B `background=True` or a Modal entrypoint for longer work); output
+arrives when a command ends, so callbacks such as E2B's `on_stdout` run once, with all of it; a
+background command's stdout and stderr come back together (a Modal entrypoint's stderr is kept
+apart in a file). No stdin, PTY, GPU, volumes or image builds. Async variants (`AsyncSandbox`,
+`AsyncDaytona`, `.aio`) are not mirrored. `kosa8.compat.set_default_cloud(Kosa8Cloud(...))` points
+every shim at one client.
+
+**Which path to use.** kosa8 Cloud also answers E2B's own HTTP API at `https://api.kosa8.com/e2b`
+(the server side, `workers/cloud-api/src/e2b.js` in the kosa8 repo). Use that when you cannot change
+code at all, or the code is not Python: keep the official `e2b` SDK (any language) and set
+`E2B_API_KEY=k8c_live_...`, `E2B_API_URL=https://api.kosa8.com/e2b` and
+`E2B_SANDBOX_URL=https://api.kosa8.com/e2b/envd`. It covers create, list, get, kill, set_timeout,
+pause, connect, `files.read` / `write` and `commands.run`; fork, snapshots, `files.list`, metrics,
+PTY and stdin answer 501, and env vars, metadata and `cpu_count` on create are refused. Use
+`kosa8.compat.e2b` when you can change one import: it reaches more (env and metadata on create,
+fork, snapshots, `files.list` / `exists` / `get_info` / `remove`, background commands, the code
+interpreter) and names the kosa8 alternative when something is missing. Daytona and Modal have
+only the Python shims. For new code, use `Kosa8Cloud` directly.
+
 ## Agent frameworks
 
 These adapters drive the local daemon (`Kosa8Client`). For kosa8 Cloud with LangChain,

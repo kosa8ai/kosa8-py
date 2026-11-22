@@ -28,6 +28,7 @@ The rest of the kosa8 Cloud API, and a fix that makes the Cloud client work at a
 - **Snapshots:** `box.snapshot(name)`, `cloud.snapshots.create|list|get|delete`.
 - **More of a sandbox:** `box.previews` (create, list, link, rotate, delete), `box.terminal()`, `box.run_code()` and `box.code_contexts`, `box.files.read_raw|write_raw|link`, `box.egress|set_egress|reset_egress`, `box.schedules`, `box.set_labels|metrics|logs|secrets`; `cloud.egress_presets|org_egress|set_org_egress|capabilities`.
 - **Secrets:** `cloud.secrets.set|list|delete` (a value goes in a body only, never comes back).
+- **Switching shims:** `kosa8.compat.e2b` (and `e2b_code_interpreter`), `kosa8.compat.daytona` and `kosa8.compat.modal` mirror those SDKs' sandbox APIs (e2b 2.64.0, e2b-code-interpreter 2.11.10, daytona 2.1.0, modal 1.6.4) on kosa8 Cloud, so a project switches by changing one import. What kosa8 cannot do raises `kosa8.compat.Unsupported` with the kosa8 alternative.
 - **Pipelines:** `cloud.pipelines.run|list|get|logs|cancel|artifacts|download_artifact|wait`, `cloud.pipelines.hooks.create|list|delete`.
 
 ## 0.4.0 — 2026-11-15
