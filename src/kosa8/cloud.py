@@ -55,6 +55,7 @@ from .errors import (
 from .retry import RetryPolicy, call_with_retry
 from .jobs import CloudJobs
 from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens, preview_path
+from .cloud_browser import CloudAI, CloudBrowser, CloudBrowsers
 from .cloud_features import (
     CloudBackgroundExec,
     CloudCodeContexts,
@@ -529,6 +530,10 @@ class Kosa8Cloud:
         self.tokens = CloudTokens(self)
         #: Desktop session recordings.
         self.recordings = CloudRecordings(self)
+        #: Headless Chromium browsers driven over CDP ($0.12 per browser-hour, billed per second).
+        self.browsers = CloudBrowsers(self)
+        #: The AI gateway: provider keys, settings and usage.
+        self.ai = CloudAI(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -544,6 +549,42 @@ class Kosa8Cloud:
     def templates(self) -> List[Dict[str, Any]]:
         """The templates the org can start: ``key``, ``cpus``, ``mem_mb``, ``image``, ``regions``, ``warm``."""
         return (self._request("GET", "/v1/templates") or {}).get("templates", [])
+
+    def browser(self, *, ttl_s: Optional[int] = None, sandbox_id: Optional[str] = None,
+                name: Optional[str] = None) -> CloudBrowser:
+        """Open a headless Chromium browser; see :meth:`CloudBrowsers.create`.
+        ``with cloud.browser() as b:`` closes it on the way out."""
+        return self.browsers.create(ttl_s=ttl_s, sandbox_id=sandbox_id, name=name)
+
+    def list_browsers(self, *, state: Optional[str] = None) -> List[CloudBrowser]:
+        """Open browsers (``state="all"`` for closed ones too)."""
+        return self.browsers.list(state=state)
+
+    def get_browser(self, browser_id: str) -> CloudBrowser:
+        """One browser, with a fresh ``cdp_url`` while open."""
+        return self.browsers.get(browser_id)
+
+    def set_ai_key(self, provider: str, key: str) -> Dict[str, Any]:
+        """Store a provider key for the AI gateway; see :class:`CloudAI`."""
+        return self.ai.set_key(provider, key)
+
+    def list_ai_keys(self) -> List[Dict[str, Any]]:
+        return self.ai.keys()
+
+    def delete_ai_key(self, provider: str) -> Dict[str, Any]:
+        return self.ai.delete_key(provider)
+
+    def ai_settings(self) -> Dict[str, Any]:
+        return self.ai.settings()
+
+    def update_ai_settings(self, *, enabled: Optional[bool] = None, all_sandboxes: Optional[bool] = None,
+                           cache_ttl_s: Optional[int] = None, rate_per_min: Optional[int] = None) -> Dict[str, Any]:
+        return self.ai.update_settings(enabled=enabled, all_sandboxes=all_sandboxes, cache_ttl_s=cache_ttl_s,
+                                       rate_per_min=rate_per_min)
+
+    def ai_usage(self, month: Optional[str] = None) -> Dict[str, Any]:
+        """AI gateway calls and cost for a month (``YYYY-MM``, default this one)."""
+        return self.ai.usage(month)
 
     def preview_domains(self, preview_id: str) -> CloudPreviewDomains:
         """The custom domains of a preview by its id (``{sandbox_id}:{port}``,
@@ -802,7 +843,7 @@ def _create_body(
     docker: Optional[bool], cpu: Optional[str], name: Optional[str], env: Optional[Mapping[str, str]],
     snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
     secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
-    run_id: Optional[str], record: Optional[bool] = None,
+    run_id: Optional[str], record: Optional[bool] = None, ai_gateway: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """The body of ``POST /v1/sandboxes`` (checked). Labels, ``kosa8.run``
     included, go in the body: kosa8 Cloud stores them before it answers, so a
@@ -852,6 +893,7 @@ def _create_body(
     for k, v in (
         ("size", size), ("cpus", cpus), ("mem_mb", mem_mb), ("image", image), ("disk_gb", disk_gb),
         ("docker", docker), ("persistent", persistent), ("cpu", cpu), ("name", name), ("record", record),
+        ("ai_gateway", ai_gateway),
     ):
         if v is not None:
             body[k] = v
@@ -896,6 +938,7 @@ class CloudSandboxes:
         lease_s: Optional[int] = None,
         run_id: Optional[str] = None,
         record: Optional[bool] = None,
+        ai_gateway: Optional[bool] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -922,7 +965,11 @@ class CloudSandboxes:
         org secrets it holds, ``labels`` are sent with the create (stored
         before it answers, so they are there while it boots). ``record=True``
         (the kosa8-desktop image, persistent only) records its desktop to MP4,
-        saved to ``cloud.recordings`` when it is deleted.
+        saved to ``cloud.recordings`` when it is deleted. ``ai_gateway=True``
+        routes its model calls through the org's AI gateway (``cloud.ai``): it
+        gets ``OPENAI_BASE_URL``, ``ANTHROPIC_BASE_URL``, ``KOSA8_AI_GATEWAY_URL``
+        and ``KOSA8_AI_TOKEN`` in its env; ``False`` opts it out when the gateway
+        covers all sandboxes.
 
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
@@ -945,6 +992,7 @@ class CloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
+            ai_gateway=ai_gateway,
         )
         r = self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = CloudSandbox(self._cloud, r["sandbox"])

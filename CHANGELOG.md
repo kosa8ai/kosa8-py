@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Cloud browsers: `cloud.browser(ttl_s=, sandbox_id=, name=)` opens headless Chromium and returns a `CloudBrowser` with `id`, `cdp_url` (for Playwright `connect_over_cdp` / Puppeteer), `refresh()`, `goto(url, text=True)`, `screenshot(url, full_page=False)` (PNG bytes), `page(...)` and `close()`; `with cloud.browser() as b:` closes it. Also `cloud.browsers.create/list/get/delete/info`, `cloud.list_browsers(state=)` and `cloud.get_browser(id)`. $0.12 per browser-hour, billed per second.
+- AI gateway: `cloud.ai` (`settings`, `update_settings`, `set_key`, `keys`, `delete_key`, `usage(month)`) and the shortcuts `cloud.set_ai_key`, `list_ai_keys`, `delete_ai_key`, `ai_settings`, `update_ai_settings`, `ai_usage`. `sandboxes.create(ai_gateway=True|False)` on both clients.
+
 ## 0.5.5
 
 - Fix: the E2B code-interpreter shim (`kosa8.compat.e2b_code_interpreter.Sandbox`) creates a persistent sandbox. Before, its first `run_code` failed with 409 `not_persistent`, because the code interpreter keeps Python running between cells and kosa8 Cloud runs it only in a persistent sandbox. A persistent sandbox counts against the plan's persistent-sandbox limit; a `snap_...` template is started as the snapshot was.
