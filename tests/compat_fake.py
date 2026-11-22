@@ -2,6 +2,7 @@
 :class:`kosa8.Kosa8Cloud` that answers the endpoints the shims call, keeps
 state between calls and records every request. No network."""
 
+import base64
 import json
 import posixpath
 import re
@@ -23,7 +24,11 @@ class FakeCloud:
         self.n = 0
         #: argv -> (exit, stdout, stderr); default echoes argv[-1]
         self.on_exec = None
+        #: argv, env -> list of stream frames for a streamed exec, or None
+        self.on_stream = None
         self.bg_polls_until_exit = 1
+        #: a background command's output poll by poll; it exits on the last
+        self.bg_progress = None
         self.code_answer = {"execution_count": 1, "results": [], "stdout": "", "stderr": ""}
         self.fail = {}  # "METHOD /path" -> (status, body)
 
@@ -137,6 +142,8 @@ class FakeCloud:
                 code, out, _ = self._exec(b["cmd"])
                 self.bg[bid] = {"id": bid, "state": "running", "exit": None, "output": None, "_polls": 0, "_final": (code, out)}
                 return 202, {"exec": {"id": bid, "state": "running", "exit": None}}
+            if b.get("stream"):
+                return 200, self._stream(b["cmd"], b.get("env"))
             code, out, err = self._exec(b["cmd"], b.get("env"))
             return 200, {"exit": code, "stdout": out, "stderr": err}
         m2 = re.match(r"^/exec/([^/]+)(/stop)?$", rest)
@@ -147,6 +154,11 @@ class FakeCloud:
             if m2[2]:
                 j.update(state="exited", exit=143, output="", stopped=True)
                 return 200, {"exec": {"id": j["id"], "state": "stopping"}}
+            if j["state"] == "running" and self.bg_progress:
+                j["output"] = self.bg_progress.pop(0)
+                if not self.bg_progress:
+                    j.update(state="exited", exit=j["_final"][0])
+                return 200, {"exec": {k: v for k, v in j.items() if not k.startswith("_")}}
             if j["state"] == "running":
                 j["_polls"] += 1
                 if j["_polls"] >= self.bg_polls_until_exit:
@@ -202,6 +214,28 @@ class FakeCloud:
         if re.match(r"^/code/contexts/[^/]+(/reset)?$", rest):
             return 200, {}
         return nf
+
+    def _stream(self, argv, env=None):
+        """A streamed exec's NDJSON: ``on_stream(argv, env)`` gives the frames
+        (dicts; ``data`` as plain text, encoded here), else one stdout and one
+        stderr frame from the buffered answer, a heartbeat and the exit."""
+        frames = self.on_stream(argv, env) if self.on_stream is not None else None
+        if frames is None:
+            code, out, err = self._exec(argv, env)
+            frames = [{"stream": "stdout", "data": "", "heartbeat": True}]
+            if out:
+                frames.append({"stream": "stdout", "data": out})
+            if err:
+                frames.append({"stream": "stderr", "data": err})
+            frames.append({"done": True, "exit": code})
+        lines = []
+        for f in frames:
+            f = dict(f)
+            if "data" in f:
+                d = f["data"]
+                f["data"] = base64.b64encode(d if isinstance(d, bytes) else d.encode()).decode()
+            lines.append(json.dumps(f).encode() + b"\n")
+        return b"".join(lines)
 
     def _exec(self, argv, env=None):
         if self.on_exec is not None:

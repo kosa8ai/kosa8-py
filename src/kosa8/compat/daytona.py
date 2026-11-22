@@ -29,7 +29,13 @@ Daytona                             kosa8 Cloud
 ``get`` / ``list`` / ``delete``     get (by id or name) / list / delete
 ``start`` / ``stop`` / ``pause``    wake / sleep / sleep
 ``sandbox.process.exec``            exec (``sh -c``; ``cwd`` relative to
-                                    /workspace)
+                                    /workspace); streamed when ``timeout``
+                                    is over 90 s
+``process.*session*``               each command a streamed exec: logs
+                                    arrive as it prints
+                                    (``get_session_command_logs_async``),
+                                    ``run_async`` runs it on a thread; cd and
+                                    export do not carry between commands
 ``sandbox.process.code_run``        ``python3 -c`` (or ``node -e``) as an exec
 ``sandbox.fs.*``                    the sandbox's files API
 ``sandbox.fork``                    ``fork(n=1)``
@@ -41,7 +47,9 @@ delete``
 Daytona snapshots are images you build; kosa8 snapshots are saved sandboxes
 (memory and disk). ``daytona.snapshot.create`` (an image build) raises
 :class:`kosa8.compat.Unsupported`, as does anything else kosa8 cannot do.
-Only ``/workspace`` outlives a command, and an exec runs at most 90 s.
+Only ``/workspace`` outlives a command. A buffered exec (``process.exec``
+with no ``timeout`` over 90 s) runs at most 90 s; session commands and a
+``timeout`` over 90 s are streamed and are not held to it.
 """
 
 from __future__ import annotations
@@ -49,10 +57,11 @@ from __future__ import annotations
 import math
 import os
 import posixpath
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
-from ..cloud import CloudSandbox, Kosa8Cloud
+from ..cloud import EXEC_LIMIT_S, CloudSandbox, Kosa8Cloud
 from ..errors import (
     Kosa8AuthError,
     Kosa8BadRequestError,
@@ -65,13 +74,14 @@ from ..errors import (
     Kosa8RateLimitError,
     Kosa8TimeoutError,
 )
-from . import Unsupported, abs_path, check_url, get_cloud, given, in_dir, stat_entry, translating
+from . import StreamPump, Unsupported, abs_path, check_url, get_cloud, given, in_dir, stat_entry, translating
 
 __all__ = [
     "Daytona", "DaytonaConfig", "CreateSandboxFromSnapshotParams", "CreateSandboxFromImageParams", "Resources",
     "ListSandboxesQuery", "CodeRunParams", "FileUpload", "Sandbox", "Process", "FileSystem", "SnapshotService",
     "ExecuteResponse", "ExecutionArtifacts", "FileInfo", "Snapshot", "PaginatedSnapshots", "PortPreviewUrl",
-    "CodeLanguage", "DaytonaError", "DaytonaNotFoundError", "DaytonaAuthenticationError", "DaytonaForbiddenError",
+    "CodeLanguage", "SessionExecuteRequest", "SessionExecuteResponse", "SessionCommandLogsResponse", "Session",
+    "Command", "DaytonaError", "DaytonaNotFoundError", "DaytonaAuthenticationError", "DaytonaForbiddenError",
     "DaytonaRateLimitError", "DaytonaConflictError", "DaytonaBadRequestError", "DaytonaTimeoutError",
     "DaytonaConnectionError", "DaytonaFileNotFoundError", "Unsupported",
 ]
@@ -260,6 +270,44 @@ class ExecuteResponse:
 
 
 @dataclass
+class SessionExecuteRequest:
+    command: str
+    run_async: Optional[bool] = None
+    #: Deprecated in Daytona in favour of ``run_async``; either works.
+    var_async: Optional[bool] = None
+    suppress_input_echo: Optional[bool] = False
+
+
+@dataclass
+class SessionExecuteResponse:
+    cmd_id: str
+    output: str = ""
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    exit_code: Optional[int] = None
+
+
+@dataclass
+class SessionCommandLogsResponse:
+    output: Optional[str] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+
+
+@dataclass
+class Command:
+    id: str  # noqa: A003 (Daytona's name)
+    command: str
+    exit_code: Optional[int] = None
+
+
+@dataclass
+class Session:
+    session_id: str
+    commands: Optional[List[Command]] = None
+
+
+@dataclass
 class FileInfo:
     name: str
     is_dir: bool
@@ -331,26 +379,50 @@ def _session(name: str) -> Callable[..., Any]:
     return nope
 
 
+class _SessionCommand:
+    """One command run in a session: a streamed exec, read on a thread."""
+
+    def __init__(self, cmd_id: str, command: str, pump: StreamPump) -> None:
+        self.id = cmd_id
+        self.command = command
+        self.pump = pump
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        r = self.pump.result
+        return r.exit_code if self.pump.done and r is not None else None
+
+    def logs(self) -> SessionCommandLogsResponse:
+        return SessionCommandLogsResponse(output=self.pump.text(), stdout=self.pump.text("stdout"),
+                                          stderr=self.pump.text("stderr"))
+
+    def info(self) -> Command:
+        return Command(id=self.id, command=self.command, exit_code=self.exit_code)
+
+
 class Process:
     """``sandbox.process``."""
 
     def __init__(self, sandbox: "Sandbox") -> None:
         self._sb = sandbox
+        self._sessions: Dict[str, Dict[str, _SessionCommand]] = {}
 
     @_dt
     def exec(self, command: str, cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None,
              timeout: Optional[int] = None) -> ExecuteResponse:
         """Run a shell command (``sh -c``). ``result`` is stdout then stderr,
-        and a non-zero exit is returned, not raised, as in Daytona. kosa8 runs
-        a command 90 s at most; ``timeout`` shorter than that is applied with
-        ``timeout(1)`` in the sandbox."""
+        and a non-zero exit is returned, not raised, as in Daytona.
+        ``timeout`` is applied with ``timeout(1)`` in the sandbox; over 90 s,
+        the command runs as a streamed exec, which is not held to kosa8's
+        90 s for a buffered one. With no ``timeout`` it is buffered (90 s at
+        most); for longer work without a bound, use a session command."""
         argv = ["sh", "-c", command]
         if timeout:
             argv = ["timeout", str(int(timeout)), *argv]
-        return self._run(in_dir(argv, cwd), env)
+        return self._run(in_dir(argv, cwd), env, stream=bool(timeout and timeout > EXEC_LIMIT_S))
 
-    def _run(self, argv: List[str], env: Optional[Mapping[str, str]]) -> ExecuteResponse:
-        r = self._sb.kosa8.exec(argv, env=env)
+    def _run(self, argv: List[str], env: Optional[Mapping[str, str]], stream: bool = False) -> ExecuteResponse:
+        r = self._sb.kosa8.exec(argv, env=env, stream=stream or None)
         out = r.stdout + r.stderr
         return ExecuteResponse(exit_code=r.exit_code, result=out, artifacts=ExecutionArtifacts(stdout=out))
 
@@ -372,18 +444,96 @@ class Process:
             argv += (["--"] if lang == CodeLanguage.JAVASCRIPT else []) + list(params.argv)
         if timeout:
             argv = ["timeout", str(int(timeout)), *argv]
-        return self._run(argv, params.env if params is not None else None)
+        return self._run(argv, params.env if params is not None else None, stream=bool(timeout and timeout > EXEC_LIMIT_S))
 
-    create_session = _session("create_session")
-    get_session = _session("get_session")
+    # sessions: each command is a streamed exec, so its logs arrive as it
+    # prints and it is not held to 90 s. kosa8 runs every command in a fresh
+    # container: a session groups commands and their logs, but cd and export
+    # do not carry from one command to the next (files in /workspace do).
+    # Sessions live in this Process object, not on the sandbox.
+
+    def _session_cmds(self, session_id: str) -> Dict[str, _SessionCommand]:
+        cmds = self._sessions.get(session_id)
+        if cmds is None:
+            raise DaytonaNotFoundError(f"session {session_id!r} not found", status_code=404)
+        return cmds
+
+    def _session_cmd(self, session_id: str, command_id: str) -> _SessionCommand:
+        c = self._session_cmds(session_id).get(command_id)
+        if c is None:
+            raise DaytonaNotFoundError(f"command {command_id!r} not found in session {session_id!r}", status_code=404)
+        return c
+
+    def create_session(self, session_id: str, request_timeout: Optional[float] = None) -> None:
+        if session_id in self._sessions:
+            raise DaytonaConflictError(f"session {session_id!r} already exists", status_code=409)
+        self._sessions[session_id] = {}
+
+    def get_session(self, session_id: str, request_timeout: Optional[float] = None) -> Session:
+        return Session(session_id=session_id, commands=[c.info() for c in self._session_cmds(session_id).values()])
+
+    def list_sessions(self, request_timeout: Optional[float] = None) -> List[Session]:
+        return [self.get_session(sid) for sid in self._sessions]
+
+    def delete_session(self, session_id: str, request_timeout: Optional[float] = None) -> None:
+        """Forget the session and stop reading its commands' output."""
+        for c in self._session_cmds(session_id).values():
+            c.pump.close()
+        del self._sessions[session_id]
+
+    @_dt
+    def execute_session_command(self, session_id: str, req: SessionExecuteRequest,
+                                timeout: Optional[int] = None) -> SessionExecuteResponse:
+        """Run ``req.command`` (``sh -c``) in the session. With ``run_async``
+        it returns at once with ``cmd_id``; follow it with
+        :meth:`get_session_command_logs_async` or poll :meth:`get_session_command`.
+        Otherwise it waits and returns the output and exit code."""
+        cmds = self._session_cmds(session_id)
+        argv = ["sh", "-c", req.command]
+        if timeout:
+            argv = ["timeout", str(int(timeout)), *argv]
+        cmd_id = f"cmd_{secrets.token_hex(8)}"
+        pump = StreamPump(self._sb.kosa8.exec_stream(argv))
+        cmds[cmd_id] = _SessionCommand(cmd_id, req.command, pump)
+        if req.run_async or req.var_async:
+            return SessionExecuteResponse(cmd_id=cmd_id)
+        r = pump.wait()
+        return SessionExecuteResponse(cmd_id=cmd_id, output=pump.text(), stdout=r.stdout, stderr=r.stderr,
+                                      exit_code=r.exit_code)
+
+    def get_session_command(self, session_id: str, command_id: str, request_timeout: Optional[float] = None) -> Command:
+        """The command; ``exit_code`` is None while it runs."""
+        return self._session_cmd(session_id, command_id).info()
+
+    def get_session_command_logs(self, session_id: str, command_id: str,
+                                 request_timeout: Optional[float] = None) -> SessionCommandLogsResponse:
+        """Its output so far."""
+        return self._session_cmd(session_id, command_id).logs()
+
+    async def get_session_command_logs_async(self, session_id: str, command_id: str,
+                                             on_stdout: Callable[[str], Any], on_stderr: Callable[[str], Any]) -> None:
+        """Call ``on_stdout`` / ``on_stderr`` with the command's output as it
+        prints (what it printed before this call first), until it ends.
+        A callback may be a coroutine function."""
+        import asyncio
+        import inspect
+
+        c = self._session_cmd(session_id, command_id)
+        i = 0
+        while True:
+            batch = c.pump.chunks[i:]
+            i += len(batch)
+            for name, text in batch:
+                got = (on_stdout if name == "stdout" else on_stderr)(text)
+                if inspect.isawaitable(got):
+                    await got
+            if c.pump.done and i >= len(c.pump.chunks):
+                return
+            await asyncio.sleep(0.05)
+
     get_entrypoint_session = _session("get_entrypoint_session")
-    get_session_command = _session("get_session_command")
-    execute_session_command = _session("execute_session_command")
-    get_session_command_logs = _session("get_session_command_logs")
     get_entrypoint_logs = _session("get_entrypoint_logs")
     send_session_command_input = _session("send_session_command_input")
-    list_sessions = _session("list_sessions")
-    delete_session = _session("delete_session")
 
     def create_pty_session(self, *a: Any, **kw: Any) -> Any:
         raise Unsupported("daytona Process.create_pty_session", "sandbox.kosa8.terminal() gives a wss:// URL for a terminal")

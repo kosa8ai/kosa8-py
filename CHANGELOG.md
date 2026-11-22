@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Streamed exec: `box.exec_stream(cmd, env=, image=, timeout_s=)` returns a `CloudExecStream` of `(stream, text)` chunks as the command prints (`.result(on_stdout=, on_stderr=)` for a `CloudExecResult`); `box.exec(cmd, on_stdout=, on_stderr=, stream=)` streams when given callbacks, `stream=True` or a `timeout_s` over 90. A streamed exec is not held to the 90 s buffered limit; `timeout_s` goes up to a day. `Kosa8Cloud(stream_opener=)` for a custom transport.
+- Compat shims stream: E2B `commands.run(on_stdout=, on_stderr=)` and `timeout` over 90 s (or 0), and `background=True` callbacks / `handle.wait(on_stdout=)` / iterating the handle get each new piece of output as it appears (polled about once a second); Modal `sandbox.exec(...)` returns while the command runs and `process.stdout` iterates lines as they print (the entrypoint's `sandbox.stdout` too, polled); Daytona sessions (`create_session`, `execute_session_command` with `run_async`, `get_session_command(_logs)`, `get_session_command_logs_async`, `get_session`, `list_sessions`, `delete_session`) run each command as a streamed exec, and `process.exec(timeout=)` over 90 s streams.
+
 ## 0.6.0 - 2026-11-22
 
 - Both clients (`Kosa8Cloud` and `AsyncCloud`) now cover the customer-facing Cloud API:
@@ -19,6 +24,7 @@
 - Docs: what persists between commands is stated the same way everywhere (each exec is a fresh process; files in `/workspace` persist for the sandbox's life; installed packages need `persistent=True`).
 
 ### Also in 0.6.0 (merged after 0.5.5)
+
 
 - Cloud browsers: `cloud.browser(ttl_s=, sandbox_id=, name=)` opens headless Chromium and returns a `CloudBrowser` with `id`, `cdp_url` (for Playwright `connect_over_cdp` / Puppeteer), `refresh()`, `goto(url, text=True)`, `screenshot(url, full_page=False)` (PNG bytes), `page(...)` and `close()`; `with cloud.browser() as b:` closes it. Also `cloud.browsers.create/list/get/delete/info`, `cloud.list_browsers(state=)` and `cloud.get_browser(id)`. $0.12 per browser-hour, billed per second.
 - AI gateway: `cloud.ai` (`settings`, `update_settings`, `set_key`, `keys`, `delete_key`, `usage(month)`) and the shortcuts `cloud.set_ai_key`, `list_ai_keys`, `delete_ai_key`, `ai_settings`, `update_ai_settings`, `ai_usage`. `sandboxes.create(ai_gateway=True|False)` on both clients.

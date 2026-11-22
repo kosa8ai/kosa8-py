@@ -33,7 +33,9 @@ E2B                            kosa8 Cloud
 ``list_snapshots`` /           ``cloud.snapshots``
 ``delete_snapshot``
 ``commands.run``               exec (``bash -l -c`` when the image has bash,
-                               else ``sh -c``); ``background=True`` is a
+                               else ``sh -c``); a streamed exec when given
+                               ``on_stdout``/``on_stderr`` or a ``timeout``
+                               over 90 s (or 0); ``background=True`` is a
                                background exec
 ``files.*``                    the sandbox's files API; relative paths are
                                under /workspace
@@ -43,9 +45,12 @@ E2B                            kosa8 Cloud
 =============================  ==============================================
 
 Everything else raises :class:`kosa8.compat.Unsupported`. Differences to know:
-only ``/workspace`` outlives a command; a foreground command runs at most
-90 s; output and ``on_stdout``/``on_stderr`` arrive once, when it ends; a
-background command's stdout and stderr come back together, as stdout.
+only ``/workspace`` outlives a command. ``on_stdout``/``on_stderr`` are
+called as the command prints (a streamed exec, not held to 90 s); a
+foreground command with neither callbacks nor a ``timeout`` over 90 s is
+buffered, runs at most 90 s and answers once, when it ends. A background
+command's output is polled about once a second, and its stdout and stderr
+come back together, as stdout. ``run_code`` output arrives when the cell ends.
 """
 
 from __future__ import annotations
@@ -53,13 +58,15 @@ from __future__ import annotations
 import datetime as _dt
 import enum
 import io
+import math
 import posixpath
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ..cloud import MAX_TTL_S, MIN_TTL_S, CloudSandbox, Kosa8Cloud
+from ..cloud import EXEC_LIMIT_S, MAX_TTL_S, MIN_TTL_S, CloudSandbox, Kosa8Cloud
 from ..cloud_features import CloudBackgroundExec
 from ..errors import (
     Kosa8AuthError,
@@ -70,7 +77,7 @@ from ..errors import (
     Kosa8RateLimitError,
     Kosa8TimeoutError,
 )
-from . import Hybrid, Unsupported, abs_path, bash_or_sh, check_url, get_cloud, in_dir, stat_entry, translating
+from . import Hybrid, Unsupported, abs_path, bash_or_sh, check_url, get_cloud, in_dir, poll_output, stat_entry, translating
 
 __all__ = [
     "Sandbox", "Commands", "Filesystem", "CommandResult", "CommandHandle", "EntryInfo", "WriteInfo", "FileType",
@@ -293,38 +300,104 @@ class CommandHandle:
 
     ``pid`` is kosa8's background command id (``bg_...``), not a process id.
     Its stdout and stderr are recorded together, and come back as stdout.
+    Output is followed by polling the command about once a second
+    (:attr:`poll_interval`): ``on_stdout`` given to ``run`` is called from a
+    thread with each new piece as it appears, ``wait(on_stdout=...)`` with
+    each new piece while it waits, and iterating yields them.
     """
 
-    def __init__(self, job: CloudBackgroundExec) -> None:
+    #: Seconds between polls of a background command's output.
+    poll_interval = 1.0
+
+    def __init__(self, job: CloudBackgroundExec, on_stdout: Optional[Callable[[str], None]] = None,
+                 on_stderr: Optional[Callable[[str], None]] = None) -> None:
         self._job = job
         self._result: Optional[CommandResult] = None
+        self._out: List[str] = []
+        self._final: Optional[Dict[str, Any]] = None
+        self._listeners: List[Callable[[str], None]] = [on_stdout] if on_stdout is not None else []
+        self._lock = threading.Lock()
+        self._error: Optional[BaseException] = None
+        self._thread: Optional[threading.Thread] = None
+        if self._listeners:
+            # E2B calls run()'s callbacks as output arrives, without wait().
+            self._thread = threading.Thread(target=self._pump_quietly, name="kosa8-e2b-bg", daemon=True)
+            self._thread.start()
 
     @property
     def pid(self) -> str:
         return self._job.id
 
-    @_e2b
-    def wait(self, on_pty: Optional[Callable[[Any], None]] = None, on_stdout: Optional[Callable[[str], None]] = None,
-             on_stderr: Optional[Callable[[str], None]] = None) -> CommandResult:
-        if on_pty is not None:
-            raise Unsupported("e2b CommandHandle.wait(on_pty=...)", "sandbox.kosa8.terminal() for an interactive terminal")
-        done = self._job.wait(timeout=24 * 3600)
-        out = done.get("output") or ""
-        if on_stdout and out:
-            on_stdout(out)
+    def _pump(self) -> Iterator[str]:
+        """New output as it appears, until the command exits (one reader at a time)."""
+        for new, s in poll_output(self._job.status, self.poll_interval):
+            if new:
+                with self._lock:
+                    self._out.append(new)
+                    listeners = list(self._listeners)
+                for cb in listeners:
+                    cb(new)
+                yield new
+            else:
+                self._final = s
+
+    def _pump_quietly(self) -> None:
+        try:
+            for _ in self._pump():
+                pass
+        except BaseException as e:  # noqa: BLE001 (raised again by wait)
+            self._error = e
+
+    def _finish(self) -> CommandResult:
+        if self._error is not None:
+            raise self._error
+        done = self._final or {}
+        out = "".join(self._out)
         code = done.get("exit")
         if code not in (0, None):
             raise CommandExitException(stderr="", stdout=out, exit_code=code)
         self._result = CommandResult(stderr="", stdout=out, exit_code=code)
         return self._result
 
+    @_e2b
+    def wait(self, on_pty: Optional[Callable[[Any], None]] = None, on_stdout: Optional[Callable[[str], None]] = None,
+             on_stderr: Optional[Callable[[str], None]] = None) -> CommandResult:
+        """Until the command exits; ``on_stdout`` gets its output as it appears
+        (what it printed before this call first, in one piece)."""
+        if on_pty is not None:
+            raise Unsupported("e2b CommandHandle.wait(on_pty=...)", "sandbox.kosa8.terminal() for an interactive terminal")
+        if self._result is not None and self._thread is None:
+            if on_stdout and self._result.stdout:
+                on_stdout(self._result.stdout)
+            return self._result
+        if self._thread is not None:
+            with self._lock:
+                before = "".join(self._out)
+                if on_stdout is not None:
+                    self._listeners.append(on_stdout)
+            if on_stdout and before:
+                on_stdout(before)
+            self._thread.join()
+            self._thread = None
+            return self._finish()
+        if on_stdout is not None:
+            self._listeners.append(on_stdout)
+        for _ in self._pump():
+            pass
+        return self._finish()
+
     def __iter__(self) -> Iterator[Tuple[Optional[str], Optional[str], None]]:
-        """Yields ``(stdout, None, None)`` once, when the command ends."""
-        r = self.wait() if self._result is None else self._result
-        yield (r.stdout, None, None)
+        """Yields ``(stdout, None, None)`` for each new piece of output as it appears."""
+        if self._result is not None or self._thread is not None:
+            r = self.wait() if self._result is None else self._result
+            yield (r.stdout, None, None)
+            return
+        for new in self._pump():
+            yield (new, None, None)
+        self._finish()
 
     def disconnect(self) -> None:
-        """Stop following it here; the command keeps running (nothing is streamed)."""
+        """Stop following it here; the command keeps running."""
 
     @_e2b
     def kill(self) -> bool:
@@ -370,9 +443,15 @@ class Commands:
     ) -> Union[CommandResult, CommandHandle]:
         """Run ``cmd`` and wait (or start it with ``background=True``).
 
-        Non-zero exit raises :class:`CommandExitException`, as in E2B. A
-        foreground command runs at most 90 s on kosa8 whatever ``timeout``
-        says; past that it raises :class:`TimeoutException`.
+        Non-zero exit raises :class:`CommandExitException`, as in E2B.
+
+        With ``on_stdout`` / ``on_stderr``, or a ``timeout`` over 90 s (or 0,
+        no limit), the command is a streamed exec: the callbacks get the
+        output as it prints, and ``timeout`` is applied in the sandbox
+        (:class:`TimeoutException` past it). Without them it is a buffered
+        exec, held to 90 s whatever ``timeout`` says. With ``background=True``
+        the callbacks are called from a thread as output appears (polled about
+        once a second, stdout and stderr together).
         """
         _refuse_user("Commands.run", user)
         if stdin:
@@ -385,12 +464,14 @@ class Commands:
             argv = bash_or_sh(cmd)
         argv = in_dir(argv, cwd)
         if background:
-            return CommandHandle(self._box.exec_background(argv, env=envs))
-        r = self._box.exec(argv, env=envs)
-        if on_stdout and r.stdout:
-            on_stdout(r.stdout)
-        if on_stderr and r.stderr:
-            on_stderr(r.stderr)
+            return CommandHandle(self._box.exec_background(argv, env=envs), on_stdout, on_stderr)
+        no_limit = timeout is not None and timeout <= 0
+        long_wait = timeout is not None and timeout > EXEC_LIMIT_S
+        if on_stdout is not None or on_stderr is not None or no_limit or long_wait:
+            limit = None if timeout is None or no_limit else max(1, int(math.ceil(timeout)))
+            r = self._box.exec_stream(argv, env=envs, timeout_s=limit).result(on_stdout=on_stdout, on_stderr=on_stderr)
+        else:
+            r = self._box.exec(argv, env=envs)
         out = r.stdout if retain_output else None
         err = r.stderr if retain_output else None
         if r.exit_code not in (0, None):

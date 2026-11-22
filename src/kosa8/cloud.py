@@ -31,6 +31,7 @@ Standard library only, like the rest of the SDK.
 from __future__ import annotations
 
 import base64
+import codecs
 import email.utils
 import json
 import os
@@ -50,6 +51,7 @@ from .errors import (
     Kosa8ExecTimeoutError,
     Kosa8NotFoundError,
     Kosa8RateLimitError,
+    Kosa8StreamError,
     Kosa8TimeoutError,
     classify_failure,
     error_from_response,
@@ -112,6 +114,9 @@ ROLLOUT_STDOUT_TAIL = 4096
 RUN_LABEL = "kosa8.run"
 #: The limit kosa8 Cloud puts on a buffered exec, in seconds (504 exec_timeout past it).
 EXEC_LIMIT_S = 90
+#: The longest ``timeout_s`` a streamed exec takes (a day); a streamed exec
+#: is not held to :data:`EXEC_LIMIT_S`.
+MAX_STREAM_TIMEOUT_S = 86400
 #: vCPU x GiB sizes a create takes (``size="0.25x0.5"``, or ``cpus=0.25, mem_mb=512``).
 #: The small ones (under 2 vCPU) share a vCPU and are billed at their fraction.
 CLOUD_SIZES = ("0.25x0.5", "0.5x1", "1x2", "2x4", "4x8", "8x16", "16x32")
@@ -152,6 +157,44 @@ def _urllib_open(method: str, url: str, headers: Dict[str, str], body: Optional[
             return resp.status, resp.read(), dict(resp.headers.items())
     except urllib.error.HTTPError as e:
         return e.code, e.read(), dict(e.headers.items()) if e.headers else {}
+
+
+#: (method, url, headers, body bytes or None, timeout) -> (status, lines, response headers):
+#: for a status under 400 ``lines`` is an iterable of the answer's lines as
+#: they arrive; for a refusal it is the whole body as bytes.
+StreamOpener = Callable[[str, str, Dict[str, str], Optional[bytes], float], Any]
+
+
+class _StreamAnswer:
+    """The lines of a streamed answer as they arrive, closing the response when done."""
+
+    def __init__(self, resp: Any) -> None:
+        self._resp = resp
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            while True:
+                line = self._resp.readline()
+                if not line:
+                    return
+                yield line
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        try:
+            self._resp.close()
+        except Exception:  # noqa: BLE001 (closing is best effort)
+            pass
+
+
+def _urllib_stream_open(method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float):
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (https checked above)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers.items()) if e.headers else {}
+    return resp.status, _StreamAnswer(resp), dict(resp.headers.items())
 
 
 @dataclass
@@ -344,6 +387,16 @@ def _batch_body(
 
 
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,58}$")
+
+
+def _stream_timeout_s(timeout_s: Optional[float]) -> Optional[int]:
+    """``timeout_s`` of a streamed exec: whole seconds, 1 to a day."""
+    if timeout_s is None:
+        return None
+    if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s != int(timeout_s)
+            or not 1 <= timeout_s <= MAX_STREAM_TIMEOUT_S):
+        raise ValueError(f"timeout_s must be a whole number of seconds from 1 to {MAX_STREAM_TIMEOUT_S}")
+    return int(timeout_s)
 
 
 def _exec_timeout_s(timeout_s: Optional[float]) -> Optional[int]:
@@ -559,12 +612,17 @@ class Kosa8Cloud:
         timeout: float = 120.0,
         opener: Optional[Opener] = None,
         retry: Optional[RetryPolicy] = None,
+        stream_opener: Optional[StreamOpener] = None,
     ) -> None:
         """``retry`` (default :class:`~kosa8.retry.RetryPolicy` ``()``: 3 tries,
         backoff with jitter) is applied to every request where trying again is
         safe: reads, deletes and heartbeats on infra failures, any request on a
         429 (waiting at least its ``Retry-After``). ``RetryPolicy(attempts=1)``
-        turns it off."""
+        turns it off.
+
+        ``stream_opener`` opens a streamed answer (:meth:`CloudSandbox.exec_stream`);
+        left out, it is urllib, or, when only ``opener`` is given, ``opener``
+        with the whole answer split into lines (for tests and custom transports)."""
         env = os.environ if env is None else env
         key = (api_key if api_key is not None else env.get("KOSA8_API_KEY", "")).strip()
         if not key:
@@ -579,6 +637,7 @@ class Kosa8Cloud:
         self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or DEFAULT_CLOUD_URL)
         self.timeout = timeout
         self._open = opener or _urllib_open
+        self._stream_open: Optional[StreamOpener] = stream_opener or (None if opener else _urllib_stream_open)
         self.retry = retry if retry is not None else RetryPolicy()
         self.sandboxes = CloudSandboxes(self)
         self.functions = CloudFunctions(self)
@@ -801,6 +860,39 @@ class Kosa8Cloud:
         except (urllib.error.URLError, OSError) as e:
             raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
         return _parse_answer(answer, method, path, raw)
+
+
+    def _stream(self, method: str, path: str, body: Any) -> Iterator[bytes]:
+        """Open a streamed answer and return its lines as they arrive. A refusal
+        before the stream starts raises the usual typed error (a 429 is retried
+        as :attr:`retry` allows); nothing is retried once lines flow."""
+        policy = _ScopedRetry(self.retry, method, path)
+        return call_with_retry(lambda: self._stream_once(method, path, body), policy)
+
+    def _stream_once(self, method: str, path: str, body: Any) -> Iterator[bytes]:
+        headers, payload = self._headers_payload(body, None, False)
+        headers["Accept"] = "application/x-ndjson, application/json"
+        # Heartbeats come every 15 s, so a read that waits longer than this
+        # is a dead connection, not a quiet command.
+        read_timeout = max(self.timeout, 30.0)
+        try:
+            if self._stream_open is not None:
+                answer = self._stream_open(method, self.base_url + path, headers, payload, read_timeout)
+            else:
+                st, content, *rest = self._open(method, self.base_url + path, headers, payload, read_timeout)
+                if st < 400:
+                    content = (content or b"").splitlines(keepends=True)
+                answer = (st, content, rest[0] if rest else {})
+        except (socket.timeout, TimeoutError) as e:
+            raise Kosa8TimeoutError(_timeout_message(self.timeout), method=method, path=path) from e
+        except (urllib.error.URLError, OSError) as e:
+            raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
+        status, lines = answer[0], answer[1]
+        if status >= 400:
+            _parse_answer((status, lines if isinstance(lines, (bytes, bytearray)) else b"", *answer[2:]), method, path, False)
+        if isinstance(lines, (bytes, bytearray)):  # a 200 that came whole
+            lines = bytes(lines).splitlines(keepends=True)
+        return iter(lines)
 
 
 def _timeout_message(timeout: float) -> str:
@@ -1287,6 +1379,135 @@ class CloudSandboxes:
         return CloudSandbox(self._cloud, r["sandbox"])
 
 
+class CloudExecStream:
+    """A streamed exec's output as it arrives (:meth:`CloudSandbox.exec_stream`).
+
+    Iterating yields ``(stream, text)`` with ``stream`` ``"stdout"`` or
+    ``"stderr"`` (UTF-8, decoded across chunk edges); heartbeats are skipped.
+    After the last chunk ``exit_code`` is set and ``stdout`` / ``stderr``
+    hold everything that was printed. Read it once.
+    """
+
+    def __init__(self, lines: Iterator[bytes], path: str = "") -> None:
+        self._lines = lines
+        self._path = path
+        self._dec = {"stdout": codecs.getincrementaldecoder("utf-8")("replace"),
+                     "stderr": codecs.getincrementaldecoder("utf-8")("replace")}
+        self._out: Dict[str, List[str]] = {"stdout": [], "stderr": []}
+        self.exit_code: Optional[int] = None
+        self.done = False
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self._out["stdout"])
+
+    @property
+    def stderr(self) -> str:
+        return "".join(self._out["stderr"])
+
+    def close(self) -> None:
+        """Stop reading (closes the connection)."""
+        close = getattr(self._lines, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self) -> "CloudExecStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def _keep(self, name: str, text: str) -> Optional["tuple[str, str]"]:
+        if not text:
+            return None
+        self._out[name].append(text)
+        return (name, text)
+
+    def _flush(self) -> Iterator["tuple[str, str]"]:
+        for name, dec in self._dec.items():
+            kept = self._keep(name, dec.decode(b"", final=True))
+            if kept:
+                yield kept
+
+    def __iter__(self) -> Iterator["tuple[str, str]"]:
+        if self.done:
+            return
+        for raw in self._read():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                f = json.loads(line)
+            except ValueError as e:
+                raise Kosa8StreamError(f"kosa8 Cloud sent a stream line that is not JSON: {line[:200]!r}",
+                                       self.stdout, self.stderr, path=self._path) from e
+            if not isinstance(f, dict):
+                continue
+            if f.get("done"):
+                yield from self._flush()
+                self.done = True
+                if f.get("error") is not None:
+                    self._raise(f)
+                self.exit_code = f["exit"] if _is_int(f.get("exit")) else None
+                return
+            name = f.get("stream")
+            data = f.get("data")
+            if name not in self._dec or not isinstance(data, str) or not data:
+                continue  # a heartbeat, or a frame this SDK does not know
+            try:
+                chunk = base64.b64decode(data)
+            except ValueError:
+                chunk = data.encode()
+            kept = self._keep(name, self._dec[name].decode(chunk))
+            if kept:
+                yield kept
+        yield from self._flush()
+        self.done = True
+        raise Kosa8StreamError("the exec stream ended before the command finished (no final frame)",
+                               self.stdout, self.stderr, path=self._path)
+
+    def _read(self) -> Iterator[bytes]:
+        it = iter(self._lines)
+        while True:
+            try:
+                raw = next(it)
+            except StopIteration:
+                return
+            except (socket.timeout, TimeoutError) as e:
+                raise Kosa8StreamError("kosa8 Cloud stopped sending the exec stream (no data or heartbeat in time)",
+                                       self.stdout, self.stderr, path=self._path, code="stream_stalled") from e
+            except OSError as e:
+                raise Kosa8StreamError(f"the exec stream broke: {e}", self.stdout, self.stderr, path=self._path,
+                                       code="stream_broken") from e
+            yield raw
+
+    def _raise(self, f: Mapping[str, Any]) -> None:
+        msg = str(f.get("error") or "the command failed")
+        code = f.get("code") if isinstance(f.get("code"), str) else None
+        if code == "exec_timeout" or "timeout_s" in msg:
+            e: Kosa8Error = Kosa8ExecTimeoutError(msg, status=504, daemon_message=msg, method="POST", path=self._path,
+                                                  code="exec_timeout")
+            e.stdout = self.stdout  # type: ignore[attr-defined]
+            e.stderr = self.stderr  # type: ignore[attr-defined]
+            raise e
+        raise Kosa8StreamError(msg, self.stdout, self.stderr, path=self._path, code=code)
+
+    def result(self, on_stdout: Optional[Callable[[str], None]] = None,
+               on_stderr: Optional[Callable[[str], None]] = None) -> CloudExecResult:
+        """Read to the end, calling ``on_stdout`` / ``on_stderr`` with each
+        chunk as it arrives; the whole output and exit code."""
+        try:
+            for name, text in self:
+                cb = on_stdout if name == "stdout" else on_stderr
+                if cb is not None:
+                    cb(text)
+        finally:
+            self.close()
+        code = self.exit_code
+        return CloudExecResult(exit_code=code, stdout=self.stdout, stderr=self.stderr,
+                               failure_class=None if code is None else ("ok" if code == 0 else "exit_nonzero"))
+
+
 class CloudSandbox:
     """One cloud sandbox. ``info`` is its state as of the last call.
 
@@ -1340,9 +1561,17 @@ class CloudSandbox:
         image: Optional[str] = None,
         env: Optional[Mapping[str, str]] = None,
         timeout_s: Optional[float] = None,
+        on_stdout: Optional[Callable[[str], None]] = None,
+        on_stderr: Optional[Callable[[str], None]] = None,
+        stream: Optional[bool] = None,
     ) -> CloudExecResult:
         """Run a command and wait for it. A string runs through ``sh -c``.
         A sleeping sandbox wakes for it.
+
+        With ``on_stdout`` / ``on_stderr``, ``stream=True`` or a ``timeout_s``
+        over 90, it runs as a streamed exec (:meth:`exec_stream`): the
+        callbacks get the output as the command prints it, and the command is
+        not held to 90 s. The result is the same either way.
 
         Each exec runs in a fresh container: only ``/workspace`` persists, so
         ``cd``, ``export`` and packages installed elsewhere are gone by the
@@ -1356,6 +1585,10 @@ class CloudSandbox:
         carries the output so far. The way to bound a test you do not trust
         to finish.
         """
+        long_timeout = isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) and timeout_s > EXEC_LIMIT_S
+        if stream or (stream is None and (on_stdout is not None or on_stderr is not None or long_timeout)):
+            return self.exec_stream(cmd, image=image, env=env, timeout_s=timeout_s).result(
+                on_stdout=on_stdout, on_stderr=on_stderr)
         argv = ["sh", "-c", cmd] if isinstance(cmd, str) else list(cmd)
         body: Dict[str, Any] = {"cmd": argv}
         if image is not None:
@@ -1366,7 +1599,48 @@ class CloudSandbox:
         if t is not None:
             body["timeout_s"] = t
         r = self._cloud._request("POST", self._path("/exec"), body)
-        return _exec_result(r)
+        res = _exec_result(r)
+        if on_stdout is not None and res.stdout:
+            on_stdout(res.stdout)
+        if on_stderr is not None and res.stderr:
+            on_stderr(res.stderr)
+        return res
+
+    def exec_stream(
+        self,
+        cmd: Union[str, Sequence[str]],
+        *,
+        image: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+        timeout_s: Optional[float] = None,
+    ) -> "CloudExecStream":
+        """Start a command and read its output as it prints (a streamed exec).
+
+        Not held to the 90 s of a buffered exec; ``timeout_s`` (1 s to a day)
+        stops it in the sandbox. Iterate the answer for ``(stream, text)``
+        pairs (``stream`` is ``"stdout"`` or ``"stderr"``), or call
+        ``.result(on_stdout=..., on_stderr=...)`` for a :class:`CloudExecResult`::
+
+            for stream, text in box.exec_stream("make test"):
+                print(text, end="")
+
+        A refusal (bad request, sandbox not running) raises here, before any
+        output. A command stopped at ``timeout_s`` raises
+        :class:`~kosa8.Kosa8ExecTimeoutError` (``.stdout`` / ``.stderr`` hold the
+        output so far); any other failure mid-stream raises
+        :class:`~kosa8.Kosa8StreamError`.
+        """
+        argv = ["sh", "-c", cmd] if isinstance(cmd, str) else list(cmd)
+        body: Dict[str, Any] = {"cmd": argv, "stream": True}
+        if image is not None:
+            body["image"] = image
+        if env:
+            body["env"] = [f"{k}={v}" for k, v in env.items()]
+        t = _stream_timeout_s(timeout_s)
+        if t is not None:
+            body["timeout_s"] = t
+        path = self._path("/exec")
+        return CloudExecStream(self._cloud._stream("POST", path, body), path)
 
     def sleep(self) -> "CloudSandbox":
         """Snapshot it and free its VM; it then costs only snapshot storage."""

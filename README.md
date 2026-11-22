@@ -221,7 +221,11 @@ box.previews.delete(3000); box.schedules.delete("sch_..."); box.code_contexts.de
   or chain the steps in one `sh -c`.
 - **A buffered `exec` runs at most 90 seconds** and raises
   `Kosa8ExecTimeoutError`. `exec(cmd, timeout_s=30)` stops a command sooner, in
-  the sandbox (1 to 90 whole seconds). Run long work in the background and poll it:
+  the sandbox (1 to 90 whole seconds). A **streamed exec** has no such limit and
+  hands over output as it prints: `box.exec(cmd, on_stdout=print, on_stderr=print)`,
+  `box.exec(cmd, timeout_s=600)` (a `timeout_s` over 90 streams), or
+  `for stream, text in box.exec_stream(cmd): ...` (`timeout_s` up to a day). Or run
+  long work in the background and poll it:
   `box.exec("nohup sh -c 'make test > /workspace/test.log 2>&1; echo $? > /workspace/test.exit' &")`.
 - A request body (command and env) is at most 64 KiB; a file read or write is at
   most 8 MiB.
@@ -519,7 +523,7 @@ persistent-sandbox limit.
 | Shim (mirrors) | What maps onto kosa8 Cloud |
 |---|---|
 | `kosa8.compat.e2b` (`e2b` 2.64.0, `e2b-code-interpreter` 2.11.10) | `Sandbox.create`, `connect`, `kill`, `set_timeout`, `get_info`, `is_running`, `pause`, `fork`, `create_snapshot` / `list_snapshots` / `delete_snapshot`, `Sandbox.list`, `download_url`; `commands.run` (foreground and `background=True`), `connect`, `kill`; `files.read` / `write` / `write_files` / `list` / `exists` / `get_info` / `remove` / `rename` / `make_dir`; `run_code` and code contexts (Python) |
-| `kosa8.compat.daytona` (`daytona` 2.1.0) | `Daytona().create` (snapshot / image params, `Resources`), `get`, `list`, `delete`, `start`, `stop`; `sandbox.process.exec` / `code_run`; `sandbox.fs` upload / download / list / info / folders / permissions / move / delete; `sandbox.fork`, `create_snapshot`, `set_labels`, `set_autostop_interval`, `set_ttl`, `get_preview_link`; `daytona.snapshot.list` / `get` / `delete` |
+| `kosa8.compat.daytona` (`daytona` 2.1.0) | `Daytona().create` (snapshot / image params, `Resources`), `get`, `list`, `delete`, `start`, `stop`; `sandbox.process.exec` / `code_run`; sessions (`create_session`, `execute_session_command` with `run_async`, `get_session_command`, `get_session_command_logs`, `get_session_command_logs_async`, `get_session`, `list_sessions`, `delete_session`); `sandbox.fs` upload / download / list / info / folders / permissions / move / delete; `sandbox.fork`, `create_snapshot`, `set_labels`, `set_autostop_interval`, `set_ttl`, `get_preview_link`; `daytona.snapshot.list` / `get` / `delete` |
 | `kosa8.compat.modal` (`modal` 1.6.4) | `App.lookup`, `Image.from_registry` / `debian_slim` / `from_id`, `Secret.from_dict` / `from_name`; `Sandbox.create(*entrypoint, ...)`, `exec`, `wait`, `poll`, `returncode`, `terminate`, `stdout` / `stderr` reading, `snapshot_filesystem`, `from_id`, `from_name`, `list`, `set_tags` / `get_tags`; `sandbox.filesystem` read / write / list / stat / make_directory / remove / copy |
 
 What kosa8 cannot do raises `kosa8.compat.Unsupported`, naming the method and the kosa8 way to do it
@@ -529,11 +533,15 @@ pretends a call worked. Errors come back as the other SDK's exceptions (`e2b.Tim
 Every shim object has `.kosa8`, the `CloudSandbox` underneath, for anything else.
 
 How kosa8 differs, whichever shim you use: only `/workspace` is sure to outlive a command (unless
-the sandbox is persistent); a foreground
-command runs at most 90 s (use E2B `background=True` or a Modal entrypoint for longer work); output
-arrives when a command ends, so callbacks such as E2B's `on_stdout` run once, with all of it; a
-background command's stdout and stderr come back together (a Modal entrypoint's stderr is kept
-apart in a file). No stdin, PTY, GPU, volumes or image builds. Async variants (`AsyncSandbox`,
+the sandbox is persistent). Output streams where the other SDK streams it, as a streamed exec that
+is not held to 90 s: E2B `commands.run(..., on_stdout=, on_stderr=)` or with a `timeout` over 90 s
+(or 0), Modal `sandbox.exec(...)` (iterate `process.stdout` for lines as they print), and Daytona
+session commands (`get_session_command_logs_async`) or `process.exec(timeout=)` over 90 s. A plain
+foreground command (no callbacks, no long timeout) is buffered: it runs at most 90 s and its output
+arrives when it ends. A background command (E2B `background=True`, a Modal entrypoint) is polled
+about once a second and its new output passed on as it appears, stdout and stderr together (a
+Modal entrypoint's stderr is kept apart in a file). Daytona session commands each run in a fresh
+container, so `cd` and `export` do not carry between them. No stdin, PTY, GPU, volumes or image builds. Async variants (`AsyncSandbox`,
 `AsyncDaytona`, `.aio`) are not mirrored. `kosa8.compat.set_default_cloud(Kosa8Cloud(...))` points
 every shim at one client.
 
