@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `CloudSandbox.exec(cmd, timeout_s=)` and `AsyncCloudSandbox.exec(cmd, timeout_s=)`: the API's `timeout_s` (1 to 90 whole seconds) stops the command in the sandbox when it runs that long, and raises `Kosa8ExecTimeoutError` (without the 90 s hint, which is about the buffered limit). There was no way to set it from the cloud clients; any other value is a `ValueError` before the call. The JS SDK's `exec({ timeoutS })` already had it.
+
 ## 0.5.4
 
 - Actionable kosa8 Cloud errors. `str(e)` is the server's sentence followed by what to do with it: `no capacity: fork fewer or retry in 10 s [HTTP 503 no_capacity; retry in 10 s; request a5e77ddee9ef8120-BOS]` (a 402 adds `upgrade: <url>` when the sentence lacks it). `e.message` is still the sentence alone.

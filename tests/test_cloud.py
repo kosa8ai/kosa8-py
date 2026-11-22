@@ -375,3 +375,44 @@ class CloudTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecTimeoutParam(unittest.TestCase):
+    """CloudSandbox.exec(timeout_s=) (the e2e test of 2026-11-22: there was
+    no way to set it from the sync or async cloud client)."""
+
+    def test_sync_sends_timeout_s(self):
+        stub = Stub(lambda s: (200, {"exit": 0, "stdout": "", "stderr": ""}))
+        box = cloud_box(Kosa8Cloud(KEY, env={}, opener=stub))
+        box.exec("true", timeout_s=3)
+        self.assertEqual(stub.seen[-1]["body"]["timeout_s"], 3)
+        box.exec("true")
+        self.assertNotIn("timeout_s", stub.seen[-1]["body"])
+        for bad in (0, 91, 2.5, True, "3"):
+            with self.assertRaises(ValueError):
+                box.exec("true", timeout_s=bad)
+
+    def test_own_timeout_raises_exec_timeout_without_the_90s_hint(self):
+        body = {"error": "exec_timeout", "message": "the command ran longer than its timeout_s of 3 s and was stopped",
+                "limit_s": 3, "stdout": "", "stderr": ""}
+        box = cloud_box(Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (504, body))))
+        with self.assertRaises(Kosa8ExecTimeoutError) as e:
+            box.exec("sleep 30", timeout_s=3)
+        self.assertIn("timeout_s of 3 s", str(e.exception))
+        self.assertNotIn("90 s", str(e.exception))
+
+    def test_async_sends_timeout_s(self):
+        import asyncio
+        from kosa8.aio import AsyncCloud, AsyncCloudSandbox
+
+        stub = Stub(lambda s: (200, {"exit": 0, "stdout": "", "stderr": ""}))
+
+        async def go():
+            cloud = AsyncCloud(KEY, env={}, opener=stub)
+            box = AsyncCloudSandbox(cloud, sbx())
+            await box.exec("true", timeout_s=5)
+            with self.assertRaises(ValueError):
+                await box.exec("true", timeout_s=0)
+
+        asyncio.run(go())
+        self.assertEqual(stub.seen[-1]["body"]["timeout_s"], 5)

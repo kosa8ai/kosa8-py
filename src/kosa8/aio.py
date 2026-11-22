@@ -34,6 +34,7 @@ from .cloud import (
     _batch_from,
     _create_body,
     _exec_result,
+    _exec_timeout_s,
     _fork_body,
     _grade_body,
     _grade_result,
@@ -432,14 +433,18 @@ class AsyncCloudSandbox:
         return f"/v1/sandboxes/{urllib.parse.quote(self.id, safe='')}{suffix}"
 
     async def exec(self, cmd: Union[str, Sequence[str]], *, image: Optional[str] = None,
-                   env: Optional[Mapping[str, str]] = None):
-        """Run a command and wait for it; see :meth:`kosa8.CloudSandbox.exec`."""
+                   env: Optional[Mapping[str, str]] = None, timeout_s: Optional[float] = None):
+        """Run a command and wait for it; see :meth:`kosa8.CloudSandbox.exec`
+        (``timeout_s``: 1 to 90 whole seconds, then the sandbox stops it)."""
         body: Dict[str, Any] = {"cmd": argv_of(cmd)}
         if image is not None:
             body["image"] = image
         el = env_list(env)
         if el:
             body["env"] = el
+        t = _exec_timeout_s(timeout_s)
+        if t is not None:
+            body["timeout_s"] = t
         return _exec_result(await self._cloud._request("POST", self._path("/exec"), body))
 
     async def refresh(self) -> "AsyncCloudSandbox":
