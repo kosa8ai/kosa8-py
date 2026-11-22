@@ -70,7 +70,7 @@ DEFAULT_CLOUD_URL = "https://api.kosa8.com"
 CLOUD_KEY_PREFIX = "k8c_live_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
-USER_AGENT = "kosa8-python/0.5.1"
+USER_AGENT = "kosa8-python/0.5.2"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
