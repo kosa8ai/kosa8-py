@@ -75,7 +75,7 @@ from .aio import AsyncCloud, AsyncCloudFiles, AsyncCloudSandbox, AsyncCloudSandb
 #: ``kosa8.Cloud()`` is :class:`Kosa8Cloud`.
 Cloud = Kosa8Cloud
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "Kosa8Client",

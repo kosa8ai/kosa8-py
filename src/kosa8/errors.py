@@ -241,7 +241,7 @@ def error_from_response(
 
 #: Failure classes, as kosa8 Cloud sends them in ``failure_class``.
 #: ``error`` is the SDK's own: your code raised something that is not a kosa8 error.
-FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "infra", "quota", "client", "error")
+FAILURE_CLASSES = ("ok", "exit_nonzero", "timeout", "oom", "infra", "quota", "client", "error")
 
 # The server's lists (workers/cloud-api/src/failures.js), for an error body
 # that came without failure_class (an older Worker, a proxy's answer).

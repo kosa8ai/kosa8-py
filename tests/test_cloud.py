@@ -60,7 +60,7 @@ def cloud_box(cloud):
 
 class CloudTest(unittest.TestCase):
     def setUp(self):
-        # Retries (0.5.0) wait between attempts; these tests need not.
+        # Retries (0.5.1) wait between attempts; these tests need not.
         from unittest import mock
 
         p = mock.patch("kosa8.retry._sleep", lambda _s: None)
@@ -279,7 +279,7 @@ class CloudTest(unittest.TestCase):
         self.assertEqual(stub.seen[-1]["body"], {"n": 2})
         self.assertEqual(box.ports()[0]["port"], 8000)
         self.assertEqual([t["key"] for t in cloud.templates()], ["base", "python"])
-        for bad in (0, -1, True):  # more than 100 is several calls since 0.5.0
+        for bad in (0, -1, True):  # more than 100 is several calls since 0.5.1
             with self.assertRaises(ValueError):
                 box.fork(bad)
         with self.assertRaises(ValueError):
