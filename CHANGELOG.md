@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fork progress: `box.fork(n, on_progress=fn)` streams the fork (`Accept: application/x-ndjson`) and calls `fn({"requested", "created", "failed"})` when the copies start and after each host call (up to 100 copies each); the answer is the same `SandboxBatch`. An API that does not stream answers as before. Sync client only.
 - Streamed exec: `box.exec_stream(cmd, env=, image=, timeout_s=)` returns a `CloudExecStream` of `(stream, text)` chunks as the command prints (`.result(on_stdout=, on_stderr=)` for a `CloudExecResult`); `box.exec(cmd, on_stdout=, on_stderr=, stream=)` streams when given callbacks, `stream=True` or a `timeout_s` over 90. A streamed exec is not held to the 90 s buffered limit; `timeout_s` goes up to a day. `Kosa8Cloud(stream_opener=)` for a custom transport.
 - Compat shims stream: E2B `commands.run(on_stdout=, on_stderr=)` and `timeout` over 90 s (or 0), and `background=True` callbacks / `handle.wait(on_stdout=)` / iterating the handle get each new piece of output as it appears (polled about once a second); Modal `sandbox.exec(...)` returns while the command runs and `process.stdout` iterates lines as they print (the entrypoint's `sandbox.stdout` too, polled); Daytona sessions (`create_session`, `execute_session_command` with `run_async`, `get_session_command(_logs)`, `get_session_command_logs_async`, `get_session`, `list_sessions`, `delete_session`) run each command as a streamed exec, and `process.exec(timeout=)` over 90 s streams.
 

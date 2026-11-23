@@ -862,15 +862,17 @@ class Kosa8Cloud:
         return _parse_answer(answer, method, path, raw)
 
 
-    def _stream(self, method: str, path: str, body: Any) -> Iterator[bytes]:
+    def _stream(self, method: str, path: str, body: Any,
+                extra: Optional[Mapping[str, str]] = None) -> Iterator[bytes]:
         """Open a streamed answer and return its lines as they arrive. A refusal
         before the stream starts raises the usual typed error (a 429 is retried
         as :attr:`retry` allows); nothing is retried once lines flow."""
         policy = _ScopedRetry(self.retry, method, path)
-        return call_with_retry(lambda: self._stream_once(method, path, body), policy)
+        return call_with_retry(lambda: self._stream_once(method, path, body, extra), policy)
 
-    def _stream_once(self, method: str, path: str, body: Any) -> Iterator[bytes]:
-        headers, payload = self._headers_payload(body, None, False)
+    def _stream_once(self, method: str, path: str, body: Any,
+                     extra: Optional[Mapping[str, str]] = None) -> Iterator[bytes]:
+        headers, payload = self._headers_payload(body, None, False, extra)
         headers["Accept"] = "application/x-ndjson, application/json"
         # Heartbeats come every 15 s, so a read that waits longer than this
         # is a dead connection, not a quiet command.
@@ -1734,10 +1736,16 @@ class CloudSandbox:
         partial_ok: Optional[bool] = None,
         idempotency_key: Optional[str] = None,
         prefix: Optional[str] = None,
+        on_progress: Optional[Callable[[Dict[str, int]], None]] = None,
     ) -> SandboxBatch:
         """``n`` live copies of the sandbox as it is now, on its host, as a
         :class:`SandboxBatch` (a list, with ``.failed``). Each is held to the
         rules of a create (payment, quotas).
+
+        ``on_progress``, when given, is called with ``{"requested", "created",
+        "failed"}`` as the copies are made: once when they start, then after
+        each host call (kosa8 Cloud makes up to 100 copies in one, so the
+        count moves 100 at a time). The fork's answer is the same either way.
 
         One API call makes up to 1000 (kosa8 Cloud makes them 100 at a time);
         for more this makes several calls, and if one of them raises, the
@@ -1768,8 +1776,12 @@ class CloudSandbox:
             while left > 0:
                 k = min(left, MAX_FORK_PER_CALL)
                 body = _fork_body(k, labels, run_id, lease_s, partial_ok, prefix)
-                r = self._cloud._request("POST", self._path("/fork"), body,
-                                         idempotency_key=_chunk_key(idempotency_key, call)) or {}
+                if on_progress is None:
+                    r = self._cloud._request("POST", self._path("/fork"), body,
+                                             idempotency_key=_chunk_key(idempotency_key, call)) or {}
+                else:
+                    r = self._fork_streamed(body, _chunk_key(idempotency_key, call), n,
+                                            len(out), len(out.failed), on_progress)
                 part = _batch_from(self._cloud, r, CloudSandbox, k)
                 _reindex(part.failed, n - left)
                 out.extend(part)
@@ -1781,6 +1793,34 @@ class CloudSandbox:
                 _quiet_delete(child)
             raise
         return out
+
+    def _fork_streamed(self, body: Dict[str, Any], key: Optional[str], n: int, made: int, failed: int,
+                       on_progress: Callable[[Dict[str, int]], None]) -> Dict[str, Any]:
+        """One fork call with its progress streamed (Accept:
+        application/x-ndjson): each progress event goes to ``on_progress``,
+        offset by what earlier calls of this fork made; the last line is the
+        answer, raised as the usual typed error when it is one. An API that
+        does not stream answers plain JSON, which is returned as it is."""
+        path = self._path("/fork")
+        lines = self._cloud._stream("POST", path, body, extra=_idem_headers("POST", path, key))
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            ev = json.loads(line)
+            kind = ev.get("event") if isinstance(ev, dict) else None
+            if kind == "progress":
+                on_progress({"requested": n, "created": made + int(ev.get("created") or 0),
+                             "failed": failed + int(ev.get("failed") or 0)})
+            elif kind == "result":
+                status = int(ev.pop("status", 200))
+                ev.pop("event", None)
+                if status >= 400:
+                    raise _cloud_error(status, ev, "POST", path, {})
+                return ev
+            elif kind is None:
+                return ev or {}
+        raise Kosa8ConnectionError("the connection to kosa8 Cloud closed before the fork's answer", method="POST", path=path)
 
     def grade(
         self,
