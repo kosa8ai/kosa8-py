@@ -191,7 +191,16 @@ def fake_verifiers():
         type: str = "custom"
         import_path: str = ""
 
+    class NetworkPolicyConfig(_Model):
+        allow: list = ["*"]
+        block: list = []
+
+        @property
+        def network_restricted(self):
+            return "*" not in self.allow or bool(self.block)
+
     cfg.CustomRuntimeConfig = CustomRuntimeConfig
+    cfg.NetworkPolicyConfig = NetworkPolicyConfig
     errs = mod("verifiers.v1.errors")
 
     class SandboxError(Exception):
@@ -231,6 +240,10 @@ def fake_verifiers():
         def bind(self, *, env=None):
             return Runtime(self)
 
+        @property
+        def network_restricted(self):
+            return isinstance(self.config, NetworkPolicyConfig) and self.config.network_restricted
+
         async def stop(self):
             self.stopped = True
             await asyncio.to_thread(self.cleanup)
@@ -255,6 +268,18 @@ class VerifiersAdapter(unittest.TestCase):
                               lambda: AsyncCloud(KEY, env={}, base_url=LOCAL, async_opener=self.fake.aopen))
         p.start()
         self.addCleanup(p.stop)
+        self.streams = []
+
+        class Done:
+            exit_code = 3
+
+        def open_stream(box, argv, env):
+            self.streams.append((argv, env))
+            return iter([("stdout", "ran\n"), ("stderr", "warn\n")]), Done()
+
+        p = mock.patch.object(vf, "open_stream", open_stream)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_runtime(self):
         vf = self.vf
@@ -271,20 +296,89 @@ class VerifiersAdapter(unittest.TestCase):
             self.assertEqual((create["image"], create["cpus"], create["lease_s"]), ("ghcr.io/a/b:1", 2, 3600))
             self.assertEqual(sys.modules["verifiers.v1.runtimes.base"].registered, [be])
             rt = be.bind()
-            r = await be.run(rt, ["echo", "hi"], {"X": "2"})
-            self.assertEqual((r.exit_code, r.stdout), (0, "ok\n"))
-            body = self.fake.calls[-1][2]
-            self.assertEqual(body["cmd"][-2:], ["echo", "hi"])
-            self.assertEqual(sorted(body["env"]), ["VF=1", "X=2"])
-            proc = await be.exec(rt, ["ls"], {})
+            self.assertTrue(create["persistent"])
+            proc = await be.exec(rt, ["ls"], {"X": "2"})
             out = b"".join([c async for c in proc.stdout])
-            self.assertEqual((out, await proc.wait(), await proc.poll()), (b"ok\n", 0, 0))
+            err = b"".join([c async for c in proc.stderr])
+            self.assertEqual((out, err, await proc.wait(), await proc.poll()), (b"ran\n", b"warn\n", 3, 3))
+            argv, env = self.streams[-1]
+            self.assertEqual(argv[-1], "ls")
+            self.assertEqual(argv[5], "/workspace")  # the workdir
+            self.assertEqual(env, {"VF": "1", "X": "2"})
             await be.write(rt, "notes.txt", b"abc")
             self.assertEqual(await be.read(rt, "notes.txt", max_bytes=1), b"ab")  # max + 1, as Runtime checks
             self.assertIn("/workspace/notes.txt", self.fake.sandboxes[box_id]["files"])
             await be.stop()
             self.assertNotIn(box_id, self.fake.live())
             be.cleanup()  # idempotent (also the atexit backstop)
+
+        asyncio.run(go())
+
+    def test_features(self):
+        vf = self.vf
+        be_cls = vf.Kosa8Backend
+        self.assertTrue(be_cls.SUPPORTS_USER_SWITCHING and be_cls.SUPPORTS_PORT_EXPOSURE and be_cls.SUPPORTS_TASK_IMAGES)
+        self.assertFalse(getattr(be_cls, "SUPPORTS_COMPOSE", False))
+        self.assertTrue(issubclass(vf.Kosa8RuntimeConfig, sys.modules["verifiers.v1.configs.runtime"].NetworkPolicyConfig))
+        self.assertEqual(vf.as_user(["id"], "nobody", {"A": "1"}),
+                         ["su", "-s", "/bin/sh", "-c", 'exec "$0" "$@"', "--", "nobody", "env", "A=1", "id"])
+        self.assertEqual(vf.as_user(["id"], None, {"A": "1"}), ["id"])
+        self.assertEqual(vf.egress_for(None, ["pypi.org"], []), {"internet": True, "allow": [], "deny": []})
+        self.assertEqual(vf.egress_for(["https://t.example/x"], ["pypi.org"], []),
+                         {"internet": False, "allow": ["t.example", "pypi.org"], "deny": []})
+        self.assertEqual(vf.egress_for([], ["*"], ["evil.com"]), {"internet": True, "allow": [], "deny": ["evil.com"]})
+        self.assertEqual(vf.egress_for([], [], ["*"]), {"internet": False, "allow": [], "deny": []})
+        hooked = []
+
+        def before(method, path, body):
+            hooked.append((method, path, body))
+            if path.endswith("/previews"):
+                return (201, {"preview": {"url": "https://8000-x.kosa8labs.com/", "port": body["port"]}})
+            if path.endswith("/egress"):
+                return (200, {"egress": body})
+            if path.endswith("/exec") and body.get("background"):
+                return (202, {"exec": {"id": "bg_1", "state": "running"}})
+            return None
+
+        self.fake.before = before
+
+        async def go():
+            cfg = vf.Kosa8RuntimeConfig(import_path="kosa8.rl.verifiers.Kosa8Backend", allow=["pypi.org"], block=[])
+            be = vf.Kosa8Backend(cfg)
+            await be.start()
+            create = [b for m, p, b in self.fake.calls if p == "/v1/sandboxes" and m == "POST"][0]
+            self.assertEqual(create["template"], "python")
+            self.assertEqual(be.published_port, 8000)
+            self.assertEqual(await be.expose(8000), "https://8000-x.kosa8labs.com/")
+            self.assertEqual(await be.expose(8000), "https://8000-x.kosa8labs.com/")  # opened once
+            self.assertEqual([b for m, p, b in hooked if p.endswith("/previews")], [{"port": 8000, "public": True}])
+            await be.prepare_execution(["https://tunnel.example/mcp"])
+            await be.prepare_execution(None)
+            egress = [b for m, p, b in hooked if p.endswith("/egress")]
+            self.assertEqual(egress, [{"internet": False, "allow": ["tunnel.example", "pypi.org"], "deny": []},
+                                      {"internet": True, "allow": [], "deny": []}])
+            # Stdin written before the first read is the process's stdin (a file).
+            rt = be.bind()
+            rt.user = "nobody"
+            proc = await be.exec(rt, ["cat"], {})
+            await proc.write(b"ping\n")
+            self.assertEqual(await proc.wait(), 3)
+            argv, _ = self.streams[-1]
+            self.assertTrue(argv[6].startswith("/tmp/vf-stdin-"))
+            self.assertIn(argv[6], self.fake.sandboxes[be.info.id]["files"])
+            self.assertIn("nobody", argv)
+            with self.assertRaises(sys.modules["verifiers.v1.errors"].SandboxError):
+                await proc.write(b"late")
+            # A kill before the start never runs the command.
+            n = len(self.streams)
+            idle = await be.exec(rt, ["sleep", "600"], {})
+            await idle.kill()
+            self.assertEqual((await idle.wait(), len(self.streams)), (137, n))
+            await be.run_background(be.bind(), ["sh", "-c", "serve"], {}, "bg.log")
+            bg = [b for m, p, b in self.fake.calls if p.endswith("/exec") and b.get("background")]
+            self.assertEqual(bg[-1]["cmd"][-1], "serve")
+            await be.stop()
+            await be.verify_stopped()
 
         asyncio.run(go())
 
