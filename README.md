@@ -1,13 +1,14 @@
 # kosa8 for Python
 
+**[kosa8](https://kosa8.com): Zero Trust cybersecurity infrastructure for AI agents.**
+
 > **Switching from E2B / Daytona / Modal? Change one import.**
 > `from e2b import Sandbox` → `from kosa8.compat.e2b import Sandbox` (or `kosa8.compat.daytona`,
 > `kosa8.compat.modal`). Your `E2B_API_KEY` / `DAYTONA_API_KEY` can hold the kosa8 key. Switching
-> back is the same line. Guide and pass rates: **https://kosa8.com/switch/** ·
-> [what maps](#switching-from-e2b-daytona-or-modal) · [compat results](docs/compat-results.md)
+> back is the same line: [what maps](#switching-from-e2b-daytona-or-modal) · [compat results](docs/compat-results.md)
 
-Python client for [kosa8](https://kosa8.com): microVM sandboxes for AI agents, with
-checkpoint, rewind, fork and explore. The counterpart of
+Python client for [kosa8](https://kosa8.com), Zero Trust cybersecurity infrastructure for AI
+agents: each agent in its own microVM, with checkpoint, rewind, fork and explore. The counterpart of
 [`@kosa8/sdk`](https://www.npmjs.com/package/@kosa8/sdk), method for method.
 
 No dependencies. It talks to **kosa8 Cloud** (`https://api.kosa8.com`) with an API
