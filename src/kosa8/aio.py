@@ -56,6 +56,7 @@ from .cloud import (
     _link_body,
     OVERFLOW_REGION,
     _idem_headers,
+    _key_renewer,
     _reindex,
     MAX_FORK,
     MAX_FORK_PER_CALL,
@@ -344,7 +345,8 @@ class AsyncCloud:
         extra = _idem_headers(method, path, idempotency_key)
         policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
         return await acall_with_retry(
-            lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy)
+            lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy,
+            on_retry=_key_renewer(extra, idempotency_key))
 
     async def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
                             raw: bool = False, extra: Optional[Mapping[str, str]] = None) -> Any:

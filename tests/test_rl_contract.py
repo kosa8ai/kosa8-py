@@ -95,7 +95,8 @@ class IdempotencyKeys(unittest.TestCase):
         self.assertEqual(len(batch), 3)
         for suffix in ("/v1/sandboxes", "/batch"):
             ks = keys(self.fake, "POST", suffix)
-            self.assertEqual((len(ks), len(set(ks))), (2, 1))
+            # The SDK's own key is renewed after a 5xx: the retry is a new attempt.
+            self.assertEqual((len(ks), len(set(ks))), (2, 2))
         self.assertEqual(len(self.fake.live()), 4)
 
     def test_grade_retried_after_a_lost_answer_records_once(self):
