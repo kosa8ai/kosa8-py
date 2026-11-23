@@ -28,6 +28,7 @@ class Sandbox(_e2b.Sandbox):
 
     _default_template = "python"
     _persistent = True
+    _fallback = ("e2b_code_interpreter", "Sandbox")
 
 
 __all__ = list(_e2b.__all__)

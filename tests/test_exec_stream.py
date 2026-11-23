@@ -132,15 +132,15 @@ class ShimStreamTest(unittest.TestCase):
         self.assertEqual((out, err, r.stdout, r.stderr), (["1\n", "2\n"], ["w\n"], "1\n2\n", "w\n"))
         self.assertEqual((self.exec_body()["stream"], self.exec_body()["timeout_s"]), (True, 60))
 
-    def test_e2b_long_or_no_timeout_streams_short_stays_buffered(self):
+    def test_e2b_every_foreground_command_streams(self):
         sb = e2b.Sandbox.create()
         sb.commands.run("sleep 100", timeout=150)
         self.assertEqual((self.exec_body()["stream"], self.exec_body()["timeout_s"]), (True, 150))
         sb.commands.run("serve", timeout=0)
         self.assertTrue(self.exec_body()["stream"])
         self.assertNotIn("timeout_s", self.exec_body())
-        sb.commands.run("echo")
-        self.assertNotIn("stream", self.exec_body())
+        sb.commands.run("echo")  # E2B's default 60 s, applied in the sandbox; no 90 s buffered cap
+        self.assertEqual((self.exec_body()["stream"], self.exec_body()["timeout_s"]), (True, 60))
 
     def test_e2b_stream_timeout_and_exit(self):
         sb = e2b.Sandbox.create()
@@ -168,12 +168,12 @@ class ShimStreamTest(unittest.TestCase):
         self.assertEqual(list(sb.commands.run("m", background=True)), [("1", None, None), ("2", None, None)])
 
     # daytona
-    def test_daytona_long_timeout_streams(self):
+    def test_daytona_exec_always_streams(self):
         sb = daytona.Daytona(daytona.DaytonaConfig(api_key=KEY)).create()
         sb.process.exec("sleep 100", timeout=120)
         self.assertTrue(self.exec_body()["stream"])
         sb.process.exec("echo hi")
-        self.assertNotIn("stream", self.exec_body())
+        self.assertTrue(self.exec_body()["stream"])
 
     def test_daytona_sessions(self):
         sb = daytona.Daytona(daytona.DaytonaConfig(api_key=KEY)).create()

@@ -31,6 +31,8 @@ class FakeCloud:
         self.bg_progress = None
         self.code_answer = {"execution_count": 1, "results": [], "stdout": "", "stderr": ""}
         self.fail = {}  # "METHOD /path" -> (status, body)
+        #: persistent sandboxes the plan has left (None: no limit)
+        self.persistent_left = None
 
     def cloud(self):
         return Kosa8Cloud(KEY, base_url="http://localhost:8787", env={}, opener=self)
@@ -73,7 +75,12 @@ class FakeCloud:
     def answer(self, method, path, q, b):
         nf = (404, {"error": "not_found", "message": "no such thing"})
         if path == "/v1/sandboxes" and method == "POST":
-            info = {k: v for k, v in b.items() if k not in ("env", "egress", "secrets")}
+            if b.get("persistent") and self.persistent_left is not None:
+                if self.persistent_left <= 0:
+                    return 402, {"error": "plan_limit", "message": "Solo includes 1 persistent sandbox. This organization has used 1",
+                                 "limit_name": "persistent", "limit": 1, "used": 1}
+                self.persistent_left -= 1
+            info = {k: v for k, v in b.items() if k not in ("env", "secrets")}
             if "snapshot" in b:
                 info["template"] = self.snaps.get(b["snapshot"], {}).get("template", "base")
             sid = self.add_box(**info)
@@ -191,7 +198,7 @@ class FakeCloud:
             for s, dp in self.dirs:
                 if s == sid and posixpath.dirname(dp) == p:
                     names[dp] = {"name": posixpath.basename(dp), "path": dp, "type": "dir", "size": 0}
-            if not names and (sid, p) not in self.dirs and p != "/workspace":
+            if not names and (sid, p) not in self.dirs and p not in ("/workspace", "/home/user"):
                 return nf
             return 200, {"path": p, "files": list(names.values())}
         if rest == "/files/mkdir":
@@ -200,7 +207,17 @@ class FakeCloud:
         if rest == "/files/link":
             return 201, {"link": {"url": f"https://h.example/dl?path={b['path']}&m={b.get('method', 'GET')}", "expires_at": 1}}
         if rest == "/previews":
-            return 201, {"preview": {"port": b["port"], "url": f"https://p{b['port']}.example/?t=sig"}}
+            host = f"{b['port']}-{sid.lower().replace('_', '')}.kosa8labs.example"
+            url = f"https://{host}/" if b.get("public") else f"https://p{b['port']}.example/?t=sig"
+            return 201, {"preview": {"port": b["port"], "public": bool(b.get("public")), "host": host, "url": url}}
+        if rest == "/egress" and method == "GET":
+            b = box.get("egress") or {"internet": True}
+            return 200, {"egress": {"internet": b.get("internet", not b.get("allow")), "allow": b.get("allow", []),
+                                    "deny": b.get("deny", []), "presets": [], "source": "sandbox"}}
+        if rest == "/egress" and method == "PUT":
+            box["egress"] = dict(b)
+            return 200, {"egress": {"internet": b.get("internet", not b.get("allow")), "allow": b.get("allow", []),
+                                    "deny": b.get("deny", []), "presets": [], "source": "sandbox"}}
         if rest.startswith("/code") and not self.boxes.get(sid, {}).get("persistent"):
             # Like workers/cloud-api/src/code.js: the interpreter needs a persistent sandbox.
             return 409, {"error": "not_persistent", "message": "the code interpreter keeps state in a long-lived process, "

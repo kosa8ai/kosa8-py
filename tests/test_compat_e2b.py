@@ -27,7 +27,7 @@ class E2BTest(unittest.TestCase):
         sb = Sandbox.create("python", timeout=600, envs={"A": "1"}, metadata={"team": "ml"}, allow_internet_access=False)
         body = self.f.last("POST /v1/sandboxes")["body"]
         self.assertEqual(body, {"template": "python", "ttl_s": 600, "env": {"A": "1"}, "egress": {"internet": False},
-                                "labels": {"team": "ml"}})
+                                "labels": {"team": "ml"}, "persistent": True})
         self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.assertTrue(sb.sandbox_id.startswith("sbx_"))
         self.assertIs(sb.kosa8.id, sb.sandbox_id)
@@ -35,22 +35,23 @@ class E2BTest(unittest.TestCase):
     def test_create_defaults_and_minimum_ttl(self):
         # E2B's default image has Python, so the shim's default (and E2B's
         # "base") is kosa8's python template, not kosa8's Alpine base.
+        # Persistent, like an E2B sandbox: packages, files and background
+        # processes last between commands.
         Sandbox.create()
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 300})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 300, "persistent": True})
         Sandbox.create("base", timeout=5)
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 60})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "ttl_s": 60, "persistent": True})
         Sandbox.create("node")
         self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["template"], "node")
-        self.assertNotIn("persistent", self.f.last("POST /v1/sandboxes")["body"])
 
     def test_create_pause_on_timeout_and_from_snapshot(self):
         Sandbox.create(timeout=120, lifecycle={"on_timeout": "pause"})
-        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "sleep_after_s": 120})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"], {"template": "python", "sleep_after_s": 120, "persistent": True})
         Sandbox.create("snap_9")
         self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["snapshot"], "snap_9")
 
     def test_create_unsupported(self):
-        for kw in ({"mcp": {"x": 1}}, {"network": {"allow_out": ["1.1.1.1"]}}, {"iam": {"tokens": {}}},
+        for kw in ({"mcp": {"x": 1}}, {"network": {"egress_proxy": {"address": "p:1080"}}}, {"iam": {"tokens": {}}},
                    {"volume_mounts": {"/d": "v"}}, {"idempotency_key": "k"}, {"cpu_count": 2},
                    {"lifecycle": {"on_timeout": "pause", "auto_resume": True}}):
             with self.assertRaises(Unsupported) as c:
@@ -59,6 +60,83 @@ class E2BTest(unittest.TestCase):
             self.assertIn("On kosa8:", str(c.exception))
         with self.assertRaisesRegex(Unsupported, "not a kosa8 address"):
             Sandbox.create(domain="e2b.app")
+        self.assertNotIn("POST /v1/sandboxes", self.f.routes())
+
+    def test_persistent_refused_by_plan_falls_back_with_a_warning(self):
+        self.f.persistent_left = 0
+        with self.assertWarnsRegex(RuntimeWarning, "only /workspace"):
+            sb = Sandbox.create()
+        self.assertNotIn("persistent", self.f.last("POST /v1/sandboxes")["body"])
+        self.assertTrue(sb.sandbox_id.startswith("sbx_"))
+
+    def test_create_network_maps_to_egress(self):
+        Sandbox.create(network={"allow_out": ["pypi.org", "1.1.1.1"], "deny_out": [e2b.ALL_TRAFFIC]})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["egress"],
+                         {"internet": False, "allow": ["pypi.org", "1.1.1.1"], "deny": []})
+        Sandbox.create(network={"deny_out": ["8.8.8.8", "evil.com"], "allow_out": ["8.8.8.8"]})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["egress"], {"internet": True, "deny": ["evil.com"]})
+        Sandbox.create(network={"allow_out": lambda ctx: ["a.com"], "deny_out": lambda ctx: [ctx.all_traffic]})
+        self.assertEqual(self.f.last("POST /v1/sandboxes")["body"]["egress"], {"internet": False, "allow": ["a.com"], "deny": []})
+
+    def test_update_network_replaces_egress(self):
+        sb = self.box()
+        sb.update_network({"allow_out": ["api.openai.com"], "deny_out": [e2b.ALL_TRAFFIC]})
+        self.assertEqual(self.f.last(f"PUT /v1/sandboxes/{sb.sandbox_id}/egress")["body"],
+                         {"internet": False, "allow": ["api.openai.com"], "deny": []})
+        sb.update_network({})  # E2B: omitted fields are cleared, so all traffic is allowed again
+        self.assertEqual(self.f.last(f"PUT /v1/sandboxes/{sb.sandbox_id}/egress")["body"], {"internet": True, "allow": [], "deny": []})
+        Sandbox.update_network(sb.sandbox_id, {"allow_internet_access": False})
+        self.assertEqual(self.f.last(f"PUT /v1/sandboxes/{sb.sandbox_id}/egress")["body"], {"internet": False, "allow": [], "deny": []})
+
+    def test_get_host_is_a_public_preview(self):
+        sb = self.box()
+        host = sb.get_host(3000)
+        self.assertTrue(host.startswith("3000-"))
+        self.assertNotIn("/", host)
+        self.assertEqual(self.f.last(f"POST /v1/sandboxes/{sb.sandbox_id}/previews")["body"], {"port": 3000, "public": True})
+        n = len(self.f.seen)
+        self.assertEqual(sb.get_host(3000), host)  # opened once
+        self.assertEqual(len(self.f.seen), n)
+        private = Sandbox.create(network={"allow_public_traffic": False})
+        with self.assertRaises(Unsupported):
+            private.get_host(3000)
+
+    def test_keys_from_e2b_env_and_domain(self):
+        import os
+        compat.set_default_cloud(None)
+        old = {k: os.environ.pop(k, None) for k in ("KOSA8_API_KEY", "E2B_API_KEY", "E2B_DOMAIN", "KOSA8_CLOUD_URL")}
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in old] and None)
+        self.addCleanup(lambda: os.environ.update({k: v for k, v in old.items() if v is not None}))
+        os.environ["E2B_API_KEY"] = "k8c_live_fromE2B"
+        self.assertEqual(e2b._cloud()._key, "k8c_live_fromE2B")
+        os.environ["E2B_DOMAIN"] = "kosa8.com"
+        self.assertEqual(e2b._cloud().base_url, "https://api.kosa8.com")
+        os.environ["E2B_DOMAIN"] = "e2b.app"  # another provider's: left alone, and the key never goes there
+        self.assertEqual(e2b._cloud().base_url, "https://api.kosa8.com")
+        os.environ["E2B_API_KEY"] = "e2b_realkey"  # an E2B key is not used for kosa8
+        with self.assertRaisesRegex(Exception, "KOSA8_API_KEY"):
+            e2b._cloud()
+
+    def test_fallback_to_e2b_only_when_asked(self):
+        import os, sys, types
+        calls = []
+        fake = types.ModuleType("e2b")
+        fake.Sandbox = type("Sandbox", (), {"create": staticmethod(lambda **kw: calls.append(kw) or "real-e2b-sandbox")})
+        sys.modules["e2b"] = fake
+        self.addCleanup(sys.modules.pop, "e2b", None)
+        with self.assertRaises(Unsupported):
+            Sandbox.create(mcp={"x": 1})
+        os.environ["KOSA8_FALLBACK"] = "e2b"
+        self.addCleanup(os.environ.pop, "KOSA8_FALLBACK", None)
+        old = os.environ.pop("E2B_API_KEY", None)
+        self.addCleanup(lambda: old is not None and os.environ.__setitem__("E2B_API_KEY", old))
+        with self.assertRaisesRegex(Unsupported, "API key is missing"):
+            Sandbox.create(mcp={"x": 1})
+        os.environ["E2B_API_KEY"] = "e2b_realkey"
+        self.addCleanup(os.environ.pop, "E2B_API_KEY", None)
+        with self.assertWarnsRegex(RuntimeWarning, "KOSA8_FALLBACK"):
+            self.assertEqual(Sandbox.create(mcp={"x": 1}, timeout=60), "real-e2b-sandbox")
+        self.assertEqual(calls, [{"mcp": {"x": 1}, "timeout": 60}])
         self.assertNotIn("POST /v1/sandboxes", self.f.routes())
 
     def test_connect_class_and_instance_wakes(self):
@@ -144,11 +222,11 @@ class E2BTest(unittest.TestCase):
         self.assertEqual(seen, ["ran echo hi\n"])
         cmd = self.f.last("POST /v1/sandboxes/" + sb.sandbox_id + "/exec")["body"]
         self.assertEqual(cmd["env"], ["X=1"])
-        self.assertEqual(cmd["cmd"][:5], ["sh", "-c", 'cd "$1" || exit 1; shift; exec "$@"', "sh", "/workspace/src"])
+        self.assertEqual(cmd["cmd"][:5], ["sh", "-c", 'cd "$1" || exit 1; shift; exec "$@"', "sh", "/home/user/src"])  # E2B's home: relative paths and commands start there
         self.assertEqual(cmd["cmd"][-1], "echo hi")
         self.assertIn("command -v bash", cmd["cmd"][-3])
         sb.commands.run("ls", shell=["/bin/sh", "-c"])
-        self.assertEqual(self.f.last("POST /v1/sandboxes/" + sb.sandbox_id + "/exec")["body"]["cmd"], ["/bin/sh", "-c", "ls"])
+        self.assertEqual(self.f.last("POST /v1/sandboxes/" + sb.sandbox_id + "/exec")["body"]["cmd"], ["sh", "-c", 'mkdir -p "$1" 2>/dev/null; cd "$1" || exit 1; shift; exec "$@"', "sh", "/home/user", "/bin/sh", "-c", "ls"])
         self.assertIsNone(sb.commands.run("x", retain_output=False).stdout)
 
     def test_run_nonzero_raises_command_exit(self):
@@ -207,11 +285,11 @@ class E2BTest(unittest.TestCase):
     def test_files(self):
         sb = self.box()
         info = sb.files.write("a.txt", "hello")
-        self.assertEqual((info.path, info.name, info.type), ("/workspace/a.txt", "a.txt", FileType.FILE))
-        self.assertEqual(self.f.last("PUT")["query"], {"path": "/workspace/a.txt"})
-        sb.files.write("/workspace/b.bin", io.BytesIO(b"\x00\x01"))
+        self.assertEqual((info.path, info.name, info.type), ("/home/user/a.txt", "a.txt", FileType.FILE))
+        self.assertEqual(self.f.last("PUT")["query"], {"path": "/home/user/a.txt"})
+        sb.files.write("/home/user/b.bin", io.BytesIO(b"\x00\x01"))
         self.assertEqual(sb.files.read("a.txt"), "hello")
-        self.assertEqual(sb.files.read("/workspace/b.bin", format="bytes"), bytearray(b"\x00\x01"))
+        self.assertEqual(sb.files.read("/home/user/b.bin", format="bytes"), bytearray(b"\x00\x01"))
         self.assertEqual(list(sb.files.read("a.txt", format="stream")), [b"hello"])
         with self.assertRaises(e2b.InvalidArgumentException):
             sb.files.read("a.txt", format="xml")
@@ -226,21 +304,21 @@ class E2BTest(unittest.TestCase):
         self.assertFalse(sb.files.make_dir("data"))
         sb.files.write("data/x.csv", "1,2")
         sb.files.write("top.txt", "t")
-        names = sorted(e.name for e in sb.files.list("/workspace"))
+        names = sorted(e.name for e in sb.files.list("/home/user"))
         self.assertEqual(names, ["data", "top.txt"])
-        deep = sorted(e.path for e in sb.files.list("/workspace", depth=2))
-        self.assertEqual(deep, ["/workspace/data", "/workspace/data/x.csv", "/workspace/top.txt"])
+        deep = sorted(e.path for e in sb.files.list("/home/user", depth=2))
+        self.assertEqual(deep, ["/home/user/data", "/home/user/data/x.csv", "/home/user/top.txt"])
         self.assertTrue(sb.files.exists("data/x.csv"))
         self.assertFalse(sb.files.exists("nope"))
         gi = sb.files.get_info("top.txt")
-        self.assertEqual((gi.type, gi.size, gi.path), (FileType.FILE, 1, "/workspace/top.txt"))
+        self.assertEqual((gi.type, gi.size, gi.path), (FileType.FILE, 1, "/home/user/top.txt"))
         self.assertEqual(sb.files.get_info("data").type, FileType.DIR)
         with self.assertRaises(e2b.FileNotFoundException):
             sb.files.get_info("nope")
         sb.files.remove("data")
-        self.assertEqual(self.f.last("DELETE")["query"], {"path": "/workspace/data", "recursive": "1"})
+        self.assertEqual(self.f.last("DELETE")["query"], {"path": "/home/user/data", "recursive": "1"})
         with self.assertRaises(e2b.InvalidArgumentException):
-            sb.files.list("/workspace", depth=0)
+            sb.files.list("/home/user", depth=0)
 
     def test_rename(self):
         sb = self.box()
@@ -253,26 +331,46 @@ class E2BTest(unittest.TestCase):
             return None
 
         self.f.on_exec = mv
-        self.assertEqual(sb.files.rename("a.txt", "b.txt").path, "/workspace/b.txt")
+        self.assertEqual(sb.files.rename("a.txt", "b.txt").path, "/home/user/b.txt")
         self.f.on_exec = lambda argv, env: (1, "", "mv: no such file")
         with self.assertRaisesRegex(e2b.SandboxException, "no such file"):
             sb.files.rename("zz", "yy")
 
     def test_files_unsupported(self):
         sb = self.box()
-        for call in (lambda: sb.files.watch_dir("/workspace"), lambda: sb.files.read("a", user="root"),
+        for call in (lambda: sb.files.watch_dir("/home/user"), lambda: sb.files.read("a", user="root"),
                      lambda: sb.files.write("a", "x", metadata={"k": "v"}), lambda: sb.pty, lambda: sb.git,
-                     lambda: sb.get_host(3000), lambda: sb.get_metrics(), lambda: sb.update_network({}),
+                     lambda: sb.get_metrics(), lambda: sb.update_network({"rules": {"a.com": [{}]}}),
                      lambda: sb.upload_url("a"), lambda: sb.get_mcp_token(), lambda: sb.get_mcp_url()):
             with self.assertRaises(Unsupported) as c:
                 call()
             self.assertTrue(c.exception.alternative)
 
+    def test_files_edge_cases_like_e2b(self):
+        sb = self.box()
+        sb.files.write("chunks.bin", iter([b"ab", b"cd"]))
+        self.assertEqual(sb.files.read("chunks.bin"), "abcd")
+        with self.assertRaises(e2b.InvalidArgumentException):
+            sb.files.write("bad.bin", iter(["text"]))
+        with sb.files.read("chunks.bin", format="stream") as st:
+            self.assertEqual(b"".join(st), b"abcd")
+        sb.files.remove("not-there.txt")  # no error, as in E2B
+        self.assertEqual(sb._envd_version, "kosa8")
+
+    def test_plain_sandbox_works_in_workspace(self):
+        import os
+        os.environ["KOSA8_SHIM_PERSISTENT"] = "0"
+        self.addCleanup(os.environ.pop, "KOSA8_SHIM_PERSISTENT", None)
+        sb = Sandbox.create()
+        self.assertEqual(sb.files.write("a.txt", "x").path, "/workspace/a.txt")
+        sb.commands.run("ls")
+        self.assertEqual(self.f.last("POST /v1/sandboxes/" + sb.sandbox_id + "/exec")["body"]["cmd"][4], "/workspace")
+
     def test_download_url(self):
         sb = self.box()
-        self.assertIn("path=/workspace/a.txt", sb.download_url("a.txt"))
+        self.assertIn("path=/home/user/a.txt", sb.download_url("a.txt"))
         self.assertEqual(self.f.last("POST /v1/sandboxes/" + sb.sandbox_id + "/files/link")["body"],
-                         {"path": "/workspace/a.txt", "method": "GET"})
+                         {"path": "/home/user/a.txt", "method": "GET"})
 
     def test_errors_translate(self):
         with self.assertRaises(e2b.NotFoundException) as c:
@@ -295,6 +393,9 @@ class E2BTest(unittest.TestCase):
         del snap
 
     def test_plain_e2b_run_code_on_non_persistent_is_a_clear_error(self):
+        import os
+        os.environ["KOSA8_SHIM_PERSISTENT"] = "0"
+        self.addCleanup(os.environ.pop, "KOSA8_SHIM_PERSISTENT", None)
         sb = Sandbox.create()
         with self.assertRaises(Exception) as c:
             sb.run_code("1")

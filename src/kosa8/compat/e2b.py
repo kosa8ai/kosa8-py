@@ -9,8 +9,10 @@ https://docs.e2b.dev/sdk-reference/python-sdk/v2.64.0/sandbox_sync and
 https://docs.e2b.dev/sdk-reference/code-interpreter-python-sdk/v2.11.10/code_interpreter
 (checked 2026-11-21). Async (``AsyncSandbox``) is not mirrored.
 
-The key is a kosa8 Cloud key (``KOSA8_API_KEY``, or ``api_key=`` with a
-``k8c_live_`` key); an E2B key is refused.
+The key is a kosa8 Cloud key: ``KOSA8_API_KEY``, ``api_key=`` with a
+``k8c_live_`` key, or ``E2B_API_KEY`` when it holds one (an E2B key there is
+never sent to kosa8). ``E2B_DOMAIN=kosa8.com`` (or ``domain=``) means
+``https://api.kosa8.com``; another provider's ``E2B_DOMAIN`` is ignored.
 
 What maps, and how:
 
@@ -23,7 +25,9 @@ E2B                            kosa8 Cloud
                                ``allow_internet_access=False`` no internet,
                                ``lifecycle={"on_timeout": "pause"}`` sleep
                                after ``timeout``. A ``snap_...`` template
-                               starts from that kosa8 snapshot.
+                               starts from that kosa8 snapshot. Persistent,
+                               like an E2B sandbox; ``network`` allow/deny
+                               lists are kosa8 egress.
 ``connect``                    get; wakes a sleeping sandbox
 ``kill``                       delete
 ``set_timeout``                a new ``ttl_s``, from now
@@ -32,23 +36,23 @@ E2B                            kosa8 Cloud
 ``create_snapshot``            a durable snapshot
 ``list_snapshots`` /           ``cloud.snapshots``
 ``delete_snapshot``
-``commands.run``               exec (``bash -l -c`` when the image has bash,
-                               else ``sh -c``); a streamed exec when given
-                               ``on_stdout``/``on_stderr`` or a ``timeout``
-                               over 90 s (or 0); ``background=True`` is a
+``commands.run``               a streamed exec (``bash -l -c`` when the
+                               image has bash, else ``sh -c``), held to E2B's
+                               ``timeout``, not 90 s; ``background=True`` is a
                                background exec
+``get_host``                   a public kosa8 preview's host
+``update_network``             the sandbox's egress policy, replaced
 ``files.*``                    the sandbox's files API; relative paths are
-                               under /workspace
+                               under E2B's home, /home/user (/workspace on a
+                               sandbox that could not be persistent), where
+                               commands start too
 ``run_code`` (interpreter)     the code interpreter (Python only); the
                                code-interpreter ``Sandbox`` is created
                                persistent, which the interpreter needs
 =============================  ==============================================
 
 Everything else raises :class:`kosa8.compat.Unsupported`. Differences to know:
-only ``/workspace`` outlives a command. ``on_stdout``/``on_stderr`` are
-called as the command prints (a streamed exec, not held to 90 s); a
-foreground command with neither callbacks nor a ``timeout`` over 90 s is
-buffered, runs at most 90 s and answers once, when it ends. A background
+``on_stdout``/``on_stderr`` are called as the command prints. A background
 command's output is polled about once a second, and its stdout and stderr
 come back together, as stdout. ``run_code`` output arrives when the cell ends.
 """
@@ -59,6 +63,7 @@ import datetime as _dt
 import enum
 import io
 import math
+import os
 import posixpath
 import threading
 import time
@@ -66,7 +71,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ..cloud import EXEC_LIMIT_S, MAX_TTL_S, MIN_TTL_S, CloudSandbox, Kosa8Cloud
+from ..cloud import MAX_TTL_S, MIN_TTL_S, CloudSandbox, Kosa8Cloud
 from ..cloud_features import CloudBackgroundExec
 from ..errors import (
     Kosa8AuthError,
@@ -77,7 +82,10 @@ from ..errors import (
     Kosa8RateLimitError,
     Kosa8TimeoutError,
 )
-from . import Hybrid, Unsupported, abs_path, bash_or_sh, check_url, get_cloud, in_dir, poll_output, stat_entry, translating
+from . import (
+    Hybrid, Unsupported, bash_or_sh, check_url, create_sandbox, fallback, foreign_key, get_cloud, in_dir,
+    is_kosa8_url, poll_output, stat_entry, translating,
+)
 
 __all__ = [
     "Sandbox", "Commands", "Filesystem", "CommandResult", "CommandHandle", "EntryInfo", "WriteInfo", "FileType",
@@ -212,6 +220,11 @@ class SnapshotInfo:
     sandbox_id: Optional[str] = None
     state: Optional[str] = None
 
+    @property
+    def names(self) -> List[str]:
+        """E2B lists every name a snapshot has; a kosa8 snapshot has one at most."""
+        return [self.name] if self.name else []
+
 
 class _OnePage:
     """E2B's paginators; kosa8 answers everything in one page here."""
@@ -292,6 +305,36 @@ def _refuse_user(method: str, user: Any) -> None:
         raise Unsupported(f"e2b {method}(user=...)", "commands run as the image's user; switch user inside the command (su, sudo)")
 
 
+# --- the working directory --------------------------------------------------------------
+
+#: E2B's user's home: relative paths and commands start there, as in E2B.
+HOME = "/home/user"
+
+
+def _home(box: CloudSandbox) -> str:
+    """Where relative paths go and commands start: E2B's ``/home/user`` on a
+    persistent sandbox, ``/workspace`` (the folder kosa8 keeps between
+    commands) on a plain one."""
+    return HOME if box.info.get("persistent") else "/workspace"
+
+
+def _abs(box: CloudSandbox, path: str) -> str:
+    if not path:
+        raise InvalidArgumentException("a path is required")
+    if path.startswith("/"):
+        return path
+    p = path[2:] if path.startswith("./") else path
+    return posixpath.join(_home(box), p)
+
+
+def _in_home(box: CloudSandbox, argv: List[str], cwd: Optional[str]) -> List[str]:
+    """``argv`` run in ``cwd`` (relative to the home), or in the home; the home
+    is made on first use."""
+    d = _abs(box, cwd) if cwd else _home(box)
+    mk = 'mkdir -p "$1" 2>/dev/null; ' if not cwd else ""
+    return ["sh", "-c", mk + 'cd "$1" || exit 1; shift; exec "$@"', "sh", d, *argv]
+
+
 # --- commands --------------------------------------------------------------------------
 
 
@@ -310,8 +353,9 @@ class CommandHandle:
     poll_interval = 1.0
 
     def __init__(self, job: CloudBackgroundExec, on_stdout: Optional[Callable[[str], None]] = None,
-                 on_stderr: Optional[Callable[[str], None]] = None) -> None:
+                 on_stderr: Optional[Callable[[str], None]] = None, retain_output: bool = True) -> None:
         self._job = job
+        self._retain = retain_output
         self._result: Optional[CommandResult] = None
         self._out: List[str] = []
         self._final: Optional[Dict[str, Any]] = None
@@ -352,11 +396,11 @@ class CommandHandle:
         if self._error is not None:
             raise self._error
         done = self._final or {}
-        out = "".join(self._out)
+        out = "".join(self._out) if self._retain else None
         code = done.get("exit")
         if code not in (0, None):
-            raise CommandExitException(stderr="", stdout=out, exit_code=code)
-        self._result = CommandResult(stderr="", stdout=out, exit_code=code)
+            raise CommandExitException(stderr="", stdout=out or "", exit_code=code)
+        self._result = CommandResult(stderr="" if self._retain else None, stdout=out, exit_code=code)
         return self._result
 
     @_e2b
@@ -445,33 +489,30 @@ class Commands:
 
         Non-zero exit raises :class:`CommandExitException`, as in E2B.
 
-        With ``on_stdout`` / ``on_stderr``, or a ``timeout`` over 90 s (or 0,
-        no limit), the command is a streamed exec: the callbacks get the
-        output as it prints, and ``timeout`` is applied in the sandbox
-        (:class:`TimeoutException` past it). Without them it is a buffered
-        exec, held to 90 s whatever ``timeout`` says. With ``background=True``
-        the callbacks are called from a thread as output appears (polled about
-        once a second, stdout and stderr together).
+        A foreground command is a streamed exec: ``on_stdout`` / ``on_stderr``
+        get the output as it prints, and ``timeout`` (60 s by default, 0 for
+        no limit) is applied in the sandbox (:class:`TimeoutException` past
+        it); kosa8's 90 s cap on a buffered exec does not apply. With
+        ``background=True`` the callbacks are called from a thread as output
+        appears (polled about once a second, stdout and stderr together).
         """
         _refuse_user("Commands.run", user)
         if stdin:
             raise Unsupported("e2b Commands.run(stdin=True)", "kosa8 commands take no stdin; write the input to a file in /workspace")
         if shell is not None:
-            if isinstance(shell, str) or not shell or not shell[0]:
+            if isinstance(shell, (str, set)) or not isinstance(shell, Sequence) or not shell or not shell[0]:
                 raise InvalidArgumentException("shell must be a sequence such as ['/bin/sh', '-c']")
             argv = [*shell, cmd]
         else:
             argv = bash_or_sh(cmd)
-        argv = in_dir(argv, cwd)
+        argv = _in_home(self._box, argv, cwd)
         if background:
-            return CommandHandle(self._box.exec_background(argv, env=envs), on_stdout, on_stderr)
-        no_limit = timeout is not None and timeout <= 0
-        long_wait = timeout is not None and timeout > EXEC_LIMIT_S
-        if on_stdout is not None or on_stderr is not None or no_limit or long_wait:
-            limit = None if timeout is None or no_limit else max(1, int(math.ceil(timeout)))
-            r = self._box.exec_stream(argv, env=envs, timeout_s=limit).result(on_stdout=on_stdout, on_stderr=on_stderr)
-        else:
-            r = self._box.exec(argv, env=envs)
+            return CommandHandle(self._box.exec_background(argv, env=envs), on_stdout, on_stderr, retain_output=retain_output)
+        # Always a streamed exec: output reaches on_stdout/on_stderr as it
+        # prints, and the command runs as long as E2B's timeout says (60 s by
+        # default, 0 for no limit), not kosa8's 90 s for a buffered exec.
+        limit = None if timeout is None or timeout <= 0 else max(1, int(math.ceil(timeout)))
+        r = self._box.exec_stream(argv, env=envs, timeout_s=limit).result(on_stdout=on_stdout, on_stderr=on_stderr)
         out = r.stdout if retain_output else None
         err = r.stderr if retain_output else None
         if r.exit_code not in (0, None):
@@ -479,9 +520,11 @@ class Commands:
         return CommandResult(stderr=err, stdout=out, exit_code=r.exit_code)
 
     @_e2b
-    def connect(self, pid: str, timeout: Optional[float] = 60, request_timeout: Optional[float] = None) -> CommandHandle:
+    def connect(self, pid: str, timeout: Optional[float] = 60, request_timeout: Optional[float] = None,
+                on_stdout: Optional[Callable[[str], None]] = None, on_stderr: Optional[Callable[[str], None]] = None,
+                *, retain_output: bool = True) -> CommandHandle:
         """A background command by its id (``bg_...``)."""
-        return CommandHandle(self._box.get_exec(str(pid)))
+        return CommandHandle(self._box.get_exec(str(pid)), on_stdout, on_stderr, retain_output=retain_output)
 
     @_e2b
     def kill(self, pid: str, request_timeout: Optional[float] = None) -> bool:
@@ -518,7 +561,43 @@ def _bytes(data: Any) -> bytes:
     if hasattr(data, "read"):
         v = data.read()
         return v.encode() if isinstance(v, str) else bytes(v)
-    raise InvalidArgumentException(f"cannot write {type(data).__name__}: give str, bytes or a file object")
+    if hasattr(data, "__iter__"):
+        out = bytearray()
+        for chunk in data:
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise InvalidArgumentException(f"an iterable written to a file must yield bytes, not {type(chunk).__name__}")
+            out += chunk
+        return bytes(out)
+    raise InvalidArgumentException(f"cannot write {type(data).__name__}: give str, bytes, a file object or an iterable of bytes")
+
+
+class _ByteStream:
+    """``files.read(format="stream")``: an iterator of bytes that is also a
+    context manager with ``close()``, as E2B's is. kosa8 reads the file in one
+    piece, so it yields it in chunks of 64 KiB."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._i = 0
+
+    def __iter__(self) -> "_ByteStream":
+        return self
+
+    def __next__(self) -> bytes:
+        if self._i >= len(self._data):
+            raise StopIteration
+        chunk = self._data[self._i:self._i + 65536]
+        self._i += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self._i = len(self._data)
+
+    def __enter__(self) -> "_ByteStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
 
 class Filesystem:
@@ -534,7 +613,7 @@ class Filesystem:
         """``format``: ``text`` (str), ``bytes`` (bytearray) or ``stream`` (an iterator of bytes)."""
         _refuse_user("Filesystem.read", user)
         try:
-            data = self._box.files.read(abs_path(path))
+            data = self._box.files.read(_abs(self._box, path))
         except Kosa8NotFoundError as e:
             raise FileNotFoundException(str(e)) from e
         if format == "text":
@@ -542,7 +621,7 @@ class Filesystem:
         if format == "bytes":
             return bytearray(data)
         if format == "stream":
-            return iter([data])
+            return _ByteStream(data)
         raise InvalidArgumentException(f"format must be text, bytes or stream, not {format!r}")
 
     @_e2b
@@ -551,7 +630,7 @@ class Filesystem:
         _refuse_user("Filesystem.write", user)
         if metadata:
             raise Unsupported("e2b Filesystem.write(metadata=...)", "kosa8 files carry no metadata; keep it in a sidecar file")
-        p = abs_path(path)
+        p = _abs(self._box, path)
         self._box.files.write(p, _bytes(data))
         return WriteInfo(name=posixpath.basename(p), type=FileType.FILE, path=p)
 
@@ -571,7 +650,7 @@ class Filesystem:
         if depth is not None and depth < 1:
             raise InvalidArgumentException("depth should be at least 1")
         out: List[EntryInfo] = []
-        self._walk(abs_path(path), depth or 1, out)
+        self._walk(_abs(self._box, path), depth or 1, out)
         return out
 
     def _walk(self, path: str, depth: int, out: List[EntryInfo]) -> None:
@@ -586,30 +665,35 @@ class Filesystem:
     @_e2b
     def exists(self, path: str, user: Optional[str] = None, request_timeout: Optional[float] = None) -> bool:
         _refuse_user("Filesystem.exists", user)
-        return stat_entry(self._box, path) is not None
+        return stat_entry(self._box, _abs(self._box, path)) is not None
 
     @_e2b
     def get_info(self, path: str, user: Optional[str] = None, request_timeout: Optional[float] = None) -> EntryInfo:
         _refuse_user("Filesystem.get_info", user)
-        e = stat_entry(self._box, path)
+        e = stat_entry(self._box, _abs(self._box, path))
         if e is None:
-            raise FileNotFoundException(f"path {abs_path(path)} does not exist")
+            raise FileNotFoundException(f"path {_abs(self._box, path)} does not exist")
         info = _entry(e)
-        info.path = info.path or abs_path(path)
+        info.path = info.path or _abs(self._box, path)
         return info
 
     @_e2b
     def remove(self, path: str, user: Optional[str] = None, request_timeout: Optional[float] = None) -> None:
         _refuse_user("Filesystem.remove", user)
-        self._box.files.delete(abs_path(path), recursive=True)
+        try:
+            self._box.files.delete(_abs(self._box, path), recursive=True)
+        except Kosa8NotFoundError:
+            pass  # E2B: removing what is not there is not an error
 
     @_e2b
     def rename(self, old_path: str, new_path: str, user: Optional[str] = None,
                request_timeout: Optional[float] = None) -> EntryInfo:
         """Runs ``mv`` in the sandbox."""
         _refuse_user("Filesystem.rename", user)
-        r = self._box.exec(["mv", abs_path(old_path), abs_path(new_path)])
+        r = self._box.exec(["mv", _abs(self._box, old_path), _abs(self._box, new_path)])
         if r.exit_code != 0:
+            if "No such file" in r.stderr or "cannot stat" in r.stderr:
+                raise FileNotFoundException(f"path {_abs(self._box, old_path)} does not exist")
             raise SandboxException(f"rename failed: {r.stderr.strip()}")
         return self.get_info(new_path)
 
@@ -617,9 +701,9 @@ class Filesystem:
     def make_dir(self, path: str, user: Optional[str] = None, request_timeout: Optional[float] = None) -> bool:
         """False when it already existed, as in E2B."""
         _refuse_user("Filesystem.make_dir", user)
-        if stat_entry(self._box, path) is not None:
+        if stat_entry(self._box, _abs(self._box, path)) is not None:
             return False
-        self._box.files.mkdir(abs_path(path))
+        self._box.files.mkdir(_abs(self._box, path))
         return True
 
     def watch_dir(self, path: str, *a: Any, **kw: Any) -> Any:
@@ -636,7 +720,6 @@ def _create_body(
 ) -> Dict[str, Any]:
     for name, v, alt in (
         ("mcp", mcp, "run the MCP server yourself with commands.run(..., background=True)"),
-        ("network", network, "allow_internet_access=False, or sandbox.kosa8.set_egress(allow=[...], deny=[...])"),
         ("iam", iam, "org secrets: Kosa8Cloud().sandboxes.create(secrets=[...])"),
         ("volume_mounts", volume_mounts, "keep data in /workspace, or snapshot the sandbox (create_snapshot)"),
         ("idempotency_key", idempotency_key, "look the sandbox up by name: Kosa8Cloud().sandboxes.list(name=...)"),
@@ -647,6 +730,7 @@ def _create_body(
     for k in ("domain", "api_url"):
         check_url(f"e2b Sandbox.create({k}=...)", opts.get(k))
     body: Dict[str, Any] = {}
+    policy = _egress("Sandbox.create", network) if network else None
     sleep_on_timeout = False
     if lifecycle:
         on_timeout = lifecycle.get("on_timeout") if isinstance(lifecycle, Mapping) else None
@@ -672,8 +756,94 @@ def _create_body(
     if metadata:
         body["labels"] = dict(metadata)
     if allow_internet_access is False:
-        body["egress"] = {"internet": False}
+        policy = {**(policy or {}), "internet": False}
+        if policy.get("deny") and not policy.get("allow"):
+            policy.pop("deny")
+    if policy is not None:
+        body["egress"] = policy
     return body
+
+
+#: E2B's ``ALL_TRAFFIC``.
+ALL_TRAFFIC = "0.0.0.0/0"
+
+_NETWORK_REFUSED = {
+    "rules": "kosa8 does not rewrite requests on the way out; send the headers from your code, or use org secrets",
+    "egress_proxy": "set HTTPS_PROXY / ALL_PROXY in envs",
+    "mask_request_host": "previews are served at their own host: sandbox.get_host(port)",
+    "https_ports": "a preview speaks HTTPS to the caller and plain HTTP to the port; serve plain HTTP inside",
+    "dns_servers": "leave it out; kosa8 resolves allowed names for the sandbox",
+}
+
+
+class _SelectorContext:
+    """What E2B passes to an ``allow_out`` / ``deny_out`` callable."""
+
+    all_traffic = ALL_TRAFFIC
+
+    def __init__(self) -> None:
+        self.rules: Mapping[str, Any] = {}
+
+
+def _selector(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if callable(v):
+        v = v(_SelectorContext())
+    if isinstance(v, str):
+        return [v]
+    return [str(x) for x in v]
+
+
+def _egress(method: str, network: Any) -> Dict[str, Any]:
+    """E2B's network options as a kosa8 egress policy.
+
+    E2B lets everything out unless ``deny_out`` says otherwise, and
+    ``allow_out`` wins over ``deny_out``. ``deny_out=[ALL_TRAFFIC]`` with an
+    ``allow_out`` list is an allow-list (kosa8 ``internet: false`` with
+    ``allow``); a ``deny_out`` of some hosts blocks just those."""
+    n = network if isinstance(network, Mapping) else vars(network)
+    for k, alt in _NETWORK_REFUSED.items():
+        if n.get(k) not in (None, [], {}):
+            raise Unsupported(f"e2b {method}(network={{'{k}': ...}})", alt)
+    allow = _selector(n.get("allow_out"))
+    deny = _selector(n.get("deny_out"))
+    if ALL_TRAFFIC in allow:
+        return {"internet": True, "deny": []}
+    if ALL_TRAFFIC in deny:
+        return {"internet": False, "allow": allow, "deny": [d for d in deny if d != ALL_TRAFFIC and d not in allow]}
+    return {"internet": True, "deny": [d for d in deny if d not in allow]}
+
+
+def _private_traffic(network: Any) -> bool:
+    if not network:
+        return False
+    n = network if isinstance(network, Mapping) else vars(network)
+    return n.get("allow_public_traffic") is False
+
+
+def _base_url(opts: Mapping[str, Any]) -> Optional[str]:
+    """A kosa8 address named the E2B way: ``api_url=``, ``domain=`` or
+    ``E2B_DOMAIN`` (``kosa8.com`` is ``https://api.kosa8.com``, as E2B makes
+    ``https://api.<domain>``). An ``E2B_DOMAIN`` that is not kosa8's is
+    another provider's and is left alone."""
+    if opts.get("api_url"):
+        return str(opts["api_url"])
+    domain = opts.get("domain") or os.environ.get("E2B_DOMAIN", "").strip()
+    if not domain or not is_kosa8_url(domain):
+        return None
+    host = domain.split("//", 1)[-1].rstrip("/")
+    if host.startswith(("localhost", "127.0.0.1")):
+        return "http://" + host
+    return "https://" + (host if host.startswith("api.") else "api." + host)
+
+
+#: The E2B key variable; read when it holds a kosa8 key.
+KEY_ENV = ("E2B_API_KEY",)
+
+
+def _cloud(api_key: Optional[str] = None, **opts: Any) -> Kosa8Cloud:
+    return get_cloud(api_key, key_env=KEY_ENV, base_url=_base_url(opts))
 
 
 def _kill_id(cloud: Kosa8Cloud, sandbox_id: str) -> bool:
@@ -693,15 +863,24 @@ class Sandbox:
     #: E2B's default image has Python, so the shim starts kosa8's ``python``
     #: template unless ``template=`` says otherwise.
     _default_template: Optional[str] = "python"
-    #: Whether create() asks for a persistent sandbox (one long-lived
-    #: container); the code interpreter needs one.
-    _persistent: bool = False
+    #: Whether create() asks for a persistent sandbox: one long-lived
+    #: machine, as on E2B, so installed packages, files outside /workspace
+    #: and background processes last between commands (the code interpreter
+    #: needs one too). ``KOSA8_SHIM_PERSISTENT=0`` turns it off; a plan with
+    #: no persistent sandboxes left gets a plain one, with a warning.
+    _persistent: bool = True
+    #: The original SDK's module and class, for ``KOSA8_FALLBACK=e2b``.
+    _fallback = ("e2b", "Sandbox")
 
     def __init__(self, *, _box: Optional[CloudSandbox] = None, **opts: Any) -> None:
         if _box is None:
             # E2B's constructor is deprecated in favour of create(); it still creates.
             _box = type(self).create(**opts).kosa8
         self.kosa8 = _box
+        #: E2B's envd version; kosa8 answers the same calls without envd.
+        self._envd_version = "kosa8"
+        self._private_traffic = False
+        self._hosts: Dict[int, str] = {}
         self._files = Filesystem(_box)
         self._commands = Commands(_box)
 
@@ -737,7 +916,6 @@ class Sandbox:
     # create / connect ----------------------------------------------------------------
 
     @classmethod
-    @_e2b
     def create(
         cls,
         template: Optional[str] = None,
@@ -759,18 +937,44 @@ class Sandbox:
         **opts: Any,
     ) -> "Sandbox":
         """Start a sandbox (``template`` is a kosa8 template key; the default,
-        and E2B's ``base``, is kosa8's ``python``; a ``snap_...`` id starts
-        from that snapshot). ``secure`` is
-        ignored, as E2B now ignores it; ``logger`` is not used."""
-        body = _create_body(template if template is not None else cls._default_template, timeout, metadata, envs,
-                            allow_internet_access, mcp, network, iam, lifecycle, volume_mounts, idempotency_key,
-                            cpu_count, opts)
-        if cls._persistent and "snapshot" not in body:
-            body["persistent"] = True
-        cloud = get_cloud(api_key)
+        and E2B's ``base``, is kosa8's ``python``, Debian with Python 3; a
+        ``snap_...`` id starts from that snapshot). It is persistent, like an
+        E2B sandbox. ``network`` maps to kosa8 egress (``allow_out`` /
+        ``deny_out``, ``allow_public_traffic``). ``secure`` is ignored, as E2B
+        now ignores it; ``logger`` is not used.
+
+        With ``KOSA8_FALLBACK=e2b``, the ``e2b`` package installed and an E2B
+        key in ``E2B_API_KEY``, a create kosa8 cannot do runs on E2B instead
+        (and returns E2B's own ``Sandbox``)."""
+        args = dict(template=template, timeout=timeout, metadata=metadata, envs=envs, secure=secure,
+                    allow_internet_access=allow_internet_access, mcp=mcp, network=network, iam=iam, lifecycle=lifecycle,
+                    volume_mounts=volume_mounts, logger=logger, idempotency_key=idempotency_key)
+        try:
+            return cls._create(args, cpu_count, api_key, opts)
+        except Unsupported as e:
+            def original() -> Any:
+                mod, name = cls._fallback
+                real = getattr(__import__(mod, fromlist=[name]), name)
+                kw = {k: v for k, v in args.items() if v is not None}
+                if cpu_count is not None:
+                    kw["cpu_count"] = cpu_count
+                return real.create(**kw, **{k: v for k, v in opts.items() if k not in ("domain", "api_url")})
+            return fallback("e2b", e, lambda: foreign_key("E2B_API_KEY") and bool(__import__(cls._fallback[0])), original)
+
+    @classmethod
+    @_e2b
+    def _create(cls, args: Dict[str, Any], cpu_count: Optional[int], api_key: Optional[str], opts: Dict[str, Any]) -> "Sandbox":
+        a = args
+        template = a["template"]
+        body = _create_body(template if template is not None else cls._default_template, a["timeout"], a["metadata"],
+                            a["envs"], a["allow_internet_access"], a["mcp"], a["network"], a["iam"], a["lifecycle"],
+                            a["volume_mounts"], a["idempotency_key"], cpu_count, opts)
+        cloud = _cloud(api_key, **opts)
         labels = body.pop("labels", None)
-        box = cloud.sandboxes.create(labels=labels, **body)
-        return cls(_box=box)
+        box = create_sandbox(cloud, persistent=cls._persistent, labels=labels, **body)
+        sb = cls(_box=box)
+        sb._private_traffic = _private_traffic(a["network"])
+        return sb
 
     def _connect_self(self, timeout: Optional[int] = None, **opts: Any) -> "Sandbox":
         return type(self)._connect_cls(self.sandbox_id, timeout, **opts)
@@ -781,11 +985,15 @@ class Sandbox:
                      on_resume: str = "restore", api_key: Optional[str] = None, **opts: Any) -> "Sandbox":
         if on_resume != "restore":
             raise Unsupported(f"e2b Sandbox.connect(on_resume={on_resume!r})", "on_resume='restore' (memory and disk kept)")
-        box = get_cloud(api_key).sandboxes.get(sandbox_id)
+        box = _cloud(api_key, **opts).sandboxes.get(sandbox_id)
         if box.state == "sleeping":
             box.wake()
         if timeout is not None:
-            box.update(ttl_s=_ttl(timeout))
+            # E2B's connect only ever lengthens a running sandbox's life.
+            end = box.info.get("delete_after")
+            want = int(time.time() * 1000) + _ttl(timeout) * 1000
+            if not isinstance(end, (int, float)) or want > end:
+                box.update(ttl_s=_ttl(timeout))
         return cls(_box=box)
 
     #: ``Sandbox.connect(sandbox_id)`` or ``sandbox.connect()``; wakes a paused sandbox.
@@ -797,7 +1005,7 @@ class Sandbox:
         return _e2b(_kill_id)(self.kosa8._cloud, self.sandbox_id)
 
     #: Delete it; False when there was no such sandbox.
-    kill = Hybrid(_kill_self, lambda cls, sandbox_id, api_key=None, **o: _e2b(_kill_id)(get_cloud(api_key), sandbox_id))
+    kill = Hybrid(_kill_self, lambda cls, sandbox_id, api_key=None, **o: _e2b(_kill_id)(_cloud(api_key), sandbox_id))
 
     def _set_timeout_self(self, timeout: int, **opts: Any) -> None:
         _e2b(self.kosa8.update)(ttl_s=_ttl(timeout))
@@ -805,7 +1013,7 @@ class Sandbox:
     #: A new lifetime, counted from now (kosa8 keeps a sandbox 60 s at least).
     set_timeout = Hybrid(
         _set_timeout_self,
-        lambda cls, sandbox_id, timeout, api_key=None, **o: _e2b(get_cloud(api_key).sandboxes.get(sandbox_id).update)(ttl_s=_ttl(timeout)),
+        lambda cls, sandbox_id, timeout, api_key=None, **o: _e2b(_cloud(api_key).sandboxes.get(sandbox_id).update)(ttl_s=_ttl(timeout)),
     )
 
     def _get_info_self(self, **opts: Any) -> SandboxInfo:
@@ -813,7 +1021,7 @@ class Sandbox:
 
     get_info = Hybrid(
         _get_info_self,
-        lambda cls, sandbox_id, api_key=None, **o: _info(_e2b(get_cloud(api_key).sandboxes.get)(sandbox_id).info),
+        lambda cls, sandbox_id, api_key=None, **o: _info(_e2b(_cloud(api_key).sandboxes.get)(sandbox_id).info),
     )
 
     @_e2b
@@ -830,7 +1038,7 @@ class Sandbox:
     pause = Hybrid(
         _pause_self,
         lambda cls, sandbox_id, keep_memory=None, *, mode=None, strict=False, api_key=None, **o:
-            _e2b(_pause)(get_cloud(api_key).sandboxes.get(sandbox_id), keep_memory, mode),
+            _e2b(_pause)(_cloud(api_key).sandboxes.get(sandbox_id), keep_memory, mode),
     )
     beta_pause = pause
 
@@ -850,7 +1058,7 @@ class Sandbox:
     fork = Hybrid(
         _fork_self,
         lambda cls, sandbox_id, timeout=None, count=None, logger=None, api_key=None, **o:
-            cls._fork_box(get_cloud(api_key).sandboxes.get(sandbox_id), timeout, count),
+            cls._fork_box(_cloud(api_key).sandboxes.get(sandbox_id), timeout, count),
     )
 
     def _snapshot_self(self, name: Optional[str] = None, *, mode: Any = None, **opts: Any) -> SnapshotInfo:
@@ -860,7 +1068,7 @@ class Sandbox:
     create_snapshot = Hybrid(
         _snapshot_self,
         lambda cls, sandbox_id, name=None, *, mode=None, api_key=None, **o:
-            _e2b(_snapshot)(get_cloud(api_key).sandboxes.get(sandbox_id), name, mode),
+            _e2b(_snapshot)(_cloud(api_key).sandboxes.get(sandbox_id), name, mode),
     )
 
     def _list_snapshots_self(self, limit: Optional[int] = None, next_token: Optional[str] = None,
@@ -870,14 +1078,14 @@ class Sandbox:
     list_snapshots = Hybrid(
         _list_snapshots_self,
         lambda cls, sandbox_id=None, limit=None, next_token=None, name=None, api_key=None, **o:
-            _list_snapshots(get_cloud(api_key), sandbox_id, name),
+            _list_snapshots(_cloud(api_key), sandbox_id, name),
     )
 
     @staticmethod
     @_e2b
     def delete_snapshot(snapshot_id: str, api_key: Optional[str] = None, **opts: Any) -> bool:
         try:
-            get_cloud(api_key).snapshots.delete(snapshot_id)
+            _cloud(api_key).snapshots.delete(snapshot_id)
         except Kosa8NotFoundError:
             return False
         return True
@@ -891,7 +1099,7 @@ class Sandbox:
         q = query if isinstance(query, Mapping) else (vars(query) if query is not None else {})
         labels = q.get("metadata") or None
         states = q.get("state") or ["running", "paused"]
-        cloud = get_cloud(api_key)
+        cloud = _cloud(api_key)
 
         def fetch() -> List[SandboxInfo]:
             boxes = cloud.sandboxes.list(labels=labels)
@@ -907,19 +1115,42 @@ class Sandbox:
         """A presigned link to download ``path`` (valid up to 300 s)."""
         _refuse_user("Sandbox.download_url", user)
         ttl = None if use_signature_expiration is None else min(max(int(use_signature_expiration), 10), 300)
-        return self.kosa8.files.link(abs_path(path), method="GET", ttl_s=ttl)["url"]
+        return self.kosa8.files.link(_abs(self.kosa8, path), method="GET", ttl_s=ttl)["url"]
 
     def upload_url(self, path: Optional[str] = None, *a: Any, **kw: Any) -> str:
         raise Unsupported("e2b Sandbox.upload_url", "sandbox.kosa8.files.link(path, method='PUT')['url'] takes a PUT of the raw bytes (not E2B's multipart POST)")
 
+    @_e2b
     def get_host(self, port: int) -> str:
-        raise Unsupported("e2b Sandbox.get_host", "sandbox.kosa8.previews.create(port)['url'] (a signed private link; public=True for an open one)")
+        """The host serving ``port`` over HTTPS (``https://{host}``), as in E2B.
+
+        It is a public kosa8 preview of the port, opened on first use: like
+        an E2B sandbox URL, anyone with the host reaches the port. A sandbox
+        created with ``network={"allow_public_traffic": False}`` has no
+        public host; use ``sandbox.kosa8.previews.create(port)["url"]``, a
+        signed private link, there."""
+        if self._private_traffic:
+            raise Unsupported("e2b Sandbox.get_host with allow_public_traffic=False",
+                              "sandbox.kosa8.previews.create(port)['url'] is a signed private link (the token is in the URL, "
+                              "not E2B's e2b-traffic-access-token header)")
+        port = int(port)
+        if port not in self._hosts:
+            self._hosts[port] = self.kosa8.previews.create(port, public=True)["host"]
+        return self._hosts[port]
 
     def get_metrics(self, *a: Any, **kw: Any) -> Any:
         raise Unsupported("e2b Sandbox.get_metrics", "sandbox.kosa8.metrics() (kosa8's own fields)")
 
-    def update_network(self, *a: Any, **kw: Any) -> None:
-        raise Unsupported("e2b Sandbox.update_network", "sandbox.kosa8.set_egress(internet=..., allow=[...], deny=[...])")
+    def _update_network_self(self, network: Any, **opts: Any) -> None:
+        _e2b(_set_network)(self.kosa8, network)
+
+    #: Replace the sandbox's egress rules (kosa8 egress), as E2B's update does:
+    #: what ``network`` leaves out is cleared. ``allow_internet_access``
+    #: may be given too.
+    update_network = Hybrid(
+        _update_network_self,
+        lambda cls, sandbox_id, network, api_key=None, **o: _e2b(_set_network)(_cloud(api_key, **o).sandboxes.get(sandbox_id), network),
+    )
 
     def get_mcp_token(self) -> Any:
         raise Unsupported("e2b Sandbox.get_mcp_token", "run your MCP server with commands.run(..., background=True)")
@@ -997,6 +1228,21 @@ class Sandbox:
     @_e2b
     def restart_code_context(self, context: Union["Context", str]) -> None:
         self.kosa8.code_contexts.reset(context.id if isinstance(context, Context) else context)
+
+
+def _set_network(box: CloudSandbox, network: Any) -> None:
+    n = dict(network if isinstance(network, Mapping) else vars(network or {}))
+    internet = n.pop("allow_internet_access", None)
+    if "allow_public_traffic" in n:
+        raise Unsupported("e2b Sandbox.update_network(allow_public_traffic=...)",
+                          "set it on create; open private previews with sandbox.kosa8.previews.create(port)")
+    p = _egress("Sandbox.update_network", n)
+    if internet is False:
+        p["internet"] = False
+    if p["internet"]:
+        box.set_egress(internet=True, allow=[], deny=p.get("deny", []))
+    else:
+        box.set_egress(internet=False, allow=p.get("allow", []), deny=p.get("deny", []))
 
 
 def _pause(box: CloudSandbox, keep_memory: Optional[bool], mode: Any) -> bool:

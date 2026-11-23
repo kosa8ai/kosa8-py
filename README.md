@@ -1,5 +1,11 @@
 # kosa8 for Python
 
+> **Switching from E2B / Daytona / Modal? Change one import.**
+> `from e2b import Sandbox` → `from kosa8.compat.e2b import Sandbox` (or `kosa8.compat.daytona`,
+> `kosa8.compat.modal`). Your `E2B_API_KEY` / `DAYTONA_API_KEY` can hold the kosa8 key. Switching
+> back is the same line. Guide and pass rates: **https://kosa8.com/switch/** ·
+> [what maps](#switching-from-e2b-daytona-or-modal) · [compat results](docs/compat-results.md)
+
 Python client for [kosa8](https://kosa8.com): microVM sandboxes for AI agents, with
 checkpoint, rewind, fork and explore. The counterpart of
 [`@kosa8/sdk`](https://www.npmjs.com/package/@kosa8/sdk), method for method.
@@ -13,7 +19,8 @@ pip install kosa8
 
 ## Quickstart: kosa8 Cloud
 
-Make an API key in the dashboard (https://app.kosa8.com) and set `KOSA8_API_KEY`.
+Sign up free at https://app.kosa8.com (the Starter tier, no card), make an API key, and set
+`KOSA8_API_KEY`. That is all you need to run the code below.
 
 ```python
 from kosa8 import Kosa8Cloud
@@ -499,7 +506,10 @@ client.create_sandbox(name="scratch", ephemeral=True, auto_stop_min=15)
 
 ## Switching from E2B, Daytona or Modal
 
-Change one import; the rest of your code stays. Set `KOSA8_API_KEY` (a `k8c_live_` key):
+Change one import; the rest of your code stays. The key is a kosa8 key (`k8c_live_...`) in
+`KOSA8_API_KEY`, or in the variable you already use: `E2B_API_KEY` / `DAYTONA_API_KEY` are read when
+they hold a kosa8 key (another provider's key there is never sent to kosa8). With E2B,
+`E2B_DOMAIN=kosa8.com` also works.
 
 ```python
 from kosa8.compat.e2b import Sandbox                    # was: from e2b import Sandbox
@@ -507,59 +517,76 @@ from kosa8.compat.e2b_code_interpreter import Sandbox   # was: from e2b_code_int
 from kosa8.compat.daytona import Daytona, CreateSandboxFromImageParams   # was: from daytona import ...
 import kosa8.compat.modal as modal                      # was: import modal
 
-sbx = Sandbox.create(timeout=600)                       # kosa8's python template, like E2B's default image
-print(sbx.commands.run("echo hi").stdout)
-sbx.files.write("app.py", "print(6 * 7)")               # relative paths go under /workspace
-print(sbx.commands.run("python3 /workspace/app.py").stdout)   # 42
+sbx = Sandbox.create(timeout=600)                       # Debian + Python 3, like E2B's default image
+sbx.commands.run("pip install -q requests")             # persistent: installed packages stay
+sbx.commands.run("python3 -m http.server 8000", background=True)
+print(f"https://{sbx.get_host(8000)}")                  # a public preview URL, as in E2B
+sbx.update_network({"allow_out": ["pypi.org"], "deny_out": ["0.0.0.0/0"]})   # kosa8 egress
+sbx.commands.run("sleep 120 && echo done", timeout=180, on_stdout=print)   # streams; no 90 s cap
 sbx.kill()
 
 from kosa8.compat.e2b_code_interpreter import Sandbox as CodeSandbox
-with CodeSandbox.create() as nb:                         # persistent: the interpreter keeps Python running
+with CodeSandbox.create() as nb:
     nb.run_code("x = 6 * 7")
     print(nb.run_code("x").text)                         # 42
 ```
 
-The E2B shims start kosa8's `python` template when you give no template (or E2B's `base`), since
-E2B's default image has Python and kosa8's `base` is Alpine without it. The code-interpreter
-`Sandbox` is created `persistent`, which `run_code` needs; it counts against your plan's
-persistent-sandbox limit.
+**Same machine model as theirs.** Shim sandboxes are created `persistent`: one long-lived machine,
+so installed packages, files anywhere, and background processes last between commands, as on
+E2B, Daytona and Modal (each command is still its own process, so `cd` and `export` do not carry,
+as in E2B). In the E2B shim, relative paths and commands start in E2B's home, `/home/user`. A plan
+with no persistent sandboxes left gets a plain one with a warning (then only `/workspace` lasts, and
+relative paths and commands start there); `KOSA8_SHIM_PERSISTENT=0` skips the attempt. With no template you get kosa8's
+`python` template (Debian, Python 3.12), as E2B's and Modal's defaults have Python.
+
+**Output streams, with no 90 s cap.** Every foreground command is a streamed exec: E2B
+`commands.run` (its `timeout`, 60 s by default, 0 for none, is applied in the sandbox), Daytona
+`process.exec` / `code_run` / session commands, Modal `sandbox.exec`. `on_stdout` / `on_stderr` are
+called as the command prints. A background command (E2B `background=True`, a Modal entrypoint) is
+polled about once a second, stdout and stderr together.
+
+**Ports and network.** E2B `get_host(port)`, Daytona `get_preview_link(port)` (public when the
+sandbox is `public`) and Modal `tunnels()` (for `encrypted_ports`) open kosa8 previews. E2B
+`network={"allow_out": ..., "deny_out": ...}` and `update_network`, Daytona `network_allow_list` /
+`domain_allow_list` / `network_block_all` / `update_network_settings`, and Modal
+`outbound_cidr_allowlist` / `outbound_domain_allowlist` / `block_network` set kosa8 egress.
 
 | Shim (mirrors) | What maps onto kosa8 Cloud |
 |---|---|
-| `kosa8.compat.e2b` (`e2b` 2.64.0, `e2b-code-interpreter` 2.11.10) | `Sandbox.create`, `connect`, `kill`, `set_timeout`, `get_info`, `is_running`, `pause`, `fork`, `create_snapshot` / `list_snapshots` / `delete_snapshot`, `Sandbox.list`, `download_url`; `commands.run` (foreground and `background=True`), `connect`, `kill`; `files.read` / `write` / `write_files` / `list` / `exists` / `get_info` / `remove` / `rename` / `make_dir`; `run_code` and code contexts (Python) |
-| `kosa8.compat.daytona` (`daytona` 2.1.0) | `Daytona().create` (snapshot / image params, `Resources`), `get`, `list`, `delete`, `start`, `stop`; `sandbox.process.exec` / `code_run`; sessions (`create_session`, `execute_session_command` with `run_async`, `get_session_command`, `get_session_command_logs`, `get_session_command_logs_async`, `get_session`, `list_sessions`, `delete_session`); `sandbox.fs` upload / download / list / info / folders / permissions / move / delete; `sandbox.fork`, `create_snapshot`, `set_labels`, `set_autostop_interval`, `set_ttl`, `get_preview_link`; `daytona.snapshot.list` / `get` / `delete` |
-| `kosa8.compat.modal` (`modal` 1.6.4) | `App.lookup`, `Image.from_registry` / `debian_slim` / `from_id`, `Secret.from_dict` / `from_name`; `Sandbox.create(*entrypoint, ...)`, `exec`, `wait`, `poll`, `returncode`, `terminate`, `stdout` / `stderr` reading, `snapshot_filesystem`, `from_id`, `from_name`, `list`, `set_tags` / `get_tags`; `sandbox.filesystem` read / write / list / stat / make_directory / remove / copy |
+| `kosa8.compat.e2b` (`e2b` 2.64.0, `e2b-code-interpreter` 2.11.10) | `Sandbox.create` (incl. `network`), `connect`, `kill`, `set_timeout`, `get_info`, `is_running`, `pause`, `fork`, `create_snapshot` / `list_snapshots` / `delete_snapshot`, `Sandbox.list`, `download_url`, `get_host`, `update_network`; `commands.run` (foreground and `background=True`), `connect`, `kill`; `files.read` / `write` / `write_files` / `list` / `exists` / `get_info` / `remove` / `rename` / `make_dir`; `run_code` and code contexts (Python) |
+| `kosa8.compat.daytona` (`daytona` 2.1.0) | `Daytona().create` (snapshot / image params, `Resources`, `public`, network lists), `get`, `list` (labels, states, sort, limit), `delete`, `start`, `stop`; `sandbox.process.exec` / `code_run`; sessions (`create_session`, `execute_session_command` with `run_async`, `get_session_command`, `get_session_command_logs`, `get_session_command_logs_async`, `get_session`, `list_sessions`, `delete_session`); `sandbox.fs` upload / download / list / info / folders / permissions / move / delete; `sandbox.fork`, `create_snapshot`, `set_labels`, `set_autostop_interval`, `set_auto_archive_interval`, `set_ttl`, `get_preview_link`, `set_public`, `update_network_settings`; `daytona.snapshot.list` / `get` / `delete` |
+| `kosa8.compat.modal` (`modal` 1.6.4) | `App.lookup`, `Image.from_registry` / `debian_slim` / `from_id`, `Secret.from_dict` / `from_name`; `Sandbox.create(*entrypoint, ...)` (incl. `encrypted_ports`, outbound allowlists), `exec`, `wait`, `poll`, `returncode`, `terminate`, `tunnels`, `stdout` / `stderr` reading, `snapshot_filesystem`, `from_id`, `from_name`, `list`, `set_tags` / `get_tags`; `sandbox.filesystem` read / write / list / stat / make_directory / remove / copy |
 
 What kosa8 cannot do raises `kosa8.compat.Unsupported`, naming the method and the kosa8 way to do it
 (for example Modal's `Image.pip_install`: kosa8 boots images, it does not build them). A shim never
 pretends a call worked. Errors come back as the other SDK's exceptions (`e2b.TimeoutException`,
 `DaytonaNotFoundError`, `modal.exception.NotFoundError`), with the kosa8 error as `__cause__`.
-Every shim object has `.kosa8`, the `CloudSandbox` underneath, for anything else.
+Every shim object has `.kosa8`, the `CloudSandbox` underneath, for anything else. Not mirrored: stdin,
+PTY, GPU, volumes, image builds, and the async variants (`AsyncSandbox`, `AsyncDaytona`, `.aio`).
+`kosa8.compat.set_default_cloud(Kosa8Cloud(...))` points every shim at one client.
 
-How kosa8 differs, whichever shim you use: only `/workspace` is sure to outlive a command (unless
-the sandbox is persistent). Output streams where the other SDK streams it, as a streamed exec that
-is not held to 90 s: E2B `commands.run(..., on_stdout=, on_stderr=)` or with a `timeout` over 90 s
-(or 0), Modal `sandbox.exec(...)` (iterate `process.stdout` for lines as they print), and Daytona
-session commands (`get_session_command_logs_async`) or `process.exec(timeout=)` over 90 s. A plain
-foreground command (no callbacks, no long timeout) is buffered: it runs at most 90 s and its output
-arrives when it ends. A background command (E2B `background=True`, a Modal entrypoint) is polled
-about once a second and its new output passed on as it appears, stdout and stderr together (a
-Modal entrypoint's stderr is kept apart in a file). Daytona session commands each run in a fresh
-container, so `cd` and `export` do not carry between them. No stdin, PTY, GPU, volumes or image builds. Async variants (`AsyncSandbox`,
-`AsyncDaytona`, `.aio`) are not mirrored. `kosa8.compat.set_default_cloud(Kosa8Cloud(...))` points
-every shim at one client.
+**Fallback to the original provider (opt-in).** Set `KOSA8_FALLBACK=e2b` (or `daytona`, `modal`, a
+comma list, or `all`) and a *create* that kosa8 cannot do (an `Unsupported` option such as E2B
+`mcp=` or Daytona `volumes=`) runs on the original provider instead, through its own SDK and its own
+key (`E2B_API_KEY`, `DAYTONA_API_KEY`, a Modal token), with a warning; you get that SDK's own sandbox
+object back. Without the SDK or its key, the `Unsupported` error stands. A sandbox already on kosa8
+stays there: calls on it that kosa8 cannot do still raise.
+
+**How well it works, measured.** `compat_suite/run.py` runs E2B's own Python SDK test suite and
+Daytona's and Modal's own sandbox examples, unmodified, against the shims on kosa8 Cloud, and
+writes [docs/compat-results.md](docs/compat-results.md) (pass, unsupported, fail, per test).
 
 **Which path to use.** kosa8 Cloud also answers E2B's own HTTP API at `https://api.kosa8.com/e2b`
 (the server side, `workers/cloud-api/src/e2b.js` in the kosa8 repo). Use that when you cannot change
-code at all, or the code is not Python: keep the official `e2b` SDK (any language) and set
+code at all, or the code is not Python: keep the official `e2b` SDK and set
 `E2B_API_KEY=k8c_live_...`, `E2B_API_URL=https://api.kosa8.com/e2b` and
-`E2B_SANDBOX_URL=https://api.kosa8.com/e2b/envd`. It covers create, list, get, kill, set_timeout,
-pause, connect, `files.read` / `write` and `commands.run`; fork, snapshots, `files.list`, metrics,
-PTY and stdin answer 501, and env vars, metadata and `cpu_count` on create are refused. Use
-`kosa8.compat.e2b` when you can change one import: it reaches more (env and metadata on create,
-fork, snapshots, `files.list` / `exists` / `get_info` / `remove`, background commands, the code
-interpreter) and names the kosa8 alternative when something is missing. Daytona and Modal have
-only the Python shims. For new code, use `Kosa8Cloud` directly.
+`E2B_SANDBOX_URL=https://api.kosa8.com/e2b/envd` (pin `e2b<3`: E2B plans to drop `E2B_API_URL`). It
+covers create (with `network` allow/deny lists), list, get, kill, set_timeout, pause, connect,
+`update_network`, `files.read` / `write` and `commands.run`; fork, snapshots, `files.list`,
+metrics, PTY, stdin and `get_host` (E2B builds that host itself) do not work there. Use
+`kosa8.compat.e2b` when you can change one import: it reaches much more and names the kosa8
+alternative when something is missing. TypeScript users: `@kosa8/sdk/e2b`, `/daytona`, `/modal`
+and `/vercel`. For new code, use `Kosa8Cloud` directly.
 
 ## Agent frameworks
 
@@ -637,6 +664,13 @@ approval: repeat the call with `approval=<id>`), `Kosa8NotFoundError` (404),
 
 ```sh
 PYTHONPATH=src:tests python3 -m unittest discover -s tests
+```
+
+The compat pass rate (live, makes and deletes real sandboxes; see `compat_suite/run.py` for the
+pip installs it needs):
+
+```sh
+KOSA8_API_KEY=k8c_live_... python3 compat_suite/run.py    # writes docs/compat-results.md
 ```
 
 ## License

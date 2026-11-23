@@ -69,10 +69,12 @@ from ..errors import (
     Kosa8NotFoundError,
     Kosa8TimeoutError,
 )
-from . import StreamPump, Unsupported, abs_path, get_cloud, given, in_dir, poll_output, stat_entry, translating
+from . import (
+    StreamPump, Unsupported, abs_path, create_sandbox, fallback, fit_size, get_cloud, given, in_dir, poll_output, stat_entry, translating,
+)
 
 __all__ = [
-    "App", "Image", "Secret", "Sandbox", "ContainerProcess", "StreamReader", "StreamWriter", "StreamType",
+    "App", "Image", "Secret", "Sandbox", "Tunnel", "ContainerProcess", "StreamReader", "StreamWriter", "StreamType",
     "FileInfo", "exception", "Unsupported",
 ]
 
@@ -488,14 +490,9 @@ _CREATE_REFUSED = (
     ("volumes", "keep data in /workspace, or snapshot_filesystem() and start from it"),
     ("network_file_systems", "keep data in /workspace"),
     ("pty", "sandbox.kosa8.terminal() gives a wss:// terminal URL"),
-    ("encrypted_ports", "sandbox.kosa8.previews.create(port) gives an https URL"),
-    ("h2_ports", "sandbox.kosa8.previews.create(port)"),
-    ("unencrypted_ports", "sandbox.kosa8.previews.create(port)"),
+    ("unencrypted_ports", "encrypted_ports=[port] and sandbox.tunnels() (kosa8 previews are HTTPS only, no raw TCP)"),
     ("custom_domain", "sandbox.kosa8.previews.create(port)"),
     ("proxy", "set HTTPS_PROXY in env"),
-    ("outbound_cidr_allowlist", "sandbox.kosa8.set_egress(allow=[...]) after create"),
-    ("outbound_domain_allowlist", "sandbox.kosa8.set_egress(allow=[...]) after create"),
-    ("cidr_allowlist", "sandbox.kosa8.set_egress(allow=[...]) after create"),
     ("inbound_cidr_allowlist", "private previews (signed links): sandbox.kosa8.previews.create(port)"),
     ("readiness_probe", "poll sandbox.exec(...) until your check passes"),
     ("include_oidc_identity_token", "org secrets via Secret.from_name"),
@@ -507,12 +504,63 @@ _CREATE_REFUSED = (
 )
 
 
+@dataclass(frozen=True)
+class Tunnel:
+    """``modal.Tunnel``: a port at an HTTPS host (no raw TCP on kosa8)."""
+
+    host: str
+    port: int = 443
+    unencrypted_host: str = ""
+    unencrypted_port: int = 0
+
+    @property
+    def url(self) -> str:
+        return f"https://{self.host}" + ("" if self.port == 443 else f":{self.port}")
+
+    @property
+    def tls_socket(self) -> tuple:
+        return (self.host, self.port)
+
+    @property
+    def tcp_socket(self) -> tuple:
+        raise InvalidError("kosa8 tunnels are HTTPS only (no unencrypted TCP)")
+
+
+def _modal_token() -> bool:
+    import modal  # noqa: F401  (the original SDK)
+
+    return bool(os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET")) or \
+        os.path.exists(os.path.expanduser(os.environ.get("MODAL_CONFIG_PATH", "~/.modal.toml")))
+
+
+def _real_modal_create(args: Sequence[str], kw: Dict[str, Any]) -> Any:
+    """The same ``Sandbox.create`` on Modal's own SDK (``KOSA8_FALLBACK=modal``)."""
+    import modal as real
+
+    kw = dict(kw)
+    kw.pop("api_key", None)
+    app = kw.get("app")
+    kw["app"] = real.App.lookup(app.name if app is not None and app.name else "kosa8-fallback", create_if_missing=True)
+    img = kw.get("image")
+    if img is not None:
+        if img.snapshot or img.template:
+            raise Unsupported("KOSA8_FALLBACK=modal with a kosa8 snapshot or template image",
+                              "Image.from_registry('registry/name:tag') works on both")
+        kw["image"] = real.Image.from_registry(img.ref)
+    secrets = kw.get("secrets")
+    if secrets:
+        kw["secrets"] = [real.Secret.from_name(s.name) if s.name else real.Secret.from_dict(dict(s.env or {})) for s in secrets]
+    return real.Sandbox.create(*args, **kw)
+
+
 class Sandbox:
     """``modal.Sandbox``. ``sandbox.kosa8`` is the :class:`kosa8.CloudSandbox` underneath."""
 
     def __init__(self, box: CloudSandbox, *, entry: Optional[CloudBackgroundExec] = None, entry_err: Optional[str] = None,
-                 workdir: Optional[str] = None) -> None:
+                 workdir: Optional[str] = None, ports: Sequence[int] = ()) -> None:
         self.kosa8 = box
+        self._ports = [int(p) for p in ports]
+        self._tunnels: Dict[int, Tunnel] = {}
         self._entry = entry
         self._entry_err = entry_err
         self._workdir = workdir
@@ -530,8 +578,19 @@ class Sandbox:
         return self.kosa8.id
 
     @staticmethod
+    def create(*args: str, **kw: Any) -> "Sandbox":
+        """Start a sandbox; see :meth:`_create` for how each argument maps.
+        With ``KOSA8_FALLBACK=modal`` (the ``modal`` package installed and a
+        Modal token set up), a create kosa8 cannot do runs on Modal instead
+        (its ``image`` must then be ``Image.from_registry`` or the default)."""
+        try:
+            return Sandbox._create(*args, **kw)
+        except Unsupported as e:
+            return fallback("modal", e, _modal_token, lambda: _real_modal_create(args, kw))
+
+    @staticmethod
     @_md
-    def create(
+    def _create(
         *args: str,
         app: Optional[App] = None,
         name: Optional[str] = None,
@@ -546,6 +605,11 @@ class Sandbox:
         cpu: Optional[Union[float, tuple]] = None,
         memory: Optional[Union[int, tuple]] = None,
         block_network: bool = False,
+        encrypted_ports: Sequence[int] = (),
+        h2_ports: Sequence[int] = (),
+        outbound_cidr_allowlist: Optional[Sequence[str]] = None,
+        outbound_domain_allowlist: Optional[Sequence[str]] = None,
+        cidr_allowlist: Optional[Sequence[str]] = None,
         verbose: bool = False,
         client: Any = None,
         environment_name: Optional[str] = None,
@@ -588,9 +652,13 @@ class Sandbox:
         if cpu is not None:
             c = cpu[1] if isinstance(cpu, tuple) else cpu
             m = memory[1] if isinstance(memory, tuple) else memory
-            body["cpus"] = max(int(-(-float(c) // 1)), 1)
-            body["mem_mb"] = int(m)
-        if block_network:
+            body["cpus"], body["mem_mb"] = fit_size(float(c), int(m))
+        allow = [*(outbound_cidr_allowlist or ()), *(cidr_allowlist or ()), *(outbound_domain_allowlist or ())]
+        if block_network and allow:
+            raise InvalidError("block_network=True cannot be combined with an outbound allowlist")
+        if allow:
+            body["egress"] = {"internet": False, "allow": [str(a) for a in allow]}
+        elif block_network:
             body["egress"] = {"internet": False}
         if region:
             if not isinstance(region, str):
@@ -603,13 +671,13 @@ class Sandbox:
         labels = dict(tags or {})
         if app is not None and app.name:
             labels["modal-app"] = app.name
-        box = get_cloud(api_key).sandboxes.create(labels=labels or None, **body)
+        box = create_sandbox(get_cloud(api_key), labels=labels, **body)
         entry = entry_err = None
         if args:
             entry_err = f"{_ENTRY_DIR}/{_secrets.token_hex(6)}.stderr"
             argv = ["sh", "-c", 'mkdir -p "${0%/*}" && exec "$@" 2>"$0"', entry_err, *args]
             entry = box.exec_background(in_dir(argv, workdir))
-        return Sandbox(box, entry=entry, entry_err=entry_err, workdir=workdir)
+        return Sandbox(box, entry=entry, entry_err=entry_err, workdir=workdir, ports=[*encrypted_ports, *h2_ports])
 
     @staticmethod
     @_md
@@ -769,6 +837,15 @@ class Sandbox:
         return Image(snapshot=s["id"])
 
     @_md
+    def tunnels(self, timeout: int = 50, *, client: Any = None) -> Dict[int, "Tunnel"]:
+        """The ports given as ``encrypted_ports`` / ``h2_ports``, each at a
+        public kosa8 preview (``tunnel.url`` is ``https://host``)."""
+        for p in self._ports:
+            if p not in self._tunnels:
+                self._tunnels[p] = Tunnel(host=self.kosa8.previews.create(p, public=True)["host"], port=443)
+        return dict(self._tunnels)
+
+    @_md
     def set_tags(self, tags: Dict[str, str], *, client: Any = None) -> None:
         keep = {k: v for k, v in (self.kosa8.info.get("labels") or {}).items() if k == "modal-app"}
         self.kosa8.set_labels({**keep, **tags})
@@ -786,7 +863,6 @@ class Sandbox:
         nope.__name__ = name
         return nope
 
-    tunnels = _refuse("tunnels", "sandbox.kosa8.previews.create(port)['url'] for each port")
     create_connect_token = _refuse("create_connect_token", "sandbox.kosa8.previews.create(port) (a signed private link)")
     wait_until_ready = _refuse("wait_until_ready", "poll sandbox.exec(...) until your readiness check passes")
     snapshot_directory = _refuse("snapshot_directory", "snapshot_filesystem() (the whole sandbox)")
