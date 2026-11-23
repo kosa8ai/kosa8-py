@@ -22,8 +22,10 @@ container. The ``base`` template is Alpine Linux
 (command and env) is at most 64 KiB.
 
 The calls that make sandboxes (create, create_many, fork, grade) send an
-``Idempotency-Key`` that their retries reuse, so a retry after a timeout or a
-5xx gets the first answer instead of a second fleet.
+``Idempotency-Key``. Their retries reuse it after no answer (a timeout or a
+dropped connection), so a retry gets the first answer instead of a second
+fleet; after a 5xx the SDK's own key is replaced, so that retry is a new
+attempt. A key you pass is never changed.
 
 Standard library only, like the rest of the SDK.
 """
@@ -821,11 +823,14 @@ class Kosa8Cloud:
         """One call, retried as :attr:`retry` allows. ``body`` is sent as JSON
         and ``data`` as raw bytes; with ``raw`` a successful answer's bytes are
         returned as they came. A call that makes sandboxes (:func:`keyed_route`)
-        sends ``idempotency_key`` (a new UUID when not given), the same on every
-        retry, so it may be retried after a timeout or a 5xx too."""
+        sends ``idempotency_key`` (a new UUID when not given), so it may be
+        retried after a timeout or a 5xx too. A given key is sent unchanged on
+        every retry; the SDK's own is kept after no answer, a 429 or a 409 and
+        replaced after a 5xx (:func:`renews_idempotency_key`)."""
         extra = _idem_headers(method, path, idempotency_key)
         policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
-        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy)
+        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy,
+                               on_retry=_key_renewer(extra, idempotency_key))
 
     def _headers_payload(self, body: Any, data: Optional[bytes], raw: bool,
                          extra: Optional[Mapping[str, str]] = None) -> "tuple[Dict[str, str], Optional[bytes]]":
@@ -863,12 +868,15 @@ class Kosa8Cloud:
 
 
     def _stream(self, method: str, path: str, body: Any,
-                extra: Optional[Mapping[str, str]] = None) -> Iterator[bytes]:
+                extra: Optional[Dict[str, str]] = None, *, own_key: bool = False) -> Iterator[bytes]:
         """Open a streamed answer and return its lines as they arrive. A refusal
         before the stream starts raises the usual typed error (a 429 is retried
-        as :attr:`retry` allows); nothing is retried once lines flow."""
+        as :attr:`retry` allows); nothing is retried once lines flow. With
+        ``own_key`` the Idempotency-Key in ``extra`` is the SDK's, renewed
+        after a 5xx."""
         policy = _ScopedRetry(self.retry, method, path)
-        return call_with_retry(lambda: self._stream_once(method, path, body, extra), policy)
+        renew = _key_renewer(extra or {}, None) if own_key else None
+        return call_with_retry(lambda: self._stream_once(method, path, body, extra), policy, on_retry=renew)
 
     def _stream_once(self, method: str, path: str, body: Any,
                      extra: Optional[Mapping[str, str]] = None) -> Iterator[bytes]:
@@ -912,6 +920,31 @@ def _idem_headers(method: str, path: str, key: Optional[str]) -> Dict[str, str]:
     if key is None and not keyed_route(method, path):
         return {}
     return {"Idempotency-Key": key or new_idempotency_key()}
+
+
+def renews_idempotency_key(exc: BaseException) -> bool:
+    """Whether a retry after ``exc`` gets a new SDK-made Idempotency-Key: only
+    when kosa8 Cloud answered with a 5xx (502 ``host_failed``, 503
+    ``no_capacity``, ...), so each retry of a server-side failure is a new
+    attempt. No answer (a timeout or a dropped connection: the first try may
+    still be running and may have made the sandbox), a 429 and a 409
+    (``idempotency_in_progress``, ``template_building``) keep the key."""
+    status = getattr(exc, "status", None)
+    return isinstance(exc, Kosa8Error) and isinstance(status, int) and status >= 500
+
+
+def _key_renewer(extra: Dict[str, str], given: Optional[str]) -> Optional[Callable[[BaseException, int, float], None]]:
+    """An ``on_retry`` that replaces the SDK's own key in ``extra`` after a
+    5xx; ``None`` when there is no key or the caller gave it (theirs is never
+    changed)."""
+    if given is not None or "Idempotency-Key" not in extra:
+        return None
+
+    def renew(exc: BaseException, _attempt: int, _wait: float) -> None:
+        if renews_idempotency_key(exc):
+            extra["Idempotency-Key"] = new_idempotency_key()
+
+    return renew
 
 
 def _parse_answer(answer: Any, method: str, path: str, raw: bool) -> Any:
@@ -1186,8 +1219,10 @@ class CloudSandboxes:
         which the person agreed to.
 
         ``idempotency_key`` (default a new UUID) is sent as the
-        ``Idempotency-Key`` header and reused on every retry, so a create that
-        timed out or met a 5xx is retried without making a second sandbox.
+        ``Idempotency-Key`` header. The default is reused on a retry after a
+        timeout, a dropped connection, a 429 or a 409, so a retried create
+        never makes a second sandbox, and replaced after a 5xx, so that retry
+        is a new attempt. A key you pass is sent unchanged on every retry.
         Pass your own to make a create safe to repeat across processes (kosa8
         Cloud keeps the answer 24 hours; the same key with another body is
         ``422 idempotency_mismatch``).
@@ -1802,7 +1837,7 @@ class CloudSandbox:
         answer, raised as the usual typed error when it is one. An API that
         does not stream answers plain JSON, which is returned as it is."""
         path = self._path("/fork")
-        lines = self._cloud._stream("POST", path, body, extra=_idem_headers("POST", path, key))
+        lines = self._cloud._stream("POST", path, body, extra=_idem_headers("POST", path, key), own_key=key is None)
         for line in lines:
             line = line.strip()
             if not line:
@@ -1850,8 +1885,9 @@ class CloudSandbox:
         ``files``: at most 64, adding up to 8 MiB before base64 (a
         ``ValueError`` here otherwise). ``timeout_s``: 1 to 90 whole seconds.
         The call carries an ``Idempotency-Key`` (``idempotency_key``, default
-        a new UUID) that its retries reuse: a retry after a timeout or a 5xx
-        gets the first grade's answer, and records nothing twice.
+        a new UUID) that its retries reuse after a timeout: such a retry gets
+        the first grade's answer, and records nothing twice. After a 5xx the
+        default key is replaced (a new attempt); yours is never changed.
         """
         amb = _ambient(self._cloud)
         run_id = amb.get("run_id") if run_id is None else run_id

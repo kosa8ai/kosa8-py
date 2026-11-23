@@ -389,11 +389,15 @@ The sealed grader's 90 s cap stays for now: split a long test suite into
 several grades (`swebench.grade` raises `GradeTooLong` with that advice).
 Longer grading comes with the upcoming kosa8 Jobs API.
 
-**Safe retries.** Creates, batches, forks and grades send an
-`Idempotency-Key` (a new UUID, or `idempotency_key=` yours) that every retry
-reuses; kosa8 Cloud keeps the answer for 24 hours and replays it. So the SDK
-retries those calls after a timeout or a 5xx too, and a retried grade records
-its rollout once. The same key with another body is `422
+**Safe retries.** Creates, batches, forks, grades and job submits send an
+`Idempotency-Key` (a new UUID, or `idempotency_key=` yours); kosa8 Cloud keeps
+a settled answer for 24 hours and replays it. So the SDK retries those calls
+after a timeout or a 5xx too, and a retried grade records its rollout once.
+The SDK's own key is kept after no answer (a timeout or a dropped connection:
+the first try may still be running and may have made the sandbox), a 429 and
+a 409; after a 5xx (502 `host_failed`, 503 `no_capacity`, ...) the retry gets
+a new key, so it is a new attempt, never tied to the failed one. A key you
+pass is never changed. The same key with another body is `422
 idempotency_mismatch`; a duplicate that arrives while the first is still
 running waits for it, or gets `409 idempotency_in_progress`, which the SDK
 retries. A grade given a run (inside `Run`, or `run_id=`) is recorded by kosa8
