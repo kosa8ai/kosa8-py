@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-11-23
 
 - Retries of creates, batches, forks, grades, rollouts and job submits use a new SDK-made `Idempotency-Key` after a 5xx (502 `host_failed`, 503 `no_capacity` / `host_restarting` / `host_unavailable`, 504), so each retry of a server-side failure is a new attempt. The key is still kept after no answer (the first try may have created the sandbox), a 429 and a 409 `idempotency_in_progress` / `template_building`. A key you pass as `idempotency_key` is never changed. Retry-After is honoured as before. `kosa8.cloud.renews_idempotency_key(exc)` says which failures renew it.
 - verifiers runtime (`kosa8.rl.verifiers.Kosa8Backend`) declares user switching (`su` to the bound user, files `chown`-ed), port exposure (`expose(port)` is a public kosa8 preview; servers bind 8000), network policies (the config is a `NetworkPolicyConfig`; `prepare_execution` applies `allow`/`block` with the sandbox's egress API) and stop confirmation. Commands are streamed execs (no 90 s cap) in a persistent sandbox (`persistent = false` to opt out), with real `kill`/`terminate`; the default image is the `python` template; `run_background` is a detached background exec. Input written before a process's output is read becomes its stdin; interactive stdin is refused. verifiers' own `tests/unit/test_runtimes.py --runtime` passes 22/22 against api.kosa8.com (verifiers 96f0707, 2026-11-23).
