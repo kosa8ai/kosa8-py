@@ -7,9 +7,17 @@ public reference https://www.daytona.io/docs/en/python-sdk/ (``sync/daytona``,
 ``sync/sandbox``, ``sync/process``, ``sync/file-system``, ``sync/snapshot``,
 ``common/errors``; checked 2026-11-21). ``AsyncDaytona`` is not mirrored.
 
-The key is a kosa8 Cloud key: ``DaytonaConfig(api_key="k8c_live_...")`` or
-``KOSA8_API_KEY``. ``DAYTONA_API_KEY`` is not read, and an ``api_url`` that is
-not kosa8's is refused, so the kosa8 key never goes to another provider.
+The key is a kosa8 Cloud key: ``DaytonaConfig(api_key="k8c_live_...")``,
+``KOSA8_API_KEY``, or ``DAYTONA_API_KEY`` when it holds a kosa8 key (a
+Daytona key there is left alone). An ``api_url`` that is not kosa8's is
+refused, so the kosa8 key never goes to another provider.
+
+Sandboxes are persistent (one long-lived machine, as on Daytona), so
+installed packages, files outside /workspace and background processes last
+between commands; ``KOSA8_SHIM_PERSISTENT=0`` turns that off, and a plan
+with no persistent sandboxes left gets a plain one, with a warning.
+``KOSA8_FALLBACK=daytona`` (with the ``daytona`` package and a Daytona key in
+``DAYTONA_API_KEY``) runs a create kosa8 cannot do on Daytona instead.
 
 What maps, and how:
 
@@ -25,12 +33,15 @@ Daytona                             kosa8 Cloud
                                     ``auto_pause_interval`` (minutes) sleep
                                     after idle, ``ttl_minutes`` ttl_s,
                                     ``network_block_all`` no internet,
+                                    ``network_allow_list`` /
+                                    ``domain_allow_list`` an allow-list,
+                                    ``public`` public previews,
                                     ``target`` region
 ``get`` / ``list`` / ``delete``     get (by id or name) / list / delete
 ``start`` / ``stop`` / ``pause``    wake / sleep / sleep
-``sandbox.process.exec``            exec (``sh -c``; ``cwd`` relative to
-                                    /workspace); streamed when ``timeout``
-                                    is over 90 s
+``sandbox.process.exec``            a streamed exec (``sh -c``; ``cwd``
+                                    relative to /workspace), not held to
+                                    kosa8's 90 s for a buffered one
 ``process.*session*``               each command a streamed exec: logs
                                     arrive as it prints
                                     (``get_session_command_logs_async``),
@@ -47,9 +58,8 @@ delete``
 Daytona snapshots are images you build; kosa8 snapshots are saved sandboxes
 (memory and disk). ``daytona.snapshot.create`` (an image build) raises
 :class:`kosa8.compat.Unsupported`, as does anything else kosa8 cannot do.
-Only ``/workspace`` outlives a command. A buffered exec (``process.exec``
-with no ``timeout`` over 90 s) runs at most 90 s; session commands and a
-``timeout`` over 90 s are streamed and are not held to it.
+``get_preview_link`` is a public preview when the sandbox is public, else a
+signed private link; ``update_network_settings`` sets kosa8 egress.
 """
 
 from __future__ import annotations
@@ -61,7 +71,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
-from ..cloud import EXEC_LIMIT_S, CloudSandbox, Kosa8Cloud
+from ..cloud import CloudSandbox, Kosa8Cloud
 from ..errors import (
     Kosa8AuthError,
     Kosa8BadRequestError,
@@ -74,7 +84,10 @@ from ..errors import (
     Kosa8RateLimitError,
     Kosa8TimeoutError,
 )
-from . import StreamPump, Unsupported, abs_path, check_url, get_cloud, given, in_dir, stat_entry, translating
+from . import (
+    StreamPump, Unsupported, abs_path, check_url, create_sandbox, fallback, fit_size, foreign_key, get_cloud, given, in_dir,
+    stat_entry, translating,
+)
 
 __all__ = [
     "Daytona", "DaytonaConfig", "CreateSandboxFromSnapshotParams", "CreateSandboxFromImageParams", "Resources",
@@ -239,6 +252,11 @@ class ListSandboxesQuery:
     name: Optional[str] = None
     labels: Optional[Dict[str, str]] = None
     states: Optional[List[str]] = None
+    #: ``createdAt`` / ``name`` / ``updatedAt`` (Daytona's ``SandboxListSortField``)
+    sort: Any = None
+    #: ``asc`` / ``desc`` (Daytona's ``SandboxListSortDirection``)
+    order: Any = None
+    page: Optional[int] = None
 
 
 @dataclass
@@ -414,12 +432,11 @@ class Process:
         and a non-zero exit is returned, not raised, as in Daytona.
         ``timeout`` is applied with ``timeout(1)`` in the sandbox; over 90 s,
         the command runs as a streamed exec, which is not held to kosa8's
-        90 s for a buffered one. With no ``timeout`` it is buffered (90 s at
-        most); for longer work without a bound, use a session command."""
+        90 s for a buffered one, with or without ``timeout``."""
         argv = ["sh", "-c", command]
         if timeout:
             argv = ["timeout", str(int(timeout)), *argv]
-        return self._run(in_dir(argv, cwd), env, stream=bool(timeout and timeout > EXEC_LIMIT_S))
+        return self._run(in_dir(argv, cwd), env, stream=True)
 
     def _run(self, argv: List[str], env: Optional[Mapping[str, str]], stream: bool = False) -> ExecuteResponse:
         r = self._sb.kosa8.exec(argv, env=env, stream=stream or None)
@@ -444,7 +461,7 @@ class Process:
             argv += (["--"] if lang == CodeLanguage.JAVASCRIPT else []) + list(params.argv)
         if timeout:
             argv = ["timeout", str(int(timeout)), *argv]
-        return self._run(argv, params.env if params is not None else None, stream=bool(timeout and timeout > EXEC_LIMIT_S))
+        return self._run(argv, params.env if params is not None else None, stream=True)
 
     # sessions: each command is a streamed exec, so its logs arrive as it
     # prints and it is not held to 90 s. kosa8 runs every command in a fresh
@@ -664,9 +681,11 @@ class FileSystem:
 class Sandbox:
     """A Daytona ``Sandbox``. ``sandbox.kosa8`` is the :class:`kosa8.CloudSandbox` underneath."""
 
-    def __init__(self, box: CloudSandbox, language: Optional[str] = None) -> None:
+    def __init__(self, box: CloudSandbox, language: Optional[str] = None, public: bool = False) -> None:
         self.kosa8 = box
         self._language = language
+        self._public = public
+        self._archive = 10080
         self.process = Process(self)
         self.fs = FileSystem(self)
 
@@ -711,6 +730,38 @@ class Sandbox:
     @property
     def created_at(self) -> Any:
         return self.kosa8.info.get("created_at")
+
+    @property
+    def auto_stop_interval(self) -> int:
+        """Minutes idle before it sleeps (0: never)."""
+        return int(self.kosa8.info.get("sleep_after_s") or 0) // 60
+
+    auto_pause_interval = auto_stop_interval
+
+    @property
+    def auto_archive_interval(self) -> int:
+        """What ``set_auto_archive_interval`` was given (Daytona's default, 7 days,
+        until then). kosa8 stores a stopped sandbox as a snapshot at once, so it
+        changes nothing."""
+        return self._archive
+
+    @property
+    def auto_delete_interval(self) -> int:
+        """-1: kosa8 never deletes a sandbox for being stopped (it deletes on ``set_ttl``)."""
+        return -1
+
+    def _egress(self) -> Dict[str, Any]:
+        return self.kosa8.egress()
+
+    @property
+    def network_block_all(self) -> bool:
+        e = self._egress()
+        return e.get("internet") is False and not e.get("allow")
+
+    @property
+    def network_allow_list(self) -> Optional[str]:
+        allow = self._egress().get("allow") or []
+        return ",".join(allow) if allow else None
 
     @property
     def git(self) -> Any:
@@ -781,16 +832,40 @@ class Sandbox:
             self.kosa8.update(ttl_s=max(int(ttl_minutes) * 60, 60))
 
     def set_auto_archive_interval(self, interval: int, request_timeout: Optional[float] = None) -> None:
-        """Nothing to do: a sleeping kosa8 sandbox is already stored as a snapshot."""
+        """Recorded only: a sleeping kosa8 sandbox is already stored as a snapshot."""
+        if interval < 0:
+            raise DaytonaError("auto_archive_interval must be a non-negative integer")
+        self._archive = int(interval)
 
     def set_auto_delete_interval(self, interval: int, request_timeout: Optional[float] = None) -> None:
+        """-1 (never delete for being stopped) is how kosa8 works already; any other value raises."""
+        if interval == -1:
+            return
         raise Unsupported("daytona Sandbox.set_auto_delete_interval", "set_ttl(minutes): kosa8 deletes on a lifetime, not after a stop")
 
     @_dt
     def get_preview_link(self, port: int, request_timeout: Optional[float] = None) -> PortPreviewUrl:
-        """A private kosa8 preview of ``port``; ``url`` is a signed link (no separate token)."""
-        p = self.kosa8.previews.create(port)
+        """A kosa8 preview of ``port``: public (no token needed) when the
+        sandbox is public, else private, with ``url`` a signed link (the
+        token is in it, so ``token`` is None)."""
+        p = self.kosa8.previews.create(port, public=True) if self._public else self.kosa8.previews.create(port)
         return PortPreviewUrl(url=p["url"], token=None)
+
+    def set_public(self, public: bool, request_timeout: Optional[float] = None) -> None:
+        """Make the previews ``get_preview_link`` opens from now on public (or private)."""
+        self._public = bool(public)
+
+    @_dt
+    def update_network_settings(self, *, network_block_all: Optional[bool] = None, network_allow_list: Optional[str] = None,
+                                domain_allow_list: Optional[str] = None, request_timeout: Optional[float] = None) -> None:
+        """kosa8 egress: block everything, an allow-list (CIDRs and domains), or open again."""
+        allow = _allow_list(network_allow_list) + _allow_list(domain_allow_list)
+        if allow:
+            self.kosa8.set_egress(internet=False, allow=allow, deny=[])
+        elif network_block_all is True:
+            self.kosa8.set_egress(internet=False, allow=[], deny=[])
+        elif network_block_all is False:
+            self.kosa8.set_egress(internet=True, allow=[], deny=[])
 
     @_dt
     def fork(self, name: Optional[str] = None, timeout: Optional[float] = 60) -> "Sandbox":
@@ -815,10 +890,8 @@ class Sandbox:
     get_metrics = _refuse("get_metrics", "sandbox.kosa8.metrics()")
     get_metrics_latest = _refuse("get_metrics_latest", "sandbox.kosa8.metrics()")
     create_lsp_server = _refuse("create_lsp_server", "run the language server with process.exec in the background")
-    set_public = _refuse("set_public", "sandbox.kosa8.previews.create(port, public=True)")
     create_signed_preview_url = _refuse("create_signed_preview_url", "get_preview_link(port) (already a signed link)")
     expire_signed_preview_url = _refuse("expire_signed_preview_url", "sandbox.kosa8.previews.rotate(port)")
-    update_network_settings = _refuse("update_network_settings", "sandbox.kosa8.set_egress(internet=..., allow=[...])")
     update_secrets = _refuse("update_secrets", "org secrets: Kosa8Cloud().secrets.set(...) and create(secrets=[...])")
     update_env = _refuse("update_env", "pass env to process.exec, or create a new sandbox with env_vars")
     resize = _refuse("resize", "create a sized sandbox: CreateSandboxFromImageParams(resources=Resources(cpu=, memory=))")
@@ -883,12 +956,9 @@ class SnapshotService:
 
 _UNSUPPORTED_CREATE = (
     ("os_user", "commands run as the image's user; switch user inside the command"),
-    ("public", "sandbox.kosa8.previews.create(port, public=True)"),
     ("volumes", "keep data in /workspace, or snapshot the sandbox"),
     ("secrets", "org secrets: Kosa8Cloud().sandboxes.create(secrets=[names])"),
     ("kvm", "a sized sandbox with docker=True via Kosa8Cloud().sandboxes.create"),
-    ("network_allow_list", "sandbox.kosa8.set_egress(allow=[...]) after create"),
-    ("domain_allow_list", "sandbox.kosa8.set_egress(allow=[...]) after create"),
     ("outbound_proxy_url", "set HTTPS_PROXY in env_vars"),
     ("otel_endpoint_override", "set OTEL_EXPORTER_OTLP_ENDPOINT in env_vars"),
     ("ephemeral", "ttl_minutes, or delete() when done"),
@@ -899,6 +969,38 @@ _UNSUPPORTED_CREATE = (
 )
 
 
+def _allow_list(v: Optional[str]) -> List[str]:
+    if not v:
+        return []
+    items = v.split(",") if isinstance(v, str) else list(v)
+    return [x.strip() for x in items if x and x.strip()]
+
+
+#: Daytona's key variable; read when it holds a kosa8 key.
+KEY_ENV = ("DAYTONA_API_KEY",)
+
+
+def _real_daytona_create(params: Any, timeout: float) -> Any:
+    """The same create on Daytona's own SDK (``KOSA8_FALLBACK=daytona``)."""
+    import dataclasses
+
+    import daytona as real  # the original SDK
+
+    client = real.Daytona()
+    ns = getattr(client, "v0", client)
+    if params is None:
+        return ns.create(timeout=timeout)
+    mod = getattr(real, "v0", real)
+    cls = getattr(mod, type(params).__name__)
+    fields = {f.name: getattr(params, f.name) for f in dataclasses.fields(params) if getattr(params, f.name) is not None}
+    res = fields.get("resources")
+    if res is not None and dataclasses.is_dataclass(res):
+        rcls = getattr(mod, "Resources", None)
+        fields["resources"] = rcls(**{f.name: getattr(res, f.name) for f in dataclasses.fields(res)
+                                     if getattr(res, f.name) is not None}) if rcls else res
+    return ns.create(cls(**fields), timeout=timeout)
+
+
 class Daytona:
     """Daytona's client, on kosa8 Cloud."""
 
@@ -907,7 +1009,7 @@ class Daytona:
         if config.jwt_token:
             raise Unsupported("daytona DaytonaConfig(jwt_token=...)", "a kosa8 Cloud API key: DaytonaConfig(api_key='k8c_live_...') or KOSA8_API_KEY")
         check_url("daytona DaytonaConfig(api_url=...)", config.api_url or config.server_url)
-        self._cloud = get_cloud(config.api_key)
+        self._cloud = get_cloud(config.api_key, key_env=KEY_ENV)
         self._target = config.target
         #: Durable snapshots.
         self.snapshot = SnapshotService(self._cloud)
@@ -921,7 +1023,6 @@ class Daytona:
     def close(self) -> None:
         pass
 
-    @_dt
     def create(
         self,
         params: Optional[Union[CreateSandboxFromSnapshotParams, CreateSandboxFromImageParams]] = None,
@@ -930,7 +1031,16 @@ class Daytona:
         on_snapshot_create_logs: Optional[Callable[[str], None]] = None,
     ) -> Sandbox:
         """Start a sandbox and wait until it runs (``timeout`` seconds, 0: no
-        limit). See the module docs for how each field maps."""
+        limit). See the module docs for how each field maps. With
+        ``KOSA8_FALLBACK=daytona``, a create kosa8 cannot do runs on Daytona."""
+        try:
+            return self._create(params, timeout)
+        except Unsupported as e:
+            return fallback("daytona", e, lambda: foreign_key("DAYTONA_API_KEY") and bool(__import__("daytona")),
+                            lambda: _real_daytona_create(params, timeout))
+
+    @_dt
+    def _create(self, params: Any, timeout: float) -> Sandbox:
         p = params or CreateSandboxFromSnapshotParams()
         for name, alt in _UNSUPPORTED_CREATE:
             v = getattr(p, name, None)
@@ -954,10 +1064,9 @@ class Daytona:
                 raise Unsupported("daytona Resources with only cpu or only memory",
                                   "give both cpu and memory, e.g. Resources(cpu=2, memory=4)")
             if res.cpu is not None:
-                body["cpus"] = int(res.cpu)
-                body["mem_mb"] = int(res.memory) * 1024
+                body["cpus"], body["mem_mb"] = fit_size(res.cpu, int(res.memory) * 1024)
             if res.disk is not None:
-                body["disk_gb"] = int(res.disk)
+                body["disk_gb"] = max(int(res.disk), 8)  # kosa8 disks start at 8 GB; more than asked is safe
         lang = p.language
         if not snap and image is None and lang in (None, CodeLanguage.PYTHON):
             body["template"] = "python"
@@ -970,13 +1079,19 @@ class Daytona:
             body["env"] = dict(p.env_vars)
         if p.name:
             body["name"] = p.name
-        if p.network_block_all:
+        allow = _allow_list(getattr(p, "network_allow_list", None)) + _allow_list(getattr(p, "domain_allow_list", None))
+        if allow:
+            body["egress"] = {"internet": False, "allow": allow}
+        elif p.network_block_all:
             body["egress"] = {"internet": False}
         region = p.target or self._target
         if region:
             body["region"] = region
-        box = self._cloud.sandboxes.create(labels=p.labels or None, wait_timeout=timeout or 24 * 3600, **body)
-        return Sandbox(box, lang)
+        box = create_sandbox(self._cloud, labels=p.labels, wait_timeout=timeout or 24 * 3600, **body)
+        sb = Sandbox(box, lang, public=bool(getattr(p, "public", False)))
+        if getattr(p, "auto_archive_interval", None) is not None:
+            sb._archive = int(p.auto_archive_interval)
+        return sb
 
     @_dt
     def get(self, sandbox_id_or_name: str, request_timeout: Optional[float] = None) -> Sandbox:
@@ -996,7 +1111,16 @@ class Daytona:
         if q.id:
             out = [s for s in out if s.id.lower().startswith(q.id.lower())]
         if q.states:
-            out = [s for s in out if s.state in q.states]
+            want = {getattr(x, "value", x) for x in q.states}
+            out = [s for s in out if s.state in want]
+        sort = str(getattr(q.sort, "value", q.sort) or "").lower()
+        if sort:
+            field = {"createdat": "created_at", "updatedat": "created_at", "name": "name"}.get(sort.replace("_", ""), "created_at")
+            desc = str(getattr(q.order, "value", q.order) or "asc").lower() == "desc"
+            out.sort(key=lambda s: (s.kosa8.info.get(field) is None, s.kosa8.info.get(field) or 0), reverse=desc)
+        if q.limit:
+            start = (max(q.page or 1, 1) - 1) * q.limit
+            out = out[start:start + q.limit]
         return iter(out)
 
     @_dt

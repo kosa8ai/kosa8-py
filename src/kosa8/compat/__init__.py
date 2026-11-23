@@ -12,22 +12,25 @@ Change one import and the same code runs on kosa8 Cloud::
     import modal                                  # before
     import kosa8.compat.modal as modal            # after
 
-Every shim calls :class:`kosa8.Kosa8Cloud` (``KOSA8_API_KEY`` from the
-environment, ``KOSA8_CLOUD_URL`` for another address). A call kosa8 cannot do
-raises :class:`Unsupported`, which names the method and what to use on kosa8
-instead; a shim never pretends a call worked.
+Every shim calls :class:`kosa8.Kosa8Cloud`: the key is ``KOSA8_API_KEY``, or
+the other SDK's own variable (``E2B_API_KEY``, ``DAYTONA_API_KEY``) when it
+holds a kosa8 key; ``KOSA8_CLOUD_URL`` for another address. A call kosa8
+cannot do raises :class:`Unsupported`, which names the method and what to use
+on kosa8 instead; a shim never pretends a call worked. With
+``KOSA8_FALLBACK=e2b`` (``daytona``, ``modal``, ``all``) a *create* the shim
+refuses runs on the original provider through its own SDK and key.
 
-Things that differ everywhere, because kosa8 Cloud works this way:
+How the shims run things:
 
-* Each command runs in a fresh container and only ``/workspace`` persists
-  between commands, so relative paths are put under ``/workspace``.
-* Output streams where the other SDK streams it. A command given output
-  callbacks (E2B ``on_stdout`` / ``on_stderr``), a timeout over 90 s, or run
-  through an API that is itself a stream (Modal ``sandbox.exec(...)``,
-  Daytona session commands and their ``get_session_command_logs_async``)
-  is a streamed exec: the output arrives as the command prints it and the
-  command is not held to 90 s. A plain buffered command (no callbacks, no
-  long timeout) still runs at most 90 s and answers once, when it ends.
+* Sandboxes are persistent, one long-lived machine as on E2B, Daytona and
+  Modal: packages, files anywhere and background processes last between
+  commands (each command is its own process, so ``cd`` and ``export`` do not
+  carry). A plan with no persistent sandboxes left gets a plain one, where
+  only ``/workspace`` lasts, with a warning; ``KOSA8_SHIM_PERSISTENT=0``
+  skips the attempt. Relative paths are put under ``/workspace``.
+* Every foreground command is a streamed exec: output reaches the other
+  SDK's callbacks or iterators as it prints, and the command runs as long as
+  that SDK's own timeout says, not kosa8's 90 s for a buffered exec.
 * A background command (E2B ``background=True``, Modal's entrypoint) is
   polled about once a second; its new output is passed on as it appears,
   stdout and stderr together.
@@ -39,16 +42,18 @@ Every shim object keeps the kosa8 object it wraps as ``.kosa8``
 from __future__ import annotations
 
 import functools
+import os
 import posixpath
 import threading
 import time
 import urllib.parse
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+import warnings
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from ..cloud import CloudExecResult, CloudExecStream, Kosa8Cloud
+from ..cloud import CloudExecResult, CloudExecStream, CloudSandbox, Kosa8Cloud
 from ..errors import Kosa8Error
 
-__all__ = ["Unsupported", "set_default_cloud", "get_cloud", "StreamPump"]
+__all__ = ["Unsupported", "set_default_cloud", "get_cloud", "env_key", "create_sandbox", "fallback_enabled", "StreamPump"]
 
 
 class Unsupported(Kosa8Error, NotImplementedError):
@@ -75,15 +80,117 @@ def set_default_cloud(cloud: Optional[Kosa8Cloud]) -> None:
     _default_cloud = cloud
 
 
-def get_cloud(api_key: Optional[str] = None) -> Kosa8Cloud:
+KEY_PREFIXES = ("k8c_live_", "k8c_tok_")
+
+
+def env_key(*names: str) -> Optional[str]:
+    """The key to use when the caller passed none: ``KOSA8_API_KEY``, else the
+    first of the other SDK's own variables (``E2B_API_KEY``,
+    ``DAYTONA_API_KEY``, ...) that holds a kosa8 key. A variable holding the
+    other provider's key is left alone (``KOSA8_FALLBACK`` may use it)."""
+    k = os.environ.get("KOSA8_API_KEY", "").strip()
+    if k:
+        return k
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v.startswith(KEY_PREFIXES):
+            return v
+    return None
+
+
+def get_cloud(api_key: Optional[str] = None, *, key_env: Sequence[str] = (), base_url: Optional[str] = None) -> Kosa8Cloud:
     """The cloud a shim talks to: the one given to :func:`set_default_cloud`,
-    else ``Kosa8Cloud(api_key)`` (``KOSA8_API_KEY`` when ``api_key`` is None)."""
-    if _default_cloud is not None and api_key is None:
+    else ``Kosa8Cloud(api_key)``. With no ``api_key``, :func:`env_key` picks
+    it (``KOSA8_API_KEY``, then the ``key_env`` variables holding a kosa8
+    key). ``base_url`` is a kosa8 address the other SDK's own setting named
+    (E2B's ``E2B_DOMAIN=kosa8.com``)."""
+    if api_key is None and _default_cloud is None:
+        api_key = env_key(*key_env)
+    if _default_cloud is not None and api_key is None and base_url is None:
         return _default_cloud
     if _default_cloud is not None:
-        return Kosa8Cloud(api_key, base_url=_default_cloud.base_url, timeout=_default_cloud.timeout,
+        return Kosa8Cloud(api_key if api_key is not None else _default_cloud._key,
+                          base_url=base_url or _default_cloud.base_url, timeout=_default_cloud.timeout,
                           opener=_default_cloud._open, stream_opener=_default_cloud._stream_open)
-    return Kosa8Cloud(api_key)
+    return Kosa8Cloud(api_key, base_url=base_url)
+
+
+def shim_persistent() -> bool:
+    """Whether shims create persistent sandboxes (``KOSA8_SHIM_PERSISTENT=0`` turns it off)."""
+    return os.environ.get("KOSA8_SHIM_PERSISTENT", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _persistent_refused(e: Kosa8Error) -> bool:
+    body = e.body if isinstance(e.body, dict) else {}
+    if body.get("limit_name") == "persistent":
+        return True
+    return e.status in (400, 402, 403, 409) and "persistent" in str(e).lower()
+
+
+def create_sandbox(cloud: Kosa8Cloud, *, persistent: bool = True, labels: Optional[Mapping[str, str]] = None,
+                   **body: Any) -> CloudSandbox:
+    """Create the sandbox a shim stands for. E2B, Daytona, Modal and Vercel
+    all keep one machine alive across commands, so a shim asks for a
+    persistent sandbox (installed packages, files outside /workspace and
+    background processes last). When the plan allows no more persistent
+    sandboxes it warns and creates a plain one (only /workspace lasts)."""
+    if persistent and shim_persistent() and "snapshot" not in body and not body.get("docker"):
+        try:
+            return cloud.sandboxes.create(labels=labels or None, persistent=True, **body)
+        except Kosa8Error as e:
+            if not _persistent_refused(e):
+                raise
+            warnings.warn(
+                f"kosa8: a persistent sandbox was refused ({e}); this one keeps only /workspace between commands. "
+                "Set KOSA8_SHIM_PERSISTENT=0 to skip the attempt.", RuntimeWarning, stacklevel=3)
+    return cloud.sandboxes.create(labels=labels or None, **body)
+
+
+def fit_size(cpus: float, mem_mb: int) -> Tuple[Any, int]:
+    """The smallest kosa8 size (``CLOUD_SIZES``) with at least ``cpus`` vCPU and
+    ``mem_mb`` memory, as ``(cpus, mem_mb)``: other SDKs take any pair, kosa8
+    takes fixed sizes, and more than asked is the safe way to round."""
+    from ..cloud import CLOUD_SIZES
+
+    for size in CLOUD_SIZES:
+        c, g = (float(x) for x in size.split("x"))
+        if c >= float(cpus) and g * 1024 >= mem_mb:
+            return (int(c) if c >= 1 else c), int(g * 1024)
+    return cpus, mem_mb  # bigger than the largest size: let the API say so
+
+
+# --- KOSA8_FALLBACK: send what kosa8 cannot do back to the original provider ---------
+
+
+def fallback_enabled(provider: str) -> bool:
+    """``KOSA8_FALLBACK`` names ``provider`` (a comma list: ``e2b,daytona,modal``, or ``all``)."""
+    v = {x.strip().lower() for x in os.environ.get("KOSA8_FALLBACK", "").split(",") if x.strip()}
+    return provider in v or "all" in v
+
+
+def fallback(provider: str, err: Unsupported, have_key: Callable[[], bool], run: Callable[[], Any]) -> Any:
+    """With ``KOSA8_FALLBACK`` naming ``provider``, its SDK installed and its own
+    key present, run ``run()`` (the same call on the original SDK) and warn;
+    otherwise raise ``err``. Only calls that make a sandbox (create) fall
+    back: a sandbox already on kosa8 stays there."""
+    if not fallback_enabled(provider):
+        raise err
+    try:
+        ok = have_key()
+    except ImportError:
+        ok = False
+    if not ok:
+        raise Unsupported(err.method, err.alternative,
+                          f"KOSA8_FALLBACK={provider} is set, but the {provider} SDK or its own API key is missing") from err
+    warnings.warn(f"kosa8: {err.method} is not supported by kosa8; KOSA8_FALLBACK={provider} runs it on {provider}",
+                  RuntimeWarning, stacklevel=3)
+    return run()
+
+
+def foreign_key(name: str) -> bool:
+    """``name`` is set and holds the other provider's key (not a kosa8 one)."""
+    v = os.environ.get(name, "").strip()
+    return bool(v) and not v.startswith(KEY_PREFIXES)
 
 
 # --- helpers the shims share ---------------------------------------------------

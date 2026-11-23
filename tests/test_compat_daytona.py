@@ -35,7 +35,7 @@ class DaytonaTest(unittest.TestCase):
 
     def test_create_default_is_python(self):
         sb = self.d.create()
-        self.assertEqual(self.created(), {"template": "python"})
+        self.assertEqual(self.created(), {"template": "python", "persistent": True})
         self.assertEqual(sb.state, "started")
         self.assertEqual(sb.get_work_dir(), "/workspace")
 
@@ -46,30 +46,71 @@ class DaytonaTest(unittest.TestCase):
         ), timeout=40)
         self.assertEqual(self.created(), {"template": "node", "sleep_after_s": 900, "ttl_s": 7200, "env": {"DEBUG": "1"},
                                           "name": "dev", "egress": {"internet": False}, "region": "us",
-                                          "labels": {"env": "dev"}})
+                                          "labels": {"env": "dev"}, "persistent": True})
         self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.d.create(CreateSandboxFromSnapshotParams(snapshot="snap_7", auto_pause_interval=5, auto_delete_interval=-1))
         self.assertEqual(self.created(), {"snapshot": "snap_7", "sleep_after_s": 300})
 
     def test_create_from_image(self):
         self.d.create(CreateSandboxFromImageParams(image="debian:12.9", resources=Resources(cpu=2, memory=4, disk=20)))
-        self.assertEqual(self.created(), {"image": "debian:12.9", "cpus": 2, "mem_mb": 4096, "disk_gb": 20})
+        self.assertEqual(self.created(), {"image": "debian:12.9", "cpus": 2, "mem_mb": 4096, "disk_gb": 20, "persistent": True})
 
     def test_config_target_is_default_region(self):
         Daytona(DaytonaConfig(target="eu", api_url="https://api.kosa8.com")).create()
         self.assertEqual(self.created()["region"], "eu")
 
     def test_create_unsupported(self):
-        for p in (CreateSandboxFromSnapshotParams(public=True), CreateSandboxFromSnapshotParams(volumes=["v"]),
+        for p in (CreateSandboxFromSnapshotParams(volumes=["v"]),
                   CreateSandboxFromSnapshotParams(os_user="daytona"), CreateSandboxFromSnapshotParams(secrets={"A": "s"}),
                   CreateSandboxFromSnapshotParams(auto_delete_interval=0), CreateSandboxFromSnapshotParams(ephemeral=True),
-                  CreateSandboxFromSnapshotParams(domain_allow_list="a.com"),
                   CreateSandboxFromImageParams(image=object()), CreateSandboxFromImageParams(image="x", resources=Resources(gpu=1)),
                   CreateSandboxFromImageParams(image="x", resources=Resources(cpu=2))):
             with self.assertRaises(Unsupported, msg=repr(p)) as c:
                 self.d.create(p)
             self.assertIn("daytona", str(c.exception))
         self.assertNotIn("POST /v1/sandboxes", self.f.routes())
+
+    def test_network_and_public_previews(self):
+        sb = self.d.create(CreateSandboxFromSnapshotParams(network_allow_list="10.0.0.0/8, 1.1.1.1/32", domain_allow_list="pypi.org"))
+        self.assertEqual(self.created()["egress"], {"internet": False, "allow": ["10.0.0.0/8", "1.1.1.1/32", "pypi.org"]})
+        self.assertTrue(sb.get_preview_link(3000).url.endswith("?t=sig"))  # private: a signed link
+        sb.set_public(True)
+        self.assertEqual(sb.get_preview_link(3000).url, f"https://3000-{sb.id.lower().replace('_', '')}.kosa8labs.example/")
+        pub = self.d.create(CreateSandboxFromSnapshotParams(public=True))
+        self.assertTrue(pub.get_preview_link(8080).url.startswith("https://8080-"))
+        sb.update_network_settings(domain_allow_list="api.openai.com")
+        self.assertEqual(self.f.last(f"PUT /v1/sandboxes/{sb.id}/egress")["body"], {"internet": False, "allow": ["api.openai.com"], "deny": []})
+        sb.update_network_settings(network_block_all=False)
+        self.assertEqual(self.f.last(f"PUT /v1/sandboxes/{sb.id}/egress")["body"], {"internet": True, "allow": [], "deny": []})
+
+    def test_interval_and_network_fields(self):
+        sb = self.d.create(CreateSandboxFromSnapshotParams(auto_stop_interval=15, auto_archive_interval=1440))
+        self.assertEqual((sb.auto_stop_interval, sb.auto_archive_interval, sb.auto_delete_interval), (15, 1440, -1))
+        sb.set_auto_archive_interval(60)
+        self.assertEqual(sb.auto_archive_interval, 60)
+        sb.set_auto_delete_interval(-1)
+        with self.assertRaises(Unsupported):
+            sb.set_auto_delete_interval(0)
+        self.assertEqual((sb.network_block_all, sb.network_allow_list), (False, None))
+        blocked = self.d.create(CreateSandboxFromSnapshotParams(network_block_all=True))
+        self.assertEqual((blocked.network_block_all, blocked.network_allow_list), (True, None))
+        listed = self.d.create(CreateSandboxFromSnapshotParams(network_allow_list="10.0.0.0/24"))
+        self.assertEqual((listed.network_block_all, listed.network_allow_list), (False, "10.0.0.0/24"))
+
+    def test_daytona_api_key_env_when_kosa8(self):
+        compat.set_default_cloud(None)
+        old = {k: os.environ.pop(k, None) for k in ("KOSA8_API_KEY", "DAYTONA_API_KEY")}
+        def restore():
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        os.environ["DAYTONA_API_KEY"] = "k8c_live_fromDaytona"
+        self.assertEqual(Daytona()._cloud._key, "k8c_live_fromDaytona")
+        os.environ["DAYTONA_API_KEY"] = "dtn_real"
+        with self.assertRaisesRegex(Exception, "KOSA8_API_KEY"):
+            Daytona()
 
     def test_client_context_manager(self):
         with Daytona() as d:
@@ -140,8 +181,8 @@ class DaytonaTest(unittest.TestCase):
 
     def test_sandbox_unsupported(self):
         sb = self.d.create()
-        names = ["get_metrics", "get_metrics_latest", "create_lsp_server", "set_public", "create_signed_preview_url",
-                 "expire_signed_preview_url", "update_network_settings", "update_secrets", "update_env", "resize",
+        names = ["get_metrics", "get_metrics_latest", "create_lsp_server", "create_signed_preview_url",
+                 "expire_signed_preview_url", "update_secrets", "update_env", "resize",
                  "create_ssh_access", "revoke_ssh_access", "validate_ssh_access", "recover", "download_url", "upload_url",
                  "set_auto_delete_interval"]
         for n in names:

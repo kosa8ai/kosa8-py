@@ -31,8 +31,8 @@ class ModalTest(unittest.TestCase):
         )
         self.assertEqual(self.created(), {
             "ttl_s": 1800, "image": "python:3.11-slim", "sleep_after_s": 120, "env": {"A": "1", "TOKEN": "t"},
-            "secrets": ["db"], "cpus": 2, "mem_mb": 2048, "egress": {"internet": False}, "region": "us", "name": "worker",
-            "labels": {"team": "ml", "modal-app": "my-app"},
+            "secrets": ["db"], "cpus": 2, "mem_mb": 4096, "egress": {"internet": False}, "region": "us", "name": "worker",
+            "labels": {"team": "ml", "modal-app": "my-app"}, "persistent": True,
         })
         self.assertFalse([p for m, p, _, _ in self.f.seen if m == "PUT" and p.endswith("/labels")])  # labels go in the create body
         self.assertTrue(sb.object_id.startswith("sbx_"))
@@ -40,17 +40,28 @@ class ModalTest(unittest.TestCase):
 
     def test_create_defaults_images(self):
         modal.Sandbox.create(app=self.app)
-        self.assertEqual(self.created(), {"ttl_s": 300, "template": "python", "labels": {"modal-app": "my-app"}})
+        self.assertEqual(self.created(), {"ttl_s": 300, "template": "python", "labels": {"modal-app": "my-app"}, "persistent": True})
         modal.Sandbox.create(image=modal.Image.from_registry("node:22"), timeout=10, region=["eu"])
-        self.assertEqual(self.created(), {"ttl_s": 60, "image": "node:22", "region": "eu"})
+        self.assertEqual(self.created(), {"ttl_s": 60, "image": "node:22", "region": "eu", "persistent": True})
         modal.Sandbox.create(image=modal.Image.from_id("snap_3"))
         self.assertEqual(self.created()["snapshot"], "snap_3")
         modal.Sandbox.create(image=modal.Image.from_id("universal"), cpu=(1, 2), memory=(512, 1024))
-        self.assertEqual(self.created(), {"ttl_s": 300, "template": "universal", "cpus": 2, "mem_mb": 1024})
+        self.assertEqual(self.created(), {"ttl_s": 300, "template": "universal", "cpus": 2, "mem_mb": 4096, "persistent": True})
+
+    def test_tunnels_and_outbound_allowlists(self):
+        sb = modal.Sandbox.create(app=self.app, encrypted_ports=[8080], outbound_domain_allowlist=["pypi.org"],
+                                  outbound_cidr_allowlist=["10.0.0.0/8"])
+        self.assertEqual(self.created()["egress"], {"internet": False, "allow": ["10.0.0.0/8", "pypi.org"]})
+        t = sb.tunnels()
+        self.assertEqual(list(t), [8080])
+        self.assertTrue(t[8080].url.startswith("https://8080-"))
+        self.assertEqual(self.f.last(f"POST /v1/sandboxes/{sb.object_id}/previews")["body"], {"port": 8080, "public": True})
+        with self.assertRaises(modal.exception.InvalidError):
+            modal.Sandbox.create(app=self.app, block_network=True, cidr_allowlist=["1.1.1.1/32"])
 
     def test_create_unsupported(self):
-        for kw in ({"gpu": "A100"}, {"volumes": {"/v": "vol"}}, {"encrypted_ports": [8080]}, {"pty": True},
-                   {"outbound_domain_allowlist": ["pypi.org"]}, {"readiness_probe": object()}, {"cloud": "aws"},
+        for kw in ({"gpu": "A100"}, {"volumes": {"/v": "vol"}}, {"unencrypted_ports": [8080]}, {"pty": True},
+                   {"readiness_probe": object()}, {"cloud": "aws"},
                    {"cpu": 2}, {"region": ["us", "eu"]}, {"custom_domain": "x.dev"}):
             with self.assertRaises(Unsupported, msg=str(kw)) as c:
                 modal.Sandbox.create(app=self.app, **kw)
@@ -230,7 +241,7 @@ class ModalTest(unittest.TestCase):
 
     def test_sandbox_unsupported(self):
         sb = modal.Sandbox.create(app=self.app)
-        for n in ("tunnels", "create_connect_token", "wait_until_ready", "snapshot_directory", "mount_image",
+        for n in ("create_connect_token", "wait_until_ready", "snapshot_directory", "mount_image",
                   "unmount_image", "reload_volumes", "open", "ls", "mkdir", "rm", "watch"):
             with self.assertRaises(Unsupported) as c:
                 getattr(sb, n)("/x")
