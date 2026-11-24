@@ -85,6 +85,7 @@ from .cloud_api import (
     AsyncCloudBenchmarks,
     AsyncCloudFunctions,
     AsyncCloudRL,
+    AsyncCloudRuns,
     AsyncCloudWebhooks,
 )
 from .cloud_browser import AsyncCloudAI, AsyncCloudBrowser, AsyncCloudBrowsers
@@ -232,6 +233,8 @@ class AsyncCloud:
         self.benchmarks = AsyncCloudBenchmarks(self)
         #: RL runs, compare and alerts (see :class:`kosa8.cloud_api.CloudRL`).
         self.rl = AsyncCloudRL(self)
+        #: One-call serverless runs (see :class:`kosa8.cloud_api.CloudRuns`).
+        self.runs = AsyncCloudRuns(self)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"
@@ -252,6 +255,10 @@ class AsyncCloud:
 
     async def me(self) -> Dict[str, Any]:
         return await self._request("GET", "/v1/me")
+
+    async def run(self, code: Optional[str] = None, **kw: Any) -> Dict[str, Any]:
+        """Run code or a command in a fresh sandbox; see :meth:`kosa8.Kosa8Cloud.run`."""
+        return await self.runs.create(code, **kw)
 
     async def usage(self) -> Dict[str, Any]:
         return await self.account.usage()
@@ -624,6 +631,10 @@ class AsyncCloudSandbox:
 
     async def delete(self) -> None:
         await self._cloud._request("DELETE", self._path())
+
+    async def direct(self) -> Dict[str, Any]:
+        """A direct-exec token for its host; see :meth:`kosa8.CloudSandbox.direct`."""
+        return (await self._cloud._request("POST", self._path("/direct")) or {}).get("direct", {})
 
     async def sleep(self) -> "AsyncCloudSandbox":
         self.info = (await self._cloud._request("POST", self._path("/sleep")))["sandbox"]
