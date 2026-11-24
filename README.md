@@ -49,6 +49,12 @@ you get the org's default, `base` (see below).
 ### More of the Cloud API
 
 ```python
+r = cloud.run("print(6 * 7)")          # one call: a fresh sandbox, output back, sandbox deleted
+print(r["status"], r["exit"], r["stdout"])     # status ok / failed / timeout / error
+cloud.run(command="uname -a", timeout_s=300, outputs=["/workspace/report.json"])
+cloud.runs.list(limit=10)              # recent runs; cloud.runs.get(id), cloud.runs.share(id, True)
+box.direct()                           # {exec_url, token, expires_at}: exec on the host directly
+
 box.update(ttl_s=7200)                 # PATCH: a new lifetime from now
 box.update(clear_lifetime=True)        # no automatic delete
 box.update(sleep_after_s=0)            # never sleep when idle

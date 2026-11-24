@@ -70,6 +70,7 @@ from .cloud_api import (
     CloudBenchmarks,
     CloudFunctions,
     CloudRL,
+    CloudRuns,
     CloudWebhooks,
 )
 from .cloud_features import (
@@ -746,6 +747,8 @@ class Kosa8Cloud:
         self.benchmarks = CloudBenchmarks(self)
         #: RL runs, compare and alert rules.
         self.rl = CloudRL(self)
+        #: One-call serverless runs (POST /v1/run) and their history.
+        self.runs = CloudRuns(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -753,6 +756,16 @@ class Kosa8Cloud:
     def me(self) -> Dict[str, Any]:
         """The org, the key in use and, for a member's key, the member."""
         return self._request("GET", "/v1/me")
+
+    def run(self, code: Optional[str] = None, **kw: Any) -> Dict[str, Any]:
+        """Run code or a command in a fresh sandbox, in one call; see
+        :meth:`kosa8.cloud_api.CloudRuns.create`::
+
+            r = cloud.run("print(6 * 7)")            # python by default
+            r = cloud.run(command="uname -a")
+            print(r["status"], r["exit"], r["stdout"])
+        """
+        return self.runs.create(code, **kw)
 
     def usage(self) -> Dict[str, Any]:
         """This month's usage, bill estimate and whether work is paused for payment."""
@@ -1760,6 +1773,13 @@ class CloudSandbox:
             body["timeout_s"] = t
         path = self._path("/exec")
         return CloudExecStream(self._cloud._stream("POST", path, body), path)
+
+    def direct(self) -> Dict[str, Any]:
+        """A token to send this sandbox's commands (and files) to its host
+        directly: ``exec_url``, ``files_url`` (when the host has it),
+        ``token`` and ``expires_at`` (ms; 5 minutes). POST ``exec_url`` with
+        the body of an exec and ``Authorization: Bearer <token>``."""
+        return (self._cloud._request("POST", self._path("/direct")) or {}).get("direct", {})
 
     def sleep(self) -> "CloudSandbox":
         """Snapshot it and free its VM; it then costs only snapshot storage."""

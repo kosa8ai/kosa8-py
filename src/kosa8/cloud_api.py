@@ -408,6 +408,89 @@ class AsyncCloudFunctions(AsyncCalls, CloudFunctions):
     """:class:`CloudFunctions` for :class:`~kosa8.AsyncCloud`."""
 
 
+# ---------------------------------------------------------------------------
+# Serverless runs: POST /v1/run, GET /v1/runs, GET /v1/runs/{id}
+
+
+#: The longest ``timeout_s`` a run takes (serverless.js RUN_MAX_TIMEOUT_S).
+RUN_MAX_TIMEOUT_S = 3600
+
+
+class CloudRuns(Calls):
+    """One-call serverless runs (``cloud.runs``): code or a command in a fresh
+    sandbox, output, exit code and files back, the sandbox deleted. Billed per
+    second like any sandbox."""
+
+    def create(
+        self,
+        code: Optional[str] = None,
+        *,
+        command: Union[str, Sequence[str], None] = None,
+        language: Optional[str] = None,
+        filename: Optional[str] = None,
+        template: Optional[str] = None,
+        files: Union[Mapping[str, str], Sequence[Mapping[str, Any]], None] = None,
+        env: Optional[Mapping[str, str]] = None,
+        size: Optional[str] = None,
+        timeout_s: Optional[int] = None,
+        outputs: Optional[Sequence[str]] = None,
+        share: Union[bool, Mapping[str, Any], None] = None,
+    ) -> Dict[str, Any]:
+        """Run ``code`` (written to ``filename``, default ``main.<ext>``) or
+        ``command`` and wait for it. Returns the run: ``id``, ``status``
+        (``ok``, ``failed``, ``timeout`` or ``error``), ``exit``, ``stdout``,
+        ``stderr``, ``files`` (the ``outputs`` asked for, base64),
+        ``duration_ms``, ``cost_usd``, ``view_url``. A command that exits
+        non-zero is ``status: failed``, not an exception."""
+        if code is None and command is None:
+            raise ValueError("give code or command")
+        body: Dict[str, Any] = {}
+        if code is not None:
+            body["code"] = code
+        if command is not None:
+            body["command"] = command if isinstance(command, str) else list(command)
+        for k, v in (("language", language), ("filename", filename), ("template", template), ("size", size)):
+            if v is not None:
+                body[k] = v
+        if files is not None:
+            body["files"] = dict(files) if isinstance(files, Mapping) else [dict(f) for f in files]
+        if env:
+            body["env"] = dict(env)
+        if timeout_s is not None:
+            _whole("timeout_s", timeout_s, 1, RUN_MAX_TIMEOUT_S)
+            body["timeout_s"] = timeout_s
+        if outputs:
+            body["outputs"] = list(outputs)
+        if share is not None:
+            body["share"] = share if isinstance(share, bool) else dict(share)
+        # The answer comes when the command ends: wait past its timeout_s.
+        wait = max(float(self._cloud.timeout), float(timeout_s if timeout_s is not None else 60) + 60.0)
+        return self._call("POST", "/v1/run", body, then=key("run", dict), timeout=wait)
+
+    def list(self, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:  # noqa: A003
+        """The org's recent runs, newest first (kept 30 days)."""
+        if limit is not None:
+            _whole("limit", limit, 1, 100)
+        return self._call("GET", "/v1/runs" + query({"limit": limit}), then=key("runs", list))
+
+    def get(self, run_id: str) -> Dict[str, Any]:
+        """One run, with the saved tail of its output."""
+        _need("run_id", run_id)
+        return self._call("GET", f"/v1/runs/{q(run_id)}", then=key("run", dict))
+
+    def share(self, run_id: str, public: bool, *, code: Optional[bool] = None) -> Dict[str, Any]:
+        """Publish (or unpublish) the run's read-only card; ``code`` shows its code too."""
+        _need("run_id", run_id)
+        body: Dict[str, Any] = {"public": bool(public)}
+        if code is not None:
+            body["code"] = bool(code)
+        return self._call("POST", f"/v1/runs/{q(run_id)}/share", body, then=key("run", dict))
+
+
+class AsyncCloudRuns(AsyncCalls, CloudRuns):
+    """:class:`CloudRuns` for :class:`~kosa8.AsyncCloud`."""
+
+
 __all__ = [
     "CloudAccount", "AsyncCloudAccount",
     "CloudApiKeys", "AsyncCloudApiKeys",
@@ -416,4 +499,5 @@ __all__ = [
     "CloudBenchmarks", "AsyncCloudBenchmarks",
     "CloudRL", "AsyncCloudRL",
     "CloudFunctions", "AsyncCloudFunctions",
+    "CloudRuns", "AsyncCloudRuns",
 ]
