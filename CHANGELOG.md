@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0 - 2026-11-23
+
+- Serverless runs: `cloud.run(code)` / `cloud.run(command=...)` runs in a fresh sandbox in one call and returns the run (status, exit, stdout, stderr, files, `cost_usd`, `view_url`), waiting past the run's own `timeout_s`; `cloud.runs` lists, gets and shares runs. `box.direct()` asks `POST /v1/sandboxes/{id}/direct` for a host exec token. Both in the async client too.
+- Files: `CloudFiles.read(offset=, length=)` (HTTP Range), `write(offset=, append=, mode=)`, and `upload` / `download` move a file of any size in 32 MiB parts (one API request is at most 100 MB, so bigger writes failed with 413). An append is no longer retried (a resent append would write twice); offset writes still are. Async client too.
+- `CloudExecResult` gains `stdout_truncated`, `stderr_truncated`, `stdout_bytes`, `stderr_bytes` and `retryable`: a buffered exec keeps the first and last MiB of each stream and now says when it dropped the middle. The exec docstring now says commands run in the sandbox's long-lived container.
+- Every `Kosa8ApiError` reads kosa8 Cloud's error contract: `request_url`, `agent_message`, `upgrade_url`, and a plan limit's `limit_name`, `limit`, `used`, `plan`, `next_plan`, `feature`, `options`, `pack_url` (a 429 `quota_exceeded` carried them, but only the 402 class exposed them). `failure_of` matches the server's classes again: `payment_failed`, `spend_cap`, `starter_limit` are quota; `invalid_` / `bad_` / `missing_` / `unknown_` codes are client errors (`invalid_timeout` was classed as a retryable timeout); `idempotency_in_progress` is infra.
+- The version lives in one place (`kosa8/_version.py`): `kosa8.__version__` and the User-Agent read it, and a test checks it matches pyproject.toml.
+- The PyPI description and README lead with "Zero Trust cybersecurity infrastructure for AI agents".
+
 ## 0.7.0 - 2026-11-23
 
 - Retries of creates, batches, forks, grades, rollouts and job submits use a new SDK-made `Idempotency-Key` after a 5xx (502 `host_failed`, 503 `no_capacity` / `host_restarting` / `host_unavailable`, 504), so each retry of a server-side failure is a new attempt. The key is still kept after no answer (the first try may have created the sandbox), a 429 and a 409 `idempotency_in_progress` / `template_building`. A key you pass as `idempotency_key` is never changed. Retry-After is honoured as before. `kosa8.cloud.renews_idempotency_key(exc)` says which failures renew it.
