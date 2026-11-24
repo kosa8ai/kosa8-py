@@ -84,9 +84,12 @@ from .cloud_api import (
     AsyncCloudAudit,
     AsyncCloudBenchmarks,
     AsyncCloudFunctions,
+    AsyncCloudGitHub,
     AsyncCloudRL,
     AsyncCloudRuns,
     AsyncCloudWebhooks,
+    pull_request_body,
+    push_body,
 )
 from .cloud_browser import AsyncCloudAI, AsyncCloudBrowser, AsyncCloudBrowsers
 from .errors import (
@@ -235,6 +238,8 @@ class AsyncCloud:
         self.rl = AsyncCloudRL(self)
         #: One-call serverless runs (see :class:`kosa8.cloud_api.CloudRuns`).
         self.runs = AsyncCloudRuns(self)
+        #: The org's connected GitHub (see :class:`kosa8.cloud_api.CloudGitHub`).
+        self.github = AsyncCloudGitHub(self)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"
@@ -417,6 +422,7 @@ class AsyncCloudSandboxes:
         run_id: Optional[str] = None,
         record: Optional[bool] = None,
         ai_gateway: Optional[bool] = None,
+        repo: Union[str, Mapping[str, Any], None] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -428,7 +434,7 @@ class AsyncCloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
-            ai_gateway=ai_gateway,
+            ai_gateway=ai_gateway, repo=repo,
         )
         r = await self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = AsyncCloudSandbox(self._cloud, r["sandbox"])
@@ -631,6 +637,32 @@ class AsyncCloudSandbox:
 
     async def delete(self) -> None:
         await self._cloud._request("DELETE", self._path())
+
+    async def repo(self) -> Dict[str, Any]:
+        """The GitHub repo it was started from (``full_name``, ``ref``,
+        ``sha``, ``path``, ``status``) with ``changes`` (files changed,
+        insertions, deletions). A clone still pending is tried again."""
+        r = (await self._cloud._request("GET", self._path("/repo"))) or {}
+        repo = r.get("repo", r) if isinstance(r, dict) else {}
+        self.info["repo"] = repo
+        return repo
+
+    async def push(self, *, branch: Optional[str] = None, message: Optional[str] = None,
+             path: Optional[str] = None) -> Dict[str, Any]:
+        """Commit everything that changed in its repo and push it to
+        ``branch`` (default ``kosa8/<short id>``): ``branch``, ``sha``,
+        ``compare_url``, ``files_changed``. kosa8 pushes with a token for this
+        one repo that never enters the sandbox. Nothing changed:
+        :class:`~kosa8.Kosa8NoChangesError`."""
+        return (await self._cloud._request("POST", self._path("/github/push"), push_body(branch, message, path))) or {}
+
+    async def pull_request(self, *, title: Optional[str] = None, body: Optional[str] = None, base: Optional[str] = None,
+                     branch: Optional[str] = None, draft: Optional[bool] = None) -> Dict[str, Any]:
+        """Push (as :meth:`push`) and open a pull request into ``base``
+        (default the repo's default branch), a draft unless ``draft=False``:
+        ``number``, ``url``, ``branch``, ``sha``."""
+        return (await self._cloud._request(
+            "POST", self._path("/github/pull-request"), pull_request_body(title, body, base, branch, draft))) or {}
 
     async def direct(self) -> Dict[str, Any]:
         """A direct-exec token for its host; see :meth:`kosa8.CloudSandbox.direct`."""

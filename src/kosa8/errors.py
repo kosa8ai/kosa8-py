@@ -153,6 +153,23 @@ class Kosa8ApiError(Kosa8Error):
         o = self.body.get("options") if isinstance(self.body, dict) else None
         return [x for x in o if isinstance(x, dict)] if isinstance(o, list) else []
 
+    @property
+    def connect_url(self) -> Optional[str]:
+        """409 ``github_not_connected``: where an admin connects GitHub."""
+        return _body_str(self.body, "connect_url")
+
+    @property
+    def settings_url(self) -> Optional[str]:
+        """409 ``github_permissions``: where on GitHub to approve the permissions kosa8 lacks."""
+        return _body_str(self.body, "settings_url")
+
+    @property
+    def missing_permissions(self) -> List[str]:
+        """409 ``github_permissions``: the GitHub App permissions missing
+        (``contents:write``, ``pull_requests:write``, ...); ``[]`` otherwise."""
+        m = self.body.get("missing") if isinstance(self.body, dict) else None
+        return [x for x in m if isinstance(x, str)] if isinstance(m, list) else []
+
 
 class Kosa8BadRequestError(Kosa8ApiError):
     """400: the request was malformed or a value was refused."""
@@ -186,6 +203,26 @@ class Kosa8NotFoundError(Kosa8ApiError):
 
 class Kosa8ConflictError(Kosa8ApiError):
     """409: a conflict, e.g. the sandbox exists but is not running."""
+
+
+class Kosa8GitHubNotConnectedError(Kosa8ConflictError):
+    """409 ``github_not_connected``: the org has not connected GitHub; an admin connects it at ``connect_url``."""
+
+
+class Kosa8GitHubPermissionsError(Kosa8ConflictError):
+    """409 ``github_permissions``: the kosa8 GitHub App lacks ``missing_permissions``; approve them at ``settings_url``."""
+
+
+class Kosa8NoChangesError(Kosa8ConflictError):
+    """409 ``no_changes``: nothing changed in the sandbox's repo, so there is nothing to push."""
+
+
+class Kosa8RepoNotFoundError(Kosa8NotFoundError):
+    """404 ``repo_not_found``: the repo is not visible to the org's GitHub installations (or does not exist)."""
+
+
+class Kosa8GitHubUnavailableError(Kosa8ApiError):
+    """502 ``github_unavailable``: GitHub did not answer or rate-limited kosa8; try again after ``retry_after`` seconds."""
 
 
 class Kosa8UnsupportedError(Kosa8ApiError):
@@ -305,6 +342,13 @@ _BY_STATUS = {
     501: Kosa8UnsupportedError,
 }
 
+_BY_CODE = {
+    (409, "github_not_connected"): Kosa8GitHubNotConnectedError,
+    (409, "github_permissions"): Kosa8GitHubPermissionsError,
+    (409, "no_changes"): Kosa8NoChangesError,
+    (404, "repo_not_found"): Kosa8RepoNotFoundError,
+}
+
 
 def error_from_response(
     status: int,
@@ -345,6 +389,9 @@ def error_from_response(
     )
     if status == 403 and _is_refusal(approval):
         return Kosa8ApprovalRequiredError(message, approval, **kw)
+    by_code = _BY_CODE.get((status, code)) or (Kosa8GitHubUnavailableError if code == "github_unavailable" else None)
+    if by_code is not None:
+        return by_code(message, **kw)
     return _BY_STATUS.get(status, Kosa8ApiError)(message, **kw)
 
 

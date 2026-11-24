@@ -13,9 +13,11 @@ API's own dicts.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from ._calls import AsyncCalls, Calls, as_dict, key, q, query
+from ._calls import query as _query
 
 
 def _whole(name: str, v: Any, lo: int, hi: Optional[int] = None) -> None:
@@ -435,13 +437,18 @@ class CloudRuns(Calls):
         timeout_s: Optional[int] = None,
         outputs: Optional[Sequence[str]] = None,
         share: Union[bool, Mapping[str, Any], None] = None,
+        repo: Union[str, Mapping[str, Any], None] = None,
     ) -> Dict[str, Any]:
         """Run ``code`` (written to ``filename``, default ``main.<ext>``) or
         ``command`` and wait for it. Returns the run: ``id``, ``status``
         (``ok``, ``failed``, ``timeout`` or ``error``), ``exit``, ``stdout``,
         ``stderr``, ``files`` (the ``outputs`` asked for, base64),
         ``duration_ms``, ``cost_usd``, ``view_url``. A command that exits
-        non-zero is ``status: failed``, not an exception."""
+        non-zero is ``status: failed``, not an exception.
+
+        ``repo`` runs it in a checkout of a repo of the org's connected
+        GitHub (``"owner/name"``, ``"owner/name@ref"`` or ``{"name", "ref",
+        "path", "depth"}``); the command runs in /workspace/<name>."""
         if code is None and command is None:
             raise ValueError("give code or command")
         body: Dict[str, Any] = {}
@@ -463,6 +470,8 @@ class CloudRuns(Calls):
             body["outputs"] = list(outputs)
         if share is not None:
             body["share"] = share if isinstance(share, bool) else dict(share)
+        if repo is not None:
+            body["repo"] = repo_body(repo)
         # The answer comes when the command ends: wait past its timeout_s.
         wait = max(float(self._cloud.timeout), float(timeout_s if timeout_s is not None else 60) + 60.0)
         return self._call("POST", "/v1/run", body, then=key("run", dict), timeout=wait)
@@ -491,7 +500,94 @@ class AsyncCloudRuns(AsyncCalls, CloudRuns):
     """:class:`CloudRuns` for :class:`~kosa8.AsyncCloud`."""
 
 
+# ---------------------------------------------------------------------------
+# GitHub repos: connect once, start sandboxes and runs from a repo, push and
+# open pull requests. kosa8 mints a token for one repo and one operation
+# (at most an hour); it never enters the sandbox and every use is audited.
+
+#: owner/name, as GitHub allows them.
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def _repo_name(name: Any) -> str:
+    if not isinstance(name, str) or not REPO_NAME_RE.match(name):
+        raise ValueError(f"repo must be owner/name (optionally @ref), got {name!r}")
+    return name
+
+
+def repo_body(spec: Union[str, Mapping[str, Any]]) -> Union[str, Dict[str, Any]]:
+    """The ``repo`` field of a create or run, checked: ``"owner/name"`` or
+    ``"owner/name@ref"`` stays a string; a mapping is sent as ``{name, ref?,
+    path?, depth?}``."""
+    if isinstance(spec, str):
+        name, at, ref = spec.partition("@")
+        _repo_name(name)
+        if at and not ref:
+            raise ValueError(f"repo {spec} has an empty ref after @")
+        return spec
+    if not isinstance(spec, Mapping):
+        raise ValueError('repo must be "owner/name[@ref]" or {"name", "ref", "path", "depth"}')
+    out: Dict[str, Any] = {"name": _repo_name(spec.get("name"))}
+    for k in ("ref", "path"):
+        if spec.get(k) is not None:
+            out[k] = spec[k]
+    if spec.get("depth") is not None:
+        _whole("depth", spec["depth"], 1)
+        out["depth"] = spec["depth"]
+    return out
+
+
+def push_body(branch: Optional[str] = None, message: Optional[str] = None, path: Optional[str] = None) -> Dict[str, Any]:
+    """The body of ``POST /v1/sandboxes/{id}/github/push``."""
+    return {k: v for k, v in (("branch", branch), ("message", message), ("path", path)) if v is not None}
+
+
+def pull_request_body(title: Optional[str] = None, body: Optional[str] = None, base: Optional[str] = None,
+                      branch: Optional[str] = None, draft: Optional[bool] = None) -> Dict[str, Any]:
+    """The body of ``POST /v1/sandboxes/{id}/github/pull-request``."""
+    return {k: v for k, v in (("title", title), ("body", body), ("base", base), ("branch", branch), ("draft", draft))
+            if v is not None}
+
+
+def _repos_page(answer: Any) -> Dict[str, Any]:
+    a = answer if isinstance(answer, dict) else {}
+    return {"repos": a.get("repos") or [], "next_page": a.get("next_page")}
+
+
+class CloudGitHub(Calls):
+    """The org's connected GitHub (``cloud.github``). An admin connects it
+    once (app.kosa8.com Settings, or ``kosa8 github connect``); listing repos
+    needs only the normal sandbox scope."""
+
+    def status(self) -> Dict[str, Any]:
+        """``configured``, ``connected``, ``can_manage``, ``install_url``
+        (admins only) and ``installations`` (each with ``manage_url`` and
+        ``missing_permissions``)."""
+        return self._call("GET", "/v1/github", then=as_dict)
+
+    def repos_page(self, query: Optional[str] = None, *, page: Optional[int] = None) -> Dict[str, Any]:
+        """One page of :meth:`repos`: ``{"repos": [...], "next_page": n or None}``."""
+        return self._call("GET", "/v1/github/repos" + _query({"q": query or None, "page": page}), then=_repos_page)
+
+    def repos(self, query: Optional[str] = None, *, page: Optional[int] = None) -> Any:
+        """Repos the org's installations can see, most recently pushed first
+        (``full_name``, ``private``, ``default_branch``, ``html_url``, ...);
+        ``query`` filters by substring."""
+        return self._call("GET", "/v1/github/repos" + _query({"q": query or None, "page": page}),
+                          then=lambda a: _repos_page(a)["repos"])
+
+    def branches(self, repo: str) -> Dict[str, Any]:
+        """A repo's (``owner/name``) ``default_branch`` and ``branches`` (the first 100)."""
+        owner, name = _repo_name(repo).split("/")
+        return self._call("GET", f"/v1/github/repos/{q(owner)}/{q(name)}/branches", then=as_dict)
+
+
+class AsyncCloudGitHub(AsyncCalls, CloudGitHub):
+    """:class:`CloudGitHub` for :class:`~kosa8.AsyncCloud`."""
+
+
 __all__ = [
+    "CloudGitHub", "AsyncCloudGitHub", "repo_body", "REPO_NAME_RE",
     "CloudAccount", "AsyncCloudAccount",
     "CloudApiKeys", "AsyncCloudApiKeys",
     "CloudWebhooks", "AsyncCloudWebhooks",
