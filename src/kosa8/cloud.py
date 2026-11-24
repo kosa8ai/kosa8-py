@@ -45,9 +45,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
 from .errors import (
+    Kosa8ApiError,
     Kosa8ConnectionError,
     Kosa8Error,
     Kosa8ExecTimeoutError,
@@ -428,6 +429,57 @@ def _exec_timeout_s(timeout_s: Optional[float]) -> Optional[int]:
     return int(timeout_s)
 
 
+#: Bytes per request when :meth:`CloudFiles.upload` / :meth:`CloudFiles.download`
+#: move a big file in parts (one API request body is at most 100 MB).
+FILE_PART_BYTES = 32 * 1024 * 1024
+
+
+def _range_header(offset: Optional[int], length: Optional[int]) -> Optional[str]:
+    """``Range`` for ``read(offset=, length=)``; ``None`` for the whole file."""
+    if offset is None and length is None:
+        return None
+    if offset is not None and (not _is_int(offset) or offset < 0):
+        raise ValueError("offset must be a whole number of bytes, 0 or more")
+    if length is not None and (not _is_int(length) or length < 1):
+        raise ValueError("length must be a whole number of bytes, 1 or more")
+    start = offset or 0
+    return f"bytes={start}-" if length is None else f"bytes={start}-{start + length - 1}"
+
+
+def _ranged(answer: Any, offset: Optional[int], length: Optional[int]) -> bytes:
+    """The asked-for bytes of a ranged read: a host that cannot serve ranges
+    answers 200 with the whole file, which is sliced here."""
+    status, content = answer[0], bytes(answer[1] or b"")
+    if status == 206:
+        return content
+    start = offset or 0
+    return content[start:] if length is None else content[start:start + length]
+
+
+def _write_query(offset: Optional[int], append: bool, mode: Union[int, str, None]) -> Dict[str, str]:
+    q: Dict[str, str] = {}
+    if offset is not None:
+        if not _is_int(offset) or offset < 0:
+            raise ValueError("offset must be a whole number of bytes, 0 or more")
+        if append:
+            raise ValueError("give offset or append, not both")
+        q["offset"] = str(offset)
+    if append:
+        q["append"] = "1"
+    if mode is not None:
+        m = format(mode, "o") if _is_int(mode) else str(mode)
+        if not re.fullmatch(r"[0-7]{3,4}", m):
+            raise ValueError("mode must be permission bits, e.g. 0o755 or \"755\"")
+        q["mode"] = m
+    return q
+
+
+def _part_size(part_size: int) -> int:
+    if not _is_int(part_size) or not 1 <= part_size <= 95 * 1024 * 1024:
+        raise ValueError("part_size must be 1 byte to 95 MiB (the API takes at most 100 MB a request)")
+    return part_size
+
+
 def _link_body(path: str, method: Optional[str], ttl_s: Optional[int]) -> Dict[str, Any]:
     """The body of ``POST …/files/link`` (checked)."""
     if not path:
@@ -543,6 +595,7 @@ def _batch_from(cloud: Any, r: Mapping[str, Any], make: Callable[[Any, Dict[str,
 #: 429), unless they carry an Idempotency-Key.
 _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 _IDEMPOTENT_POSTS = ("/v1/sandboxes/heartbeat", "/v1/sandboxes/drain")
+_APPEND_RE = re.compile(r"[?&]append=(1|true)(&|$)")
 #: The POSTs kosa8 Cloud keeps an Idempotency-Key for (24 hours): a retry with
 #: the same key and body gets the first answer (``Idempotent-Replayed: true``).
 _KEYED_POSTS = re.compile(
@@ -586,6 +639,9 @@ class _ScopedRetry:
         self.policy = policy
         bare = path.split("?", 1)[0]
         self.idempotent = keyed or method in _IDEMPOTENT or bare in _IDEMPOTENT_POSTS
+        if method == "PUT" and not keyed and _APPEND_RE.search(path):
+            # A resent append would add the bytes twice.
+            self.idempotent = False
 
     def should_retry(self, exc: BaseException, attempt: int) -> bool:
         if not self.policy.should_retry(exc, attempt):
@@ -834,6 +890,9 @@ class Kosa8Cloud:
         raw: bool = False,
         retry: Optional[RetryPolicy] = None,
         idempotency_key: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        meta: bool = False,
+        timeout: Optional[float] = None,
     ) -> Any:
         """One call, retried as :attr:`retry` allows. ``body`` is sent as JSON
         and ``data`` as raw bytes; with ``raw`` a successful answer's bytes are
@@ -843,8 +902,10 @@ class Kosa8Cloud:
         every retry; the SDK's own is kept after no answer, a 429 or a 409 and
         replaced after a 5xx (:func:`renews_idempotency_key`)."""
         extra = _idem_headers(method, path, idempotency_key)
-        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
-        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy,
+        if headers:
+            extra.update(headers)
+        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed="Idempotency-Key" in extra)
+        return call_with_retry(lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra, meta=meta, timeout=timeout), policy,
                                on_retry=_key_renewer(extra, idempotency_key))
 
     def _headers_payload(self, body: Any, data: Optional[bytes], raw: bool,
@@ -866,20 +927,22 @@ class Kosa8Cloud:
         return headers, payload
 
     def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
-                      raw: bool = False, extra: Optional[Mapping[str, str]] = None) -> Any:
+                      raw: bool = False, extra: Optional[Mapping[str, str]] = None, meta: bool = False,
+                      timeout: Optional[float] = None) -> Any:
+        wait = self.timeout if timeout is None else timeout
         headers, payload = self._headers_payload(body, data, raw, extra)
         try:
-            answer = self._open(method, self.base_url + path, headers, payload, self.timeout)
+            answer = self._open(method, self.base_url + path, headers, payload, wait)
         except (socket.timeout, TimeoutError) as e:
             if _is_exec_path(path):
                 raise Kosa8ExecTimeoutError(
-                    f"kosa8 Cloud did not answer within {self.timeout} s ({_EXEC_HINT})",
+                    f"kosa8 Cloud did not answer within {wait} s ({_EXEC_HINT})",
                     method=method, path=path, code="exec_timeout",
                 ) from e
-            raise Kosa8TimeoutError(_timeout_message(self.timeout), method=method, path=path) from e
+            raise Kosa8TimeoutError(_timeout_message(wait), method=method, path=path) from e
         except (urllib.error.URLError, OSError) as e:
             raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
-        return _parse_answer(answer, method, path, raw)
+        return _parse_answer(answer, method, path, raw, meta)
 
 
     def _stream(self, method: str, path: str, body: Any,
@@ -962,11 +1025,11 @@ def _key_renewer(extra: Dict[str, str], given: Optional[str]) -> Optional[Callab
     return renew
 
 
-def _parse_answer(answer: Any, method: str, path: str, raw: bool) -> Any:
+def _parse_answer(answer: Any, method: str, path: str, raw: bool, meta: bool = False) -> Any:
     status, content = answer[0], answer[1]
     resp_headers = answer[2] if len(answer) > 2 and answer[2] else {}
     if raw and status < 400:
-        return content or b""
+        return (status, content or b"", resp_headers) if meta else (content or b"")
     text = content.decode("utf-8", "replace") if content else ""
     try:
         parsed: Any = json.loads(text) if text else None
@@ -2070,9 +2133,11 @@ class CloudSandbox:
 
 
 class CloudFiles:
-    """Files in a cloud sandbox, at most 8 MiB each. Paths are absolute, such
-    as ``/workspace/app.py``; only ``/workspace`` outlives an exec. A sleeping
-    sandbox wakes first.
+    """Files in a cloud sandbox. Paths are absolute, such as
+    ``/workspace/app.py``; ``/workspace`` lasts across sleep and snapshots. A
+    sleeping sandbox wakes first. One request is at most 100 MB (8 MiB on a
+    host without streamed files): :meth:`upload` and :meth:`download` move a
+    file of any size in parts.
 
     Data plane: on a host without it the API answers 501 (``not_available``
     or ``not_supported``), raised as :class:`~kosa8.Kosa8UnsupportedError`.
@@ -2086,17 +2151,80 @@ class CloudFiles:
             raise ValueError("a path is required, e.g. /workspace/app.py")
         return self._sb._path(suffix) + "?" + urllib.parse.urlencode({"path": path, **extra})
 
-    def read(self, path: str) -> bytes:
-        """The file's bytes."""
-        return self._sb._cloud._request("GET", self._q("/files", path), raw=True)
+    def read(self, path: str, *, offset: Optional[int] = None, length: Optional[int] = None) -> bytes:
+        """The file's bytes; with ``offset`` / ``length`` only that part (an
+        HTTP Range, sliced here when the host sends the whole file)."""
+        rng = _range_header(offset, length)
+        if rng is None:
+            return self._sb._cloud._request("GET", self._q("/files", path), raw=True)
+        answer = self._sb._cloud._request("GET", self._q("/files", path), raw=True, meta=True, headers={"Range": rng})
+        return _ranged(answer, offset, length)
 
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         return self.read(path).decode(encoding)
 
-    def write(self, path: str, content: Union[bytes, str], encoding: str = "utf-8") -> Dict[str, Any]:
-        """Create or replace a file; returns its info (``path``, ``size``, ...)."""
+    def write(self, path: str, content: Union[bytes, str], encoding: str = "utf-8", *, offset: Optional[int] = None,
+              append: bool = False, mode: Union[int, str, None] = None) -> Dict[str, Any]:
+        """Create or replace a file; returns its info (``path``, ``size``, ...).
+        ``offset`` writes at that byte keeping the rest of the file, ``append``
+        adds to its end (never retried, so never twice) and ``mode`` sets its
+        permission bits (``0o755`` or ``"755"``). One request is at most
+        100 MB: use :meth:`upload` for bigger files."""
         data = content.encode(encoding) if isinstance(content, str) else bytes(content)
-        return (self._sb._cloud._request("PUT", self._q("/files", path), data=data) or {}).get("file", {})
+        q = self._q("/files", path, **_write_query(offset, append, mode))
+        return (self._sb._cloud._request("PUT", q, data=data) or {}).get("file", {})
+
+    def upload(self, path: str, source: Union[str, "os.PathLike[str]", BinaryIO], *,
+               part_size: int = FILE_PART_BYTES, mode: Union[int, str, None] = None) -> Dict[str, Any]:
+        """Upload a local file (a path or a binary file object) of any size,
+        ``part_size`` bytes a request (each part written at its offset and
+        retried on its own). Returns the file's info."""
+        part = _part_size(part_size)
+        own = not hasattr(source, "read")
+        f: BinaryIO = open(source, "rb") if own else source  # type: ignore[arg-type,assignment]
+        try:
+            pos, info = 0, {}
+            while True:
+                chunk = f.read(part)
+                if pos and not chunk:
+                    return info
+                info = self.write(path, chunk or b"", offset=pos or None, mode=mode if pos == 0 else None)
+                pos += len(chunk)
+                if len(chunk) < part:
+                    return info
+        finally:
+            if own:
+                f.close()
+
+    def download(self, path: str, dest: Union[str, "os.PathLike[str]", BinaryIO], *,
+                 part_size: int = FILE_PART_BYTES) -> int:
+        """Download a file of any size to ``dest`` (a local path, replaced, or
+        a binary file object), ``part_size`` bytes a request. Returns how many
+        bytes were written."""
+        part = _part_size(part_size)
+        own = not hasattr(dest, "write")
+        f: BinaryIO = open(dest, "wb") if own else dest  # type: ignore[arg-type,assignment]
+        try:
+            pos = 0
+            while True:
+                try:
+                    answer = self._sb._cloud._request("GET", self._q("/files", path), raw=True, meta=True,
+                                                      headers={"Range": f"bytes={pos}-{pos + part - 1}"})
+                except Kosa8ApiError as e:
+                    if e.status == 416 and pos > 0:  # the size was a whole number of parts
+                        return pos
+                    raise
+                data = bytes(answer[1] or b"")
+                if answer[0] != 206:  # the host sent the whole file
+                    f.write(data[pos:])
+                    return max(pos, len(data))
+                f.write(data)
+                pos += len(data)
+                if len(data) < part:
+                    return pos
+        finally:
+            if own:
+                f.close()
 
     def list(self, path: str = "/workspace") -> List[Dict[str, Any]]:  # noqa: A003
         """A folder's entries: ``name``, ``path``, ``type`` (file or dir), ``size``, ``mode``, ``mod_time``."""

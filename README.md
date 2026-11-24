@@ -124,6 +124,10 @@ box.reset_egress(); cloud.egress_presets(); cloud.set_org_egress({"internet": Fa
 
 box.schedules.create("0 * * * *", "date >> /workspace/hourly.log", wake=True)
 box.files.write_raw("/workspace/big.bin", data)       # no 8 MiB cap; read_raw too
+box.files.upload("/workspace/data.tar", "data.tar")    # any size, 32 MiB a request, each part retried
+box.files.download("/workspace/out.tar", "out.tar")    # any size, in Range parts
+box.files.read("/workspace/log.txt", offset=1024, length=512)  # a byte range
+box.files.write("/workspace/log.txt", "more\n", append=True)    # or offset=N; mode=0o755
 box.files.link("/workspace/big.bin")                  # presigned URL for curl, 10-300 s
 box.metrics(); box.logs(limit=20); box.secrets(); box.set_labels({"team": "ml"})
 cloud.capabilities()                                  # feature detection
