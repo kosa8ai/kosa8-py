@@ -391,6 +391,17 @@ class CloudTest(unittest.TestCase):
         cloud = Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (200, {"exit": None, "stdout": "", "stderr": "killed"})))
         self.assertIsNone(cloud_box(cloud).exec("true").exit_code)
 
+    def test_exec_reports_truncated_output(self):
+        ans = {"exit": 0, "stdout": "head…tail", "stderr": "", "stdout_truncated": True, "stdout_bytes": 5 << 20,
+               "stderr_bytes": 0, "failure_class": "ok", "retryable": False}
+        r = cloud_box(Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (200, ans)))).exec("yes | head -c 5M")
+        self.assertTrue(r.stdout_truncated)
+        self.assertFalse(r.stderr_truncated)
+        self.assertEqual((r.stdout_bytes, r.stderr_bytes), (5 << 20, 0))
+        plain = cloud_box(Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (200, {"exit": 0, "stdout": "", "stderr": ""})))).exec("true")
+        self.assertFalse(plain.stdout_truncated)
+        self.assertIsNone(plain.stdout_bytes)
+
     def test_unreachable(self):
         def boom(*a):
             raise OSError("connection refused")
