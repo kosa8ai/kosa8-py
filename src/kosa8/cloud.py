@@ -47,6 +47,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
+from ._version import __version__
 from .errors import (
     Kosa8ApiError,
     Kosa8ConnectionError,
@@ -92,7 +93,7 @@ CLOUD_KEY_PREFIX = "k8c_live_"
 CLOUD_TOKEN_PREFIX = "k8c_tok_"
 #: Sent with every Cloud request: the API's edge refuses Python-urllib's
 #: default User-Agent (Cloudflare error 1010, a bare 403).
-USER_AGENT = "kosa8-python/0.7.0"
+USER_AGENT = f"kosa8-python/{__version__}"
 
 #: A ttl_s is from 60 seconds to 90 days.
 MIN_TTL_S = 60
