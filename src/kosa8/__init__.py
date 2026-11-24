@@ -111,7 +111,7 @@ from .aio import AsyncCloud, AsyncCloudFiles, AsyncCloudSandbox, AsyncCloudSandb
 #: ``kosa8.Cloud()`` is :class:`Kosa8Cloud`.
 Cloud = Kosa8Cloud
 
-__version__ = "0.7.0"
+from ._version import __version__  # noqa: E402
 
 __all__ = [
     "AI_PROVIDERS",
