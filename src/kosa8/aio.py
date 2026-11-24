@@ -18,10 +18,11 @@ retries and checks are those of :class:`kosa8.Kosa8Cloud`.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import time
 import urllib.parse
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Awaitable, BinaryIO, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from .cloud import (
     _EXEC_HINT,
@@ -34,6 +35,11 @@ from .cloud import (
     _batch_from,
     _create_body,
     _exec_result,
+    FILE_PART_BYTES,
+    _part_size,
+    _range_header,
+    _ranged,
+    _write_query,
     _exec_timeout_s,
     _fork_body,
     _grade_body,
@@ -83,6 +89,7 @@ from .cloud_api import (
 )
 from .cloud_browser import AsyncCloudAI, AsyncCloudBrowser, AsyncCloudBrowsers
 from .errors import (
+    Kosa8ApiError,
     Kosa8ConnectionError,
     Kosa8Error,
     Kosa8ExecTimeoutError,
@@ -340,29 +347,36 @@ class AsyncCloud:
         raw: bool = False,
         retry: Optional[RetryPolicy] = None,
         idempotency_key: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        meta: bool = False,
+        timeout: Optional[float] = None,
     ) -> Any:
         """See :meth:`kosa8.Kosa8Cloud._request` (the same retries and Idempotency-Key)."""
         extra = _idem_headers(method, path, idempotency_key)
-        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed=bool(extra))
+        if headers:
+            extra.update(headers)
+        policy = _ScopedRetry(self.retry if retry is None else retry, method, path, keyed="Idempotency-Key" in extra)
         return await acall_with_retry(
-            lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra), policy,
+            lambda: self._request_once(method, path, body, data=data, raw=raw, extra=extra, meta=meta, timeout=timeout), policy,
             on_retry=_key_renewer(extra, idempotency_key))
 
     async def _request_once(self, method: str, path: str, body: Any = None, *, data: Optional[bytes] = None,
-                            raw: bool = False, extra: Optional[Mapping[str, str]] = None) -> Any:
+                            raw: bool = False, extra: Optional[Mapping[str, str]] = None, meta: bool = False,
+                            timeout: Optional[float] = None) -> Any:
+        wait = self.timeout if timeout is None else timeout
         headers, payload = self._sync._headers_payload(body, data, raw, extra)
         try:
-            answer = await self._aopen(method, self.base_url + path, headers, payload, self.timeout)
+            answer = await self._aopen(method, self.base_url + path, headers, payload, wait)
         except (socket.timeout, TimeoutError, asyncio.TimeoutError) as e:
             if _is_exec_path(path):
                 raise Kosa8ExecTimeoutError(
-                    f"kosa8 Cloud did not answer within {self.timeout} s ({_EXEC_HINT})",
+                    f"kosa8 Cloud did not answer within {wait} s ({_EXEC_HINT})",
                     method=method, path=path, code="exec_timeout",
                 ) from e
-            raise Kosa8TimeoutError(_timeout_message(self.timeout), method=method, path=path) from e
+            raise Kosa8TimeoutError(_timeout_message(wait), method=method, path=path) from e
         except OSError as e:
             raise Kosa8ConnectionError(_unreachable_message(self.base_url, e), method=method, path=path) from e
-        return _parse_answer(answer, method, path, raw)
+        return _parse_answer(answer, method, path, raw, meta)
 
 
 class AsyncCloudSandboxes:
@@ -715,15 +729,73 @@ class AsyncCloudFiles:
             raise ValueError("a path is required, e.g. /workspace/app.py")
         return self._sb._path(suffix) + "?" + urllib.parse.urlencode({"path": path, **extra})
 
-    async def read(self, path: str) -> bytes:
-        return await self._sb._cloud._request("GET", self._q("/files", path), raw=True)
+    async def read(self, path: str, *, offset: Optional[int] = None, length: Optional[int] = None) -> bytes:
+        """See :meth:`kosa8.CloudFiles.read`."""
+        rng = _range_header(offset, length)
+        if rng is None:
+            return await self._sb._cloud._request("GET", self._q("/files", path), raw=True)
+        answer = await self._sb._cloud._request("GET", self._q("/files", path), raw=True, meta=True,
+                                                headers={"Range": rng})
+        return _ranged(answer, offset, length)
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
         return (await self.read(path)).decode(encoding)
 
-    async def write(self, path: str, content: Union[bytes, str], encoding: str = "utf-8") -> Dict[str, Any]:
+    async def write(self, path: str, content: Union[bytes, str], encoding: str = "utf-8", *,
+                    offset: Optional[int] = None, append: bool = False,
+                    mode: Union[int, str, None] = None) -> Dict[str, Any]:
+        """See :meth:`kosa8.CloudFiles.write`."""
         data = content.encode(encoding) if isinstance(content, str) else bytes(content)
-        return (await self._sb._cloud._request("PUT", self._q("/files", path), data=data) or {}).get("file", {})
+        q = self._q("/files", path, **_write_query(offset, append, mode))
+        return (await self._sb._cloud._request("PUT", q, data=data) or {}).get("file", {})
+
+    async def upload(self, path: str, source: Union[str, "os.PathLike[str]", BinaryIO], *,
+                     part_size: int = FILE_PART_BYTES, mode: Union[int, str, None] = None) -> Dict[str, Any]:
+        """See :meth:`kosa8.CloudFiles.upload` (local reads are blocking)."""
+        part = _part_size(part_size)
+        own = not hasattr(source, "read")
+        f: BinaryIO = open(source, "rb") if own else source  # type: ignore[arg-type,assignment]
+        try:
+            pos, info = 0, {}
+            while True:
+                chunk = f.read(part)
+                if pos and not chunk:
+                    return info
+                info = await self.write(path, chunk or b"", offset=pos or None, mode=mode if pos == 0 else None)
+                pos += len(chunk)
+                if len(chunk) < part:
+                    return info
+        finally:
+            if own:
+                f.close()
+
+    async def download(self, path: str, dest: Union[str, "os.PathLike[str]", BinaryIO], *,
+                       part_size: int = FILE_PART_BYTES) -> int:
+        """See :meth:`kosa8.CloudFiles.download` (local writes are blocking)."""
+        part = _part_size(part_size)
+        own = not hasattr(dest, "write")
+        f: BinaryIO = open(dest, "wb") if own else dest  # type: ignore[arg-type,assignment]
+        try:
+            pos = 0
+            while True:
+                try:
+                    answer = await self._sb._cloud._request("GET", self._q("/files", path), raw=True, meta=True,
+                                                            headers={"Range": f"bytes={pos}-{pos + part - 1}"})
+                except Kosa8ApiError as e:
+                    if e.status == 416 and pos > 0:
+                        return pos
+                    raise
+                data = bytes(answer[1] or b"")
+                if answer[0] != 206:
+                    f.write(data[pos:])
+                    return max(pos, len(data))
+                f.write(data)
+                pos += len(data)
+                if len(data) < part:
+                    return pos
+        finally:
+            if own:
+                f.close()
 
     async def list(self, path: str = "/workspace") -> List[Dict[str, Any]]:  # noqa: A003
         return (await self._sb._cloud._request("GET", self._q("/files/list", path)) or {}).get("files", [])
