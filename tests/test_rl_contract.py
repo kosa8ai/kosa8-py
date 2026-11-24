@@ -262,7 +262,9 @@ class Shapes(unittest.TestCase):
                  (402, "payment_required"), (423, "org_frozen"), (429, "quota_exceeded"), (429, "rate_limited"),
                  (429, "x"), (400, "plan_feature"), (501, None), (501, "not_supported"), (409, "not_available"),
                  (502, "host_failed"), (503, None), (504, None), (504, "exec_timeout"), (500, "stream_timeout"),
-                 (409, "starting"), (400, "too_soon"), (403, "too_many_runs")]
+                 (409, "starting"), (400, "too_soon"), (403, "too_many_runs"),
+                 (400, "invalid_timeout"), (400, "bad_timeout_s"), (402, "spend_cap"), (402, "starter_limit"),
+                 (402, "payment_failed"), (409, "idempotency_in_progress"), (503, "database_busy")]
         for status, code in cases:
             want = fake_cloud.failure_of(status, code)
             self.assertEqual(failure_of(status, code), (want["failure_class"], want["retryable"]), (status, code))

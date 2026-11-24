@@ -16,6 +16,7 @@ from kosa8 import (
     Kosa8RateLimitError,
     Kosa8TimeoutError,
     Kosa8UnsupportedError,
+    RetryPolicy,
 )
 
 KEY = "k8c_live_testkey"
@@ -310,6 +311,32 @@ class CloudTest(unittest.TestCase):
             bare.sandboxes.create()
         self.assertIsNone(e.exception.upgrade_url)
         self.assertIsNone(e.exception.agent_message)
+
+    def test_plan_limit_fields(self):
+        body = {"error": "plan_limit", "message": "the running limit is reached", "limit_name": "running",
+                "limit": 5, "used": 5, "plan": "starter", "next_plan": "team", "pack_url": "https://app.kosa8.com/app#packs",
+                "upgrade_url": "https://app.kosa8.com/app#billing",
+                "options": [{"kind": "pack", "addon": "running_5", "monthly_usd": 10}, "junk"]}
+        cloud = Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (402, body)))
+        with self.assertRaises(Kosa8PaymentRequiredError) as e:
+            cloud.sandboxes.create()
+        x = e.exception
+        self.assertEqual((x.limit_name, x.limit, x.used, x.plan, x.next_plan), ("running", 5, 5, "starter", "team"))
+        self.assertEqual(x.pack_url, "https://app.kosa8.com/app#packs")
+        self.assertEqual(x.options, [{"kind": "pack", "addon": "running_5", "monthly_usd": 10}])
+        self.assertIsNone(x.feature)
+
+    def test_quota_exceeded_carries_agent_message_and_request_url(self):
+        body = {"error": "quota_exceeded", "message": "the running-sandbox limit is reached",
+                "agent_message": "Tell your person the limit is reached.",
+                "request_url": "https://app.kosa8.com/app#limits"}
+        cloud = Kosa8Cloud(KEY, env={}, retry=RetryPolicy(attempts=1), opener=Stub(lambda s: (429, body)))
+        with self.assertRaises(Kosa8RateLimitError) as e:
+            cloud.sandboxes.create()
+        self.assertEqual(e.exception.agent_message, "Tell your person the limit is reached.")
+        self.assertEqual(e.exception.request_url, "https://app.kosa8.com/app#limits")
+        self.assertFalse(e.exception.retryable)
+        self.assertEqual(e.exception.options, [])
 
     def test_org_frozen_and_rate_limit(self):
         cloud = Kosa8Cloud(KEY, env={}, opener=Stub(lambda s: (423, {"error": "org_frozen", "message": "frozen"})))
