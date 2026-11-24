@@ -64,6 +64,7 @@ from .retry import RetryPolicy, call_with_retry
 from .jobs import CloudJobs
 from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens, preview_path
 from .cloud_browser import CloudAI, CloudBrowser, CloudBrowsers
+from .cloud_bots import CloudApprovals, CloudBots
 from .cloud_api import (
     CloudAccount,
     CloudApiKeys,
@@ -756,6 +757,10 @@ class Kosa8Cloud:
         self.runs = CloudRuns(self)
         #: The org's connected GitHub: status, repos, branches.
         self.github = CloudGitHub(self)
+        #: Approvals T3 bot actions wait on (a person decides; see :class:`kosa8.cloud_bots.CloudApprovals`).
+        self.approvals = CloudApprovals(self)
+        #: Autopilot bots: templates, plans, dry runs, runs, pause-all.
+        self.bots = CloudBots(self, self.approvals)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"

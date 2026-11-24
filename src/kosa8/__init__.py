@@ -83,11 +83,14 @@ from .cloud_features import (
     pipeline_run_done,
 )
 from .cloud_more import CloudBurst, CloudEmbeds, CloudPreviewDomains, CloudRecordings, CloudTokens
+from .cloud_bots import AsyncCloudApprovals, AsyncCloudBots, CloudApprovals, CloudBots
 from .client import ExecResult, ExploreBranch, ExploreResult, Kosa8Client, Sandbox
 from .toolbox import Artifact, CodeResult, GitResult, ShellResult
 from .errors import (
     Kosa8ApiError,
     Kosa8ApprovalRequiredError,
+    Kosa8HumanApprovalRequiredError,
+    HumanApprovalRequired,
     Kosa8AuthError,
     Kosa8BadRequestError,
     Kosa8CheckpointError,
@@ -222,6 +225,12 @@ __all__ = [
     "Kosa8AuthError",
     "Kosa8PolicyError",
     "Kosa8ApprovalRequiredError",
+    "Kosa8HumanApprovalRequiredError",
+    "HumanApprovalRequired",
+    "CloudBots",
+    "AsyncCloudBots",
+    "CloudApprovals",
+    "AsyncCloudApprovals",
     "Kosa8NotFoundError",
     "Kosa8ConflictError",
     "Kosa8GitHubNotConnectedError",

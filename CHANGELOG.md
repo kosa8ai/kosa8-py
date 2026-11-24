@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Autopilot: `cloud.bots` lists bots (`list()` answers `bots`, `paused_all`, `pending_approvals`), `templates()` / `template(id)`, `plan(template= | spec=, name=, replay=)`, `compile(text)` (at most 500 characters, checked before sending), `create(template= | spec=, name=, sponsor=, budget_usd=, scope=, notify=)` (a draft; exactly one of template or spec), `get`, `update`, `delete`, `enable`, `disable`, `run(id, dry_run=True)` (a dry run by default), `runs(id, limit=)`, `get_run`, `cancel_run`, `undo_step(run_id, key)`, `pause_all()` and `resume_all()`. `cloud.approvals` (also `cloud.bots.approvals`): `list(state="pending", limit=)`, `get`, `approve(id, reason=, edited_args=)` and `reject(id, reason=)`. A 403 `human_required` (enable, resume-all and deciding an approval need a person's credential) raises the new `Kosa8HumanApprovalRequiredError` (alias `HumanApprovalRequired`, a `Kosa8PolicyError`); there is no way around it from code. Async client too.
+
 ## 0.9.0 - 2026-11-24
 
 - GitHub repos: `repo=` on `cloud.sandboxes.create` and `cloud.run` (`"owner/name"`, `"owner/name@ref"` or `{"name", "ref", "path", "depth"}`) starts the sandbox or run in a checkout of a repo of the org's connected GitHub; `cloud.github.status()`, `repos(query, page=)`, `repos_page(...)` and `branches("owner/name")`; `box.repo()` (the checkout and its changes), `box.push(branch=, message=, path=)` and `box.pull_request(title=, body=, base=, branch=, draft=)`. kosa8 uses a GitHub token for one repo and one operation (at most an hour) that never enters the sandbox. New errors: `Kosa8GitHubNotConnectedError` (`connect_url`), `Kosa8GitHubPermissionsError` (`missing_permissions`, `settings_url`) and `Kosa8NoChangesError` (all `Kosa8ConflictError`), `Kosa8RepoNotFoundError` (a `Kosa8NotFoundError`), `Kosa8GitHubUnavailableError`. Async client too.
