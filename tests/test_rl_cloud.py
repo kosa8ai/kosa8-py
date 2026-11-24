@@ -61,7 +61,7 @@ class FailureClasses(unittest.TestCase):
             (self.err(400, "invalid_cmd"), ("client", False)),
             (self.err(404), ("client", False)),
             (self.err(501, "not_supported"), ("infra", False)),
-            (self.err(409, "idempotency_in_progress"), ("client", True)),
+            (self.err(409, "idempotency_in_progress"), ("infra", True)),
             (self.err(422, "idempotency_mismatch"), ("client", False)),
             (self.err(500, "exec_stream_timeout"), ("timeout", True)),
             (self.err(503, "host_busy"), ("infra", True)),

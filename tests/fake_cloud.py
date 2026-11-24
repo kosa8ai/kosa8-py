@@ -43,12 +43,13 @@ IDEM_ROUTES = [re.compile(r"^/v1/sandboxes$"), re.compile(r"^/v1/sandboxes/batch
 INFRA_CODES = {
     "host_failed", "not_ready", "no_capacity", "host_unreachable", "host_unavailable", "host_busy", "host_restarting",
     "wake_failed", "try_again", "internal", "kernel_failed", "egress_failed", "dns_unreachable", "host_lost",
-    "host_removed", "insufficient_storage", "starting",
+    "host_removed", "insufficient_storage", "starting", "database_busy",
 }
 RATE_CODES = {"rate_limited", "slow_down", "too_soon"}
 QUOTA_CODES = {
     "quota_exceeded", "running_limit", "plan_required", "plan_limit", "plan_feature", "payment_required",
-    "payment_declined", "spending_cap_reached", "snapshot_limit", "org_frozen", "org_suspended", "too_many_runs",
+    "payment_failed", "payment_declined", "spending_cap_reached", "spend_cap", "starter_limit", "snapshot_limit",
+    "org_frozen", "org_suspended", "too_many_runs",
 }
 
 
@@ -59,6 +60,10 @@ def failure_of(status, code=None):
         return {"failure_class": "ok", "retryable": False}
     if c == "exec_timeout":
         return {"failure_class": "timeout", "retryable": False}
+    if c == "idempotency_in_progress":
+        return {"failure_class": "infra", "retryable": True}
+    if 400 <= status < 500 and re.match(r"^(invalid|bad|missing|unknown)_", c):
+        return {"failure_class": "client", "retryable": False}
     if "timeout" in c:
         return {"failure_class": "timeout", "retryable": True}
     if c in RATE_CODES:

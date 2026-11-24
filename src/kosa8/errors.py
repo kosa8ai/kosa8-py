@@ -9,7 +9,8 @@ exactly as the daemon sent it. Mirrors ``@kosa8/sdk``'s errors.ts.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 
 class Kosa8Error(Exception):
@@ -84,7 +85,73 @@ class Kosa8ConnectionError(Kosa8Error):
 
 
 class Kosa8ApiError(Kosa8Error):
-    """The daemon answered with an HTTP error."""
+    """The daemon (or kosa8 Cloud) answered with an HTTP error.
+
+    kosa8 Cloud's refusal fields are read from the answer's body, ``None``
+    when it did not send them: ``upgrade_url`` and ``agent_message`` (402,
+    and 429 ``quota_exceeded``), ``request_url`` (429 ``quota_exceeded``),
+    and for a 402 ``plan_limit`` / ``plan_feature`` ``limit_name``,
+    ``limit``, ``used``, ``plan``, ``next_plan``, ``feature``, ``options``
+    and ``pack_url``.
+    """
+
+    @property
+    def upgrade_url(self) -> Optional[str]:
+        """Where the person adds a payment method or credit, or raises the cap."""
+        return _body_str(self.body, "upgrade_url")
+
+    @property
+    def agent_message(self) -> Optional[str]:
+        """A sentence an AI agent should relay to its person word for word."""
+        return _body_str(self.body, "agent_message")
+
+    @property
+    def request_url(self) -> Optional[str]:
+        """429 ``quota_exceeded``: where to ask for a higher limit."""
+        return _body_str(self.body, "request_url")
+
+    @property
+    def limit_name(self) -> Optional[str]:
+        """402 ``plan_limit``: ``sandbox_hours``, ``running``, ``size``, ``persistent`` or ``snapshots``."""
+        return _body_str(self.body, "limit_name")
+
+    @property
+    def limit(self) -> Optional[float]:
+        """402 ``plan_limit``: the plan's limit."""
+        return _body_num(self.body, "limit")
+
+    @property
+    def used(self) -> Optional[float]:
+        """402 ``plan_limit``: what the organization has used."""
+        return _body_num(self.body, "used")
+
+    @property
+    def plan(self) -> Optional[str]:
+        """402 ``plan_limit`` / ``plan_feature``: the organization's plan."""
+        return _body_str(self.body, "plan")
+
+    @property
+    def next_plan(self) -> Optional[str]:
+        """The first plan that includes more (``None``: contact sales, or not sent)."""
+        return _body_str(self.body, "next_plan")
+
+    @property
+    def feature(self) -> Optional[str]:
+        """402 ``plan_feature``: the feature the plan lacks."""
+        return _body_str(self.body, "feature")
+
+    @property
+    def pack_url(self) -> Optional[str]:
+        """402 ``plan_limit``: where to add the add-on pack for this limit."""
+        return _body_str(self.body, "pack_url")
+
+    @property
+    def options(self) -> List[Dict[str, Any]]:
+        """402 ``plan_limit``: the ways past the limit, cheaper first (``kind``
+        ``pack`` or ``upgrade``, ``label``, ``monthly_usd``, ``url``); ``[]``
+        when none were sent."""
+        o = self.body.get("options") if isinstance(self.body, dict) else None
+        return [x for x in o if isinstance(x, dict)] if isinstance(o, list) else []
 
 
 class Kosa8BadRequestError(Kosa8ApiError):
@@ -161,15 +228,10 @@ class Kosa8PaymentRequiredError(Kosa8ApiError):
     ``upgrade_url`` is where the person adds a payment method or credit, and
     ``agent_message`` a sentence an AI agent should relay to its person word
     for word (stop, don't retry). Both are ``None`` when the cloud sent none.
+    A ``plan_limit`` also carries ``limit_name``, ``limit``, ``used``,
+    ``plan``, ``next_plan``, ``options`` and ``pack_url`` (see
+    :class:`Kosa8ApiError`).
     """
-
-    @property
-    def upgrade_url(self) -> Optional[str]:
-        return _body_str(self.body, "upgrade_url")
-
-    @property
-    def agent_message(self) -> Optional[str]:
-        return _body_str(self.body, "agent_message")
 
 
 class Kosa8OrgFrozenError(Kosa8ApiError):
@@ -184,6 +246,8 @@ class Kosa8RateLimitError(Kosa8ApiError):
     """429: too many requests, or a quota reached (``quota_exceeded``).
 
     ``retry_after`` is the server's Retry-After in seconds, when it sent one.
+    A ``quota_exceeded`` also carries ``agent_message`` (relay it to the
+    person) and ``request_url`` (where to ask for a higher limit).
     """
 
 
@@ -222,6 +286,11 @@ def _body_str(body: Any, key: str) -> Optional[str]:
     if isinstance(body, dict) and isinstance(body.get(key), str) and body[key]:
         return body[key]
     return None
+
+
+def _body_num(body: Any, key: str) -> Optional[float]:
+    v = body.get(key) if isinstance(body, dict) else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
 _BY_STATUS = {
@@ -297,8 +366,12 @@ _ALWAYS_RETRYABLE = frozenset({"database_busy", "template_building"})
 _RATE_CODES = frozenset({"rate_limited", "slow_down", "too_soon"})
 _QUOTA_CODES = frozenset({
     "quota_exceeded", "running_limit", "plan_required", "plan_limit", "plan_feature", "payment_required",
-    "payment_declined", "spending_cap_reached", "snapshot_limit", "org_frozen", "org_suspended", "too_many_runs",
+    "payment_failed", "payment_declined", "spending_cap_reached", "spend_cap", "starter_limit", "snapshot_limit",
+    "org_frozen", "org_suspended", "too_many_runs",
 })
+#: A bad parameter is the caller's to fix, whatever it names (invalid_timeout
+#: is not a timeout): failures.js checks this before the timeout rule.
+_CLIENT_CODE_RE = re.compile(r"^(invalid|bad|missing|unknown)_")
 #: A duplicate of an Idempotency-Key request that is still running: asking
 #: again (after its ``retry_after_s``) gets the first one's answer.
 IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
@@ -312,6 +385,10 @@ def failure_of(status: Optional[int], code: Optional[str] = None) -> "tuple[str,
         return "ok", False
     if c == "exec_timeout":
         return "timeout", False
+    if c == IDEMPOTENCY_IN_PROGRESS:
+        return "infra", True
+    if 400 <= status < 500 and _CLIENT_CODE_RE.match(c):
+        return "client", False
     if "timeout" in c:
         return "timeout", True
     if c in _RATE_CODES:
@@ -343,7 +420,7 @@ def classify_failure(exc: BaseException) -> "tuple[str, bool]":
     :class:`Kosa8Error` is ``error`` (not retryable): a bug in your code.
     """
     if isinstance(exc, Kosa8Error) and exc.code == IDEMPOTENCY_IN_PROGRESS:
-        return "client", True
+        return "infra", True
     if isinstance(exc, Kosa8Error) and exc.code in _ALWAYS_RETRYABLE:
         return "infra", True
     body = getattr(exc, "body", None)
@@ -365,19 +442,3 @@ def classify_failure(exc: BaseException) -> "tuple[str, bool]":
     if exc.status is None:
         return "error", False
     return failure_of(exc.status, exc.code)
-    if isinstance(exc, Kosa8ExecTimeoutError):
-        return "timeout", False
-    if isinstance(exc, (Kosa8ConnectionError, Kosa8TimeoutError)):
-        return "infra", True
-    status, code = exc.status, exc.code
-    if code in _INFRA_CODES:
-        return "infra", True
-    if status == 429:
-        return "quota", code != "quota_exceeded"
-    if code in _QUOTA_CODES or status in (402, 423):
-        return "quota", False
-    if status is not None and status >= 500 and status != 501:
-        return "infra", True
-    if status is not None:
-        return "client", False
-    return "error", False

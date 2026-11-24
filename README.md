@@ -251,9 +251,9 @@ box.previews.delete(3000); box.schedules.delete("sch_..."); box.code_contexts.de
 
 | Error | When | What to do |
 |---|---|---|
-| `Kosa8PaymentRequiredError` (402) | no payment method (`payment_required`), spending cap reached (`spending_cap_reached`), Store price not accepted | show `e.upgrade_url`; an agent should relay `e.agent_message` to its person and stop |
+| `Kosa8PaymentRequiredError` (402) | no plan or payment method (`plan_required`, `payment_required`), spending cap reached (`spend_cap`), a plan limit (`plan_limit`: `e.limit_name`, `e.limit`, `e.used`, `e.next_plan`, `e.options`, `e.pack_url`) or feature (`plan_feature`: `e.feature`), Store price not accepted | show `e.upgrade_url`; an agent should relay `e.agent_message` to its person and stop |
 | `Kosa8OrgFrozenError` (423, `org_frozen`) | the org is frozen in the Security Center | an owner or admin unfreezes it; retrying does not help |
-| `Kosa8RateLimitError` (429) | too many requests, or `quota_exceeded` (active sandbox limit) | wait `e.retry_after` seconds when set, or delete sandboxes |
+| `Kosa8RateLimitError` (429) | too many requests, or `quota_exceeded` (active sandbox limit) | wait `e.retry_after` seconds when set; for `quota_exceeded` relay `e.agent_message`, delete sandboxes or ask for more at `e.request_url` |
 | `Kosa8ExecTimeoutError` (504 `exec_timeout`, or today's 502 "timed out") | a buffered exec ran past its 90 s limit | run it in the background and poll |
 | `Kosa8UnsupportedError` (501) | the host has no data plane yet (files, checkpoints, fork, ports) | use `exec`, or try later |
 
