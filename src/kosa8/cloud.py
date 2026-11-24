@@ -71,8 +71,12 @@ from .cloud_api import (
     CloudBenchmarks,
     CloudFunctions,
     CloudRL,
+    CloudGitHub,
     CloudRuns,
     CloudWebhooks,
+    pull_request_body,
+    push_body,
+    repo_body,
 )
 from .cloud_features import (
     CloudBackgroundExec,
@@ -750,6 +754,8 @@ class Kosa8Cloud:
         self.rl = CloudRL(self)
         #: One-call serverless runs (POST /v1/run) and their history.
         self.runs = CloudRuns(self)
+        #: The org's connected GitHub: status, repos, branches.
+        self.github = CloudGitHub(self)
 
     def __repr__(self) -> str:  # never the key
         return f"Kosa8Cloud(base_url={self.base_url!r})"
@@ -1173,6 +1179,7 @@ def _create_body(
     snapshot: Optional[Union[str, Mapping[str, Any]]], egress: Optional[Mapping[str, Any]],
     secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
     run_id: Optional[str], record: Optional[bool] = None, ai_gateway: Optional[bool] = None,
+    repo: Union[str, Mapping[str, Any], None] = None,
 ) -> Dict[str, Any]:
     """The body of ``POST /v1/sandboxes`` (checked). Labels, ``kosa8.run``
     included, go in the body: kosa8 Cloud stores them before it answers, so a
@@ -1234,6 +1241,8 @@ def _create_body(
         body["secrets"] = list(secrets)
     if labels:
         body["labels"] = dict(labels)
+    if repo is not None:
+        body["repo"] = repo_body(repo)
     return body
 
 
@@ -1268,6 +1277,7 @@ class CloudSandboxes:
         run_id: Optional[str] = None,
         record: Optional[bool] = None,
         ai_gateway: Optional[bool] = None,
+        repo: Union[str, Mapping[str, Any], None] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -1299,7 +1309,11 @@ class CloudSandboxes:
         routes its model calls through the org's AI gateway (``cloud.ai``): it
         gets ``OPENAI_BASE_URL``, ``ANTHROPIC_BASE_URL``, ``KOSA8_AI_GATEWAY_URL``
         and ``KOSA8_AI_TOKEN`` in its env; ``False`` opts it out when the gateway
-        covers all sandboxes.
+        covers all sandboxes. ``repo`` starts it from a repo of the org's
+        connected GitHub (``"owner/name"``, ``"owner/name@ref"`` or ``{"name",
+        "ref", "path", "depth"}``), cloned into /workspace/<name>; no GitHub
+        token enters the sandbox. ``info["repo"]["status"]`` says whether the
+        clone is done (:meth:`CloudSandbox.repo` checks again).
 
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
@@ -1324,7 +1338,7 @@ class CloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
-            ai_gateway=ai_gateway,
+            ai_gateway=ai_gateway, repo=repo,
         )
         r = self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = CloudSandbox(self._cloud, r["sandbox"])
@@ -1774,6 +1788,32 @@ class CloudSandbox:
             body["timeout_s"] = t
         path = self._path("/exec")
         return CloudExecStream(self._cloud._stream("POST", path, body), path)
+
+    def repo(self) -> Dict[str, Any]:
+        """The GitHub repo it was started from (``full_name``, ``ref``,
+        ``sha``, ``path``, ``status``) with ``changes`` (files changed,
+        insertions, deletions). A clone still pending is tried again."""
+        r = self._cloud._request("GET", self._path("/repo")) or {}
+        repo = r.get("repo", r) if isinstance(r, dict) else {}
+        self.info["repo"] = repo
+        return repo
+
+    def push(self, *, branch: Optional[str] = None, message: Optional[str] = None,
+             path: Optional[str] = None) -> Dict[str, Any]:
+        """Commit everything that changed in its repo and push it to
+        ``branch`` (default ``kosa8/<short id>``): ``branch``, ``sha``,
+        ``compare_url``, ``files_changed``. kosa8 pushes with a token for this
+        one repo that never enters the sandbox. Nothing changed:
+        :class:`~kosa8.Kosa8NoChangesError`."""
+        return self._cloud._request("POST", self._path("/github/push"), push_body(branch, message, path)) or {}
+
+    def pull_request(self, *, title: Optional[str] = None, body: Optional[str] = None, base: Optional[str] = None,
+                     branch: Optional[str] = None, draft: Optional[bool] = None) -> Dict[str, Any]:
+        """Push (as :meth:`push`) and open a pull request into ``base``
+        (default the repo's default branch), a draft unless ``draft=False``:
+        ``number``, ``url``, ``branch``, ``sha``."""
+        return self._cloud._request(
+            "POST", self._path("/github/pull-request"), pull_request_body(title, body, base, branch, draft)) or {}
 
     def direct(self) -> Dict[str, Any]:
         """A token to send this sandbox's commands (and files) to its host

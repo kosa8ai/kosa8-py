@@ -156,6 +156,21 @@ hook = cloud.pipelines.hooks.create("https://github.com/me/app", provider="githu
 print(hook["url"], hook["secret"])                    # give both to the repository's webhook settings
 ```
 
+### GitHub repos
+
+Connect GitHub once (app.kosa8.com Settings → GitHub, or `kosa8 github connect`), then start from a repo and send changes back. kosa8 uses a GitHub token for one repo and one operation (at most an hour); it never enters the sandbox, and every use is in the audit log.
+
+```python
+cloud.github.repos("api")                       # repos you connected, most recently pushed first
+box = cloud.sandboxes.create(repo="acme/api@main")   # cloned into /workspace/api
+box.exec("cd /workspace/api && make fix")
+pr = box.pull_request(title="Fix the flaky test")   # pushes kosa8/<id> and opens a draft PR
+print(pr["url"])
+cloud.run(command="npm test", repo="acme/web")   # a run in a checkout
+```
+
+`Kosa8GitHubNotConnectedError.connect_url` and `Kosa8GitHubPermissionsError.settings_url` say where to fix the two setup errors.
+
 ### Browsers (headless Chromium over CDP)
 
 A cloud browser is headless Chromium you drive over CDP with Playwright or

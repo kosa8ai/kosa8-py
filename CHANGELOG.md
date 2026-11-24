@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GitHub repos: `repo=` on `cloud.sandboxes.create` and `cloud.run` (`"owner/name"`, `"owner/name@ref"` or `{"name", "ref", "path", "depth"}`) starts the sandbox or run in a checkout of a repo of the org's connected GitHub; `cloud.github.status()`, `repos(query, page=)`, `repos_page(...)` and `branches("owner/name")`; `box.repo()` (the checkout and its changes), `box.push(branch=, message=, path=)` and `box.pull_request(title=, body=, base=, branch=, draft=)`. kosa8 uses a GitHub token for one repo and one operation (at most an hour) that never enters the sandbox. New errors: `Kosa8GitHubNotConnectedError` (`connect_url`), `Kosa8GitHubPermissionsError` (`missing_permissions`, `settings_url`) and `Kosa8NoChangesError` (all `Kosa8ConflictError`), `Kosa8RepoNotFoundError` (a `Kosa8NotFoundError`), `Kosa8GitHubUnavailableError`. Async client too.
+
 ## 0.8.0 - 2026-11-23
 
 - Serverless runs: `cloud.run(code)` / `cloud.run(command=...)` runs in a fresh sandbox in one call and returns the run (status, exit, stdout, stderr, files, `cost_usd`, `view_url`), waiting past the run's own `timeout_s`; `cloud.runs` lists, gets and shares runs. `box.direct()` asks `POST /v1/sandboxes/{id}/direct` for a host exec token. Both in the async client too.
