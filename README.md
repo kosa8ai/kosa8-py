@@ -171,6 +171,20 @@ cloud.run(command="npm test", repo="acme/web")   # a run in a checkout
 
 `Kosa8GitHubNotConnectedError.connect_url` and `Kosa8GitHubPermissionsError.settings_url` say where to fix the two setup errors.
 
+### Autopilot bots
+
+Bots watch the org's sandboxes, spend and agents and act. They start as drafts; a person turns one on.
+
+```python
+print(cloud.bots.plan(template="spend-guard", replay=True)["plan"]["summary"])
+bot = cloud.bots.create(template="spend-guard", budget_usd=5)   # a draft
+run = cloud.bots.run(bot["id"])          # dry run by default: what it would do, plus a 7-day replay
+cloud.bots.pause_all()                   # any admin credential, agents included, can stop every bot
+cloud.approvals.list()                   # T3 actions waiting on a person
+```
+
+`enable`, `resume_all` and `approvals.approve` / `reject` need a person's credential; anything else raises `Kosa8HumanApprovalRequiredError` (403 `human_required`). An agent never approves its own action: a person approves in the web app, desktop, CLI or Slack.
+
 ### Browsers (headless Chromium over CDP)
 
 A cloud browser is headless Chromium you drive over CDP with Playwright or

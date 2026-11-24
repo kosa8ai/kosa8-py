@@ -92,6 +92,7 @@ from .cloud_api import (
     push_body,
 )
 from .cloud_browser import AsyncCloudAI, AsyncCloudBrowser, AsyncCloudBrowsers
+from .cloud_bots import AsyncCloudApprovals, AsyncCloudBots
 from .errors import (
     Kosa8ApiError,
     Kosa8ConnectionError,
@@ -240,6 +241,10 @@ class AsyncCloud:
         self.runs = AsyncCloudRuns(self)
         #: The org's connected GitHub (see :class:`kosa8.cloud_api.CloudGitHub`).
         self.github = AsyncCloudGitHub(self)
+        #: Approvals T3 bot actions wait on (see :class:`kosa8.cloud_bots.CloudApprovals`).
+        self.approvals = AsyncCloudApprovals(self)
+        #: Autopilot bots (see :class:`kosa8.cloud_bots.CloudBots`).
+        self.bots = AsyncCloudBots(self, self.approvals)
 
     def __repr__(self) -> str:
         return f"AsyncCloud(base_url={self.base_url!r})"

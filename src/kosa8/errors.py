@@ -197,6 +197,18 @@ class Kosa8ApprovalRequiredError(Kosa8PolicyError):
         self.approval = approval
 
 
+class Kosa8HumanApprovalRequiredError(Kosa8PolicyError):
+    """403 ``human_required``: only a person can do this (turn a bot on, resume
+    every bot, decide an approval). Capability tokens, MCP and org keys bound to
+    no member are never a person. An agent never approves its own action; a
+    person approves in the web app (app.kosa8.com/app#autopilot), desktop, CLI
+    or Slack. There is no way around it from code."""
+
+
+#: Short name for :class:`Kosa8HumanApprovalRequiredError`.
+HumanApprovalRequired = Kosa8HumanApprovalRequiredError
+
+
 class Kosa8NotFoundError(Kosa8ApiError):
     """404: no such sandbox, snapshot, container, ..."""
 
@@ -347,6 +359,7 @@ _BY_CODE = {
     (409, "github_permissions"): Kosa8GitHubPermissionsError,
     (409, "no_changes"): Kosa8NoChangesError,
     (404, "repo_not_found"): Kosa8RepoNotFoundError,
+    (403, "human_required"): Kosa8HumanApprovalRequiredError,
 }
 
 
