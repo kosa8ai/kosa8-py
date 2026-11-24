@@ -210,6 +210,17 @@ class CloudExecResult:
     #: ``ok`` (exit 0) or ``exit_nonzero``, as the API sent it (worked out from
     #: the exit code when it sent none).
     failure_class: Optional[str] = None
+    #: A buffered exec keeps the first and last 1 MiB of each stream: True
+    #: when the middle of stdout (or stderr) was dropped. Use
+    #: :meth:`CloudSandbox.exec_stream` (or ``stream=True``) for all of it.
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    #: How many bytes the command wrote to each stream, kept or not (``None``
+    #: when the API did not say).
+    stdout_bytes: Optional[int] = None
+    stderr_bytes: Optional[int] = None
+    #: Whether running it again may work (the API's ``retryable``).
+    retryable: bool = False
 
 
 @dataclass
@@ -283,6 +294,10 @@ def _exec_result(r: Mapping[str, Any]) -> CloudExecResult:
     return CloudExecResult(
         exit_code=code, stdout=r.get("stdout") or "", stderr=r.get("stderr") or "",
         woke_ms=r.get("woke_ms"), failure_class=fc,
+        stdout_truncated=r.get("stdout_truncated") is True, stderr_truncated=r.get("stderr_truncated") is True,
+        stdout_bytes=r["stdout_bytes"] if _is_int(r.get("stdout_bytes")) else None,
+        stderr_bytes=r["stderr_bytes"] if _is_int(r.get("stderr_bytes")) else None,
+        retryable=r.get("retryable") is True,
     )
 
 
@@ -1610,12 +1625,16 @@ class CloudSandbox:
         callbacks get the output as the command prints it, and the command is
         not held to 90 s. The result is the same either way.
 
-        Each exec runs in a fresh container: only ``/workspace`` persists, so
-        ``cd``, ``export`` and packages installed elsewhere are gone by the
-        next one. kosa8 Cloud stops a buffered exec after 90 s, and
+        Commands run in the sandbox's own long-lived container, whose
+        filesystem lasts between commands (one naming another ``image`` runs
+        in a fresh container that shares only ``/workspace``); a process a
+        command leaves behind may not outlive it unless the sandbox is
+        ``persistent`` (or use :meth:`exec_background`). kosa8 Cloud stops a buffered exec after 90 s, and
         this raises :class:`~kosa8.Kosa8ExecTimeoutError`; run long work in
         the background (``nohup sh -c '...' > /workspace/job.log 2>&1 &``) and
-        poll it. The request (command and env) is at most 64 KiB.
+        poll it. The request (command and env) is at most 64 KiB. A buffered
+        answer keeps the first and last 1 MiB of each stream:
+        ``stdout_truncated`` says when the middle was dropped.
 
         ``timeout_s`` (1 to 90 whole seconds) stops the command in the sandbox
         when it runs that long: :class:`~kosa8.Kosa8ExecTimeoutError` then
