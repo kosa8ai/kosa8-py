@@ -634,6 +634,13 @@ def _collect(
                 raise Kosa8StreamError(
                     f["error"], so.decode("utf-8", "replace"), se.decode("utf-8", "replace"), daemon_message=f["error"]
                 )
+            # Only ok is a result (exit is left out when 0): a final frame with
+            # neither ok nor an error is never taken for exit 0.
+            if not f.get("ok"):
+                raise Kosa8StreamError(
+                    "the stream ended without a result (no ok, no error)",
+                    so.decode("utf-8", "replace"), se.decode("utf-8", "replace"),
+                )
             ex = f.get("exit")
             return ExecResult(exit_code=ex if isinstance(ex, int) else 0, stdout_bytes=so, stderr_bytes=se)
         data = f.get("data")

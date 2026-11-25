@@ -4,6 +4,9 @@
 
 - `Kosa8Cloud()` (and `AsyncCloud()`, and the E2B/Daytona/Modal shims) with no key and no `KOSA8_API_KEY` uses the key `kosa8 login` keeps in `~/.kosa8/cloud.json`, and its `api_url` unless `KOSA8_CLOUD_URL` or `base_url=` is set. The "no API key" error now names `kosa8 login`.
 - A plan limit answered with HTTP 429 (Starter's running limit, `starter_limit`) raises the new `Kosa8PlanLimitError`: a `Kosa8PaymentRequiredError`, like every other plan limit, and still a `Kosa8RateLimitError` for older code. It is not retried.
+- Background commands: `job.read(offset, limit=)` reads the output from a byte offset (`output`, `next_offset`, `output_more`), and `job.follow(offset=0)` yields all of it as it is written until the command exits (`job.info["exit"]` then), reading again from the same byte after a lost connection, a 5xx or a 429. Async client too (`async for text in job.follow()`).
+- A streamed cloud exec that the API ends with `code: "stream_interrupted"` (the connection to the host was lost before the command ended) raises `Kosa8StreamError` with that code and no exit code; it was already never reported as complete.
+- Local runs: a final frame from kosa8d with neither `ok` nor an error now raises `Kosa8StreamError` instead of passing for exit 0.
 
 ## 0.10.0 - 2026-11-25
 
