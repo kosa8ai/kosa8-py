@@ -1206,6 +1206,18 @@ def _check_lifetime(ttl_s: Optional[int], delete_after: Optional[int]) -> None:
         raise ValueError("delete_after must be a Unix time in milliseconds")
 
 
+#: What a sandbox's timeout (``ttl_s`` / ``delete_after``) does.
+ON_TIMEOUT = ("sleep", "delete")
+
+#: Why a sandbox stopped running (``CloudSandbox.end_reason``).
+END_REASONS = ("timeout", "idle", "user", "quota", "org_max_lifetime", "crash", "host")
+
+
+def _check_on_timeout(on_timeout: Optional[str]) -> None:
+    if on_timeout is not None and on_timeout not in ON_TIMEOUT:
+        raise ValueError('on_timeout must be "sleep" (keep memory and files, asleep) or "delete"')
+
+
 def _check_sleep_after(sleep_after_s: Optional[int]) -> None:
     if sleep_after_s is not None and (not _is_int(sleep_after_s) or not 0 <= sleep_after_s <= MAX_SLEEP_AFTER_S):
         raise ValueError(f"sleep_after_s must be a whole number of seconds from 0 (never) to {MAX_SLEEP_AFTER_S}")
@@ -1220,6 +1232,7 @@ def _create_body(
     secrets: Optional[Sequence[str]], labels: Optional[Mapping[str, str]], lease_s: Optional[int],
     run_id: Optional[str], record: Optional[bool] = None, ai_gateway: Optional[bool] = None,
     repo: Union[str, Mapping[str, Any], None] = None,
+    on_timeout: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The body of ``POST /v1/sandboxes`` (checked). Labels, ``kosa8.run``
     included, go in the body: kosa8 Cloud stores them before it answers, so a
@@ -1283,6 +1296,9 @@ def _create_body(
         body["labels"] = dict(labels)
     if repo is not None:
         body["repo"] = repo_body(repo)
+    if on_timeout is not None:
+        _check_on_timeout(on_timeout)
+        body["on_timeout"] = on_timeout
     return body
 
 
@@ -1318,6 +1334,7 @@ class CloudSandboxes:
         record: Optional[bool] = None,
         ai_gateway: Optional[bool] = None,
         repo: Union[str, Mapping[str, Any], None] = None,
+        on_timeout: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -1358,8 +1375,12 @@ class CloudSandboxes:
         ``template`` is a key from :meth:`Kosa8Cloud.templates` (default the
         org's default, ``base``: Alpine, busybox sh, no bash or python) or a
         kosa8 Store item, ``creator/name`` or ``creator/name@1.2.3``.
-        ``ttl_s`` (60 s to 90 days) or ``delete_after`` (Unix ms) deletes it
-        automatically: set one so a crashed script cannot leave it running.
+        ``ttl_s`` (60 s to 90 days) or ``delete_after`` (Unix ms) is its
+        timeout: set one so a crashed script cannot leave it running.
+        ``on_timeout`` says what the timeout does: ``"sleep"`` keeps it asleep,
+        memory and files (the default where it can sleep), ``"delete"`` removes
+        it (the default for a lease or a sandbox that never sleeps).
+        ``box.end_reason`` then says why it stopped (:data:`END_REASONS`).
         ``sleep_after_s`` is the idle time before it sleeps (0 never; default
         300). ``accept_price`` is a paid Store item's current price in USD,
         which the person agreed to.
@@ -1378,7 +1399,7 @@ class CloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
-            ai_gateway=ai_gateway, repo=repo,
+            ai_gateway=ai_gateway, repo=repo, on_timeout=on_timeout,
         )
         r = self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = CloudSandbox(self._cloud, r["sandbox"])
@@ -1723,6 +1744,28 @@ class CloudSandbox:
         return self.info.get("state", "")
 
     @property
+    def on_timeout(self) -> Optional[str]:
+        """What its timeout does: ``"sleep"`` or ``"delete"``."""
+        return self.info.get("on_timeout")
+
+    @property
+    def timeout(self) -> Optional[Dict[str, Any]]:
+        """Its coming timeout, ``{"at", "in_s", "action"}``, or None."""
+        return self.info.get("timeout")
+
+    @property
+    def end(self) -> Optional[Dict[str, Any]]:
+        """Why and when it stopped running (``reason``, ``action``, ``at``,
+        ``detail``, ``message``), or None while it runs."""
+        return self.info.get("end")
+
+    @property
+    def end_reason(self) -> Optional[str]:
+        """Why it stopped running, one of :data:`END_REASONS`, or None while it runs."""
+        e = self.info.get("end")
+        return e.get("reason") if isinstance(e, dict) else self.info.get("end_reason")
+
+    @property
     def overflow(self) -> bool:
         """Whether it runs on kosa8's overflow capacity (Cloudflare), which has
         no checkpoint, rewind, fork, sleep or snapshot (those answer 501
@@ -1886,12 +1929,15 @@ class CloudSandbox:
         delete_after: Optional[int] = None,
         sleep_after_s: Optional[int] = None,
         clear_lifetime: bool = False,
+        on_timeout: Optional[str] = None,
     ) -> "CloudSandbox":
-        """Change its lifetime or sleep timer.
+        """Change its timeout, what the timeout does, or its sleep timer.
 
         ``ttl_s`` counts from now; ``clear_lifetime=True`` removes the
-        automatic delete. A new ``sleep_after_s`` is recorded; the host keeps
-        the idle time the sandbox started with until it can change it in place.
+        timeout. ``on_timeout`` is ``"sleep"`` or ``"delete"``. A new
+        ``sleep_after_s`` takes effect at once where the host can change it
+        in place; otherwise ``info`` carries a note that the host keeps the
+        old one.
         """
         if clear_lifetime and (ttl_s is not None or delete_after is not None):
             raise ValueError("clear_lifetime cannot be combined with ttl_s or delete_after")
@@ -1906,8 +1952,11 @@ class CloudSandbox:
             body["delete_after"] = delete_after
         if sleep_after_s is not None:
             body["sleep_after_s"] = sleep_after_s
+        if on_timeout is not None:
+            _check_on_timeout(on_timeout)
+            body["on_timeout"] = on_timeout
         if not body:
-            raise ValueError("give ttl_s, delete_after, sleep_after_s or clear_lifetime")
+            raise ValueError("give ttl_s, delete_after, sleep_after_s, on_timeout or clear_lifetime")
         self.info = self._cloud._request("PATCH", self._path(), body)["sandbox"]
         return self
 

@@ -3,6 +3,8 @@ import socket
 import unittest
 import urllib.parse
 
+import kosa8
+
 from kosa8 import (
     DEFAULT_CLOUD_URL,
     Kosa8ApiError,
@@ -179,6 +181,26 @@ class CloudTest(unittest.TestCase):
             box.update()
         with self.assertRaises(ValueError):
             box.update(clear_lifetime=True, ttl_s=60)
+
+    def test_lifetime_contract(self):
+        # on_timeout goes in the create and the update; end and timeout read back.
+        stub = Stub(lambda s: (201 if s["method"] == "POST" else 200, {"sandbox": sbx(
+            on_timeout="sleep", timeout={"at": 5, "in_s": 60, "action": "sleep"}, end=None)}))
+        cloud = Kosa8Cloud(KEY, env={}, opener=stub)
+        box = cloud.sandboxes.create(ttl_s=60, on_timeout="sleep", wait=False)
+        self.assertEqual(stub.seen[-1]["body"]["on_timeout"], "sleep")
+        self.assertEqual((box.on_timeout, box.timeout["action"], box.end, box.end_reason), ("sleep", "sleep", None, None))
+        box.update(on_timeout="delete")
+        self.assertEqual(stub.seen[-1]["body"], {"on_timeout": "delete"})
+        n = len(stub.seen)
+        with self.assertRaises(ValueError):
+            cloud.sandboxes.create(on_timeout="pause")
+        with self.assertRaises(ValueError):
+            box.update(on_timeout="pause")
+        self.assertEqual(len(stub.seen), n)
+        box.info = sbx(state="sleeping", end={"reason": "timeout", "action": "slept", "at": 9, "detail": None, "message": "Asleep."})
+        self.assertEqual(box.end_reason, "timeout")
+        self.assertIn(box.end_reason, kosa8.END_REASONS)
 
     def test_list_pages_and_falls_back(self):
         pages = {

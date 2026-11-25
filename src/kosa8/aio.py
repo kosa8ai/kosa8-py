@@ -428,6 +428,7 @@ class AsyncCloudSandboxes:
         record: Optional[bool] = None,
         ai_gateway: Optional[bool] = None,
         repo: Union[str, Mapping[str, Any], None] = None,
+        on_timeout: Optional[str] = None,
         wait: bool = True,
         wait_timeout: float = 300.0,
         idempotency_key: Optional[str] = None,
@@ -439,7 +440,7 @@ class AsyncCloudSandboxes:
             delete_after=delete_after, accept_price=accept_price, size=size, cpus=cpus, mem_mb=mem_mb, image=image,
             disk_gb=disk_gb, persistent=persistent, docker=docker, cpu=cpu, name=name, env=env, snapshot=snapshot,
             egress=egress, secrets=secrets, labels=labels, lease_s=lease_s, run_id=run_id, record=record,
-            ai_gateway=ai_gateway, repo=repo,
+            ai_gateway=ai_gateway, repo=repo, on_timeout=on_timeout,
         )
         r = await self._cloud._request("POST", "/v1/sandboxes", body, idempotency_key=idempotency_key)
         box = AsyncCloudSandbox(self._cloud, r["sandbox"])
@@ -557,6 +558,27 @@ class AsyncCloudSandbox:
     @property
     def state(self) -> str:
         return self.info.get("state", "")
+
+    @property
+    def on_timeout(self) -> Optional[str]:
+        """See :attr:`kosa8.CloudSandbox.on_timeout`."""
+        return self.info.get("on_timeout")
+
+    @property
+    def timeout(self) -> Optional[Dict[str, Any]]:
+        """See :attr:`kosa8.CloudSandbox.timeout`."""
+        return self.info.get("timeout")
+
+    @property
+    def end(self) -> Optional[Dict[str, Any]]:
+        """See :attr:`kosa8.CloudSandbox.end`."""
+        return self.info.get("end")
+
+    @property
+    def end_reason(self) -> Optional[str]:
+        """See :attr:`kosa8.CloudSandbox.end_reason`."""
+        e = self.info.get("end")
+        return e.get("reason") if isinstance(e, dict) else self.info.get("end_reason")
 
     @property
     def files(self) -> "AsyncCloudFiles":
