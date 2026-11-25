@@ -20,13 +20,14 @@ pip install kosa8
 
 ## Quickstart: kosa8 Cloud
 
-Sign up free at https://app.kosa8.com (the Starter tier, no card), make an API key, and set
+Sign up free at https://app.kosa8.com (the Starter tier, no card), then either run `kosa8 login`
+(the SDK reads the key it keeps in `~/.kosa8/cloud.json`) or make an API key and set
 `KOSA8_API_KEY`. That is all you need to run the code below.
 
 ```python
 from kosa8 import Kosa8Cloud
 
-cloud = Kosa8Cloud()  # KOSA8_API_KEY from the environment; or Kosa8Cloud("k8c_live_...")
+cloud = Kosa8Cloud()  # KOSA8_API_KEY, else your `kosa8 login`; or Kosa8Cloud("k8c_live_...")
 
 box = cloud.sandboxes.create(template="python", ttl_s=3600)   # deleted automatically after an hour
 r = box.exec(["python3", "-c", "print(6 * 7)"])

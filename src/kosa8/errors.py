@@ -300,6 +300,14 @@ class Kosa8RateLimitError(Kosa8ApiError):
     """
 
 
+class Kosa8PlanLimitError(Kosa8PaymentRequiredError, Kosa8RateLimitError):
+    """A plan limit answered with HTTP 429 (Starter's running limit,
+    ``starter_limit``). It is a :class:`Kosa8PaymentRequiredError` (pick a
+    plan, or stop a sandbox; retrying does not help) and, for code written
+    before it existed, still a :class:`Kosa8RateLimitError`.
+    """
+
+
 class Kosa8ExecTimeoutError(Kosa8ApiError, Kosa8TimeoutError):
     """A kosa8 Cloud exec ran past the API's limit for a buffered command.
 
@@ -354,6 +362,10 @@ _BY_STATUS = {
     501: Kosa8UnsupportedError,
 }
 
+#: Codes that mean "pick or pay for a plan", raised as
+#: :class:`Kosa8PaymentRequiredError` whatever the HTTP status.
+_PAYMENT_CODES = frozenset({"starter_limit", "plan_limit", "plan_feature", "plan_required"})
+
 _BY_CODE = {
     (409, "github_not_connected"): Kosa8GitHubNotConnectedError,
     (409, "github_permissions"): Kosa8GitHubPermissionsError,
@@ -403,6 +415,10 @@ def error_from_response(
     if status == 403 and _is_refusal(approval):
         return Kosa8ApprovalRequiredError(message, approval, **kw)
     by_code = _BY_CODE.get((status, code)) or (Kosa8GitHubUnavailableError if code == "github_unavailable" else None)
+    if by_code is None and code in _PAYMENT_CODES:
+        # A plan limit is a payment question whatever the status: Starter's
+        # running limit answers 429, and must not look like a rate limit.
+        by_code = Kosa8PlanLimitError if status == 429 else Kosa8PaymentRequiredError
     if by_code is not None:
         return by_code(message, **kw)
     return _BY_STATUS.get(status, Kosa8ApiError)(message, **kw)
