@@ -705,16 +705,21 @@ class Kosa8Cloud:
         with the whole answer split into lines (for tests and custom transports)."""
         env = os.environ if env is None else env
         key = (api_key if api_key is not None else env.get("KOSA8_API_KEY", "")).strip()
+        saved_url = ""
+        if not key and api_key is None:
+            # Signed in with `kosa8 login`: the CLI keeps the key in
+            # ~/.kosa8/cloud.json, shared with the desktop app and the SDKs.
+            key, saved_url = _saved_login(env)
         if not key:
             raise Kosa8Error(
-                "no kosa8 Cloud API key: set KOSA8_API_KEY or pass api_key=...; "
+                "no kosa8 Cloud API key: run `kosa8 login`, set KOSA8_API_KEY or pass api_key=...; "
                 f"make one at {KEYS_URL} (API keys)")
         if not key.startswith((CLOUD_KEY_PREFIX, CLOUD_TOKEN_PREFIX)):
             raise Kosa8Error(
                 f"a kosa8 Cloud API key starts with {CLOUD_KEY_PREFIX} (a capability token with {CLOUD_TOKEN_PREFIX}); "
                 f"copy the whole key from {KEYS_URL}")
         self._key = key
-        self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or DEFAULT_CLOUD_URL)
+        self.base_url = _check_base(base_url or env.get("KOSA8_CLOUD_URL") or saved_url or DEFAULT_CLOUD_URL)
         self.timeout = timeout
         self._open = opener or _urllib_open
         self._stream_open: Optional[StreamOpener] = stream_opener or (None if opener else _urllib_stream_open)
@@ -1086,6 +1091,36 @@ def _is_exec_timeout(status: int, code: Optional[str], message: str, path: str) 
 
 #: Where a person makes a kosa8 Cloud API key.
 KEYS_URL = "https://app.kosa8.com/app#keys"
+
+
+def cloud_credentials_path(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """Where `kosa8 login` keeps the kosa8 Cloud key: ``~/.kosa8/cloud.json``.
+    With an explicit ``env`` mapping, its ``HOME`` decides (none: no file)."""
+    if env is None or env is os.environ:
+        home = os.path.expanduser("~")
+    else:
+        home = env.get("HOME") or env.get("USERPROFILE") or ""
+    if not home or home == "~":
+        return None
+    return os.path.join(home, ".kosa8", "cloud.json")
+
+
+def _saved_login(env: Mapping[str, str]) -> "tuple[str, str]":
+    """The key and API address from ``~/.kosa8/cloud.json`` (written by
+    `kosa8 login`), or ``("", "")`` when there is none or it is unreadable."""
+    path = cloud_credentials_path(env)
+    if not path:
+        return "", ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    key = data.get("key") or data.get("api_key") or ""
+    url = data.get("api_url") or ""
+    return (key.strip() if isinstance(key, str) else ""), (url.strip() if isinstance(url, str) else "")
 _KEY_HINT = f"check KOSA8_API_KEY, or make a new key at {KEYS_URL}"
 _PERSISTENT_HINT = ("in Python: cloud.sandboxes.create(template=\"python\", persistent=True); "
                     "or use kosa8.compat.e2b_code_interpreter.Sandbox, which creates one")
