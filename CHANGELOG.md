@@ -7,6 +7,7 @@
 - Background commands: `job.read(offset, limit=)` reads the output from a byte offset (`output`, `next_offset`, `output_more`), and `job.follow(offset=0)` yields all of it as it is written until the command exits (`job.info["exit"]` then), reading again from the same byte after a lost connection, a 5xx or a 429. Async client too (`async for text in job.follow()`).
 - A streamed cloud exec that the API ends with `code: "stream_interrupted"` (the connection to the host was lost before the command ended) raises `Kosa8StreamError` with that code and no exit code; it was already never reported as complete.
 - Local runs: a final frame from kosa8d with neither `ok` nor an error now raises `Kosa8StreamError` instead of passing for exit 0.
+- Lifetime contract: `on_timeout=` (`"sleep"` or `"delete"`) on `cloud.sandboxes.create` (sync and async) and `box.update`, checked before sending. kosa8 Cloud now puts a sandbox to sleep at its timeout by default where it can sleep. `box.on_timeout`, `box.timeout` (`{"at", "in_s", "action"}`), `box.end` (`reason`, `action`, `at`, `detail`, `message`) and `box.end_reason` (one of `kosa8.END_REASONS`: timeout, idle, user, quota, org_max_lifetime, crash, host) say what the timeout does and why a sandbox stopped. `kosa8.ON_TIMEOUT` lists the choices.
 
 ## 0.10.0 - 2026-11-25
 
