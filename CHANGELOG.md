@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-11-25
 
 - Autopilot: `cloud.bots` lists bots (`list()` answers `bots`, `paused_all`, `pending_approvals`), `templates()` / `template(id)`, `plan(template= | spec=, name=, replay=)`, `compile(text)` (at most 500 characters, checked before sending), `create(template= | spec=, name=, sponsor=, budget_usd=, scope=, notify=)` (a draft; exactly one of template or spec), `get`, `update`, `delete`, `enable`, `disable`, `run(id, dry_run=True)` (a dry run by default), `runs(id, limit=)`, `get_run`, `cancel_run`, `undo_step(run_id, key)`, `pause_all()` and `resume_all()`. `cloud.approvals` (also `cloud.bots.approvals`): `list(state="pending", limit=)`, `get`, `approve(id, reason=, edited_args=)` and `reject(id, reason=)`. A 403 `human_required` (enable, resume-all and deciding an approval need a person's credential) raises the new `Kosa8HumanApprovalRequiredError` (alias `HumanApprovalRequired`, a `Kosa8PolicyError`); there is no way around it from code. Async client too.
 

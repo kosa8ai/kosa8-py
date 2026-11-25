@@ -334,7 +334,7 @@ class Leases(unittest.TestCase):
 class TopLevel(unittest.TestCase):
     def test_cloud_alias(self):
         self.assertIs(kosa8.Cloud, kosa8.Kosa8Cloud)
-        self.assertEqual(kosa8.__version__, "0.9.0")
+        self.assertEqual(kosa8.__version__, "0.10.0")
 
 
 if __name__ == "__main__":

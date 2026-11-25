@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kosa8"
-version = "0.9.0"
+version = "0.10.0"
 description = "Zero Trust cybersecurity infrastructure for AI agents: the kosa8 Python SDK. Each agent in its own microVM, with checkpoint, rewind, fork and explore."
 readme = "README.md"
 license = { text = "MIT" }
