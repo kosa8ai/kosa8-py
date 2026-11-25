@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 - 2026-11-25
 
 - `Kosa8Cloud()` (and `AsyncCloud()`, and the E2B/Daytona/Modal shims) with no key and no `KOSA8_API_KEY` uses the key `kosa8 login` keeps in `~/.kosa8/cloud.json`, and its `api_url` unless `KOSA8_CLOUD_URL` or `base_url=` is set. The "no API key" error now names `kosa8 login`.
 - A plan limit answered with HTTP 429 (Starter's running limit, `starter_limit`) raises the new `Kosa8PlanLimitError`: a `Kosa8PaymentRequiredError`, like every other plan limit, and still a `Kosa8RateLimitError` for older code. It is not retried.
