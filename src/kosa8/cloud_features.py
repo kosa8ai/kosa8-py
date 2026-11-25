@@ -68,8 +68,17 @@ class CloudBackgroundExec(Calls):
     def state(self) -> str:
         return self.info.get("state", "")
 
+    # What a start answered and a later read may leave out (the status read
+    # carries no pid, and the API answers a field it lacks as null): a null
+    # never replaces one already known, so ``id`` stays usable for stop().
+    _KEEP = ("id", "pid", "output_path", "exit_path")
+
     def _set(self, answer: Any) -> Dict[str, Any]:
-        self.info = {**self.info, **(answer or {}).get("exec", {})}
+        got = dict((answer or {}).get("exec") or {})
+        for k in self._KEEP:
+            if got.get(k) is None and self.info.get(k) is not None:
+                got.pop(k, None)
+        self.info = {**self.info, **got}
         return self.info
 
     def status(self) -> Dict[str, Any]:

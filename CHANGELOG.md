@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Background commands: `job.status()`, `job.read()` and `job.stop()` keep the `id`, `pid`, `output_path` and `exit_path` the start answered when a later read answers them as null (the status read carries no pid). Before, a null `id` made the next `stop()` fail with a `TypeError`.
+- README: secret names are lower case (`openai`, `npm-token`); kosa8 Cloud refuses `OPENAI` with 400 `invalid_secret`.
+
 ## 0.11.0 - 2026-11-25
 
 - `Kosa8Cloud()` (and `AsyncCloud()`, and the E2B/Daytona/Modal shims) with no key and no `KOSA8_API_KEY` uses the key `kosa8 login` keeps in `~/.kosa8/cloud.json`, and its `api_url` unless `KOSA8_CLOUD_URL` or `base_url=` is set. The "no API key" error now names `kosa8 login`.

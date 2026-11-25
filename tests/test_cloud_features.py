@@ -157,6 +157,23 @@ class Background(unittest.TestCase):
         self.assertEqual((done["state"], done["exit"], done["output"]), ("exited", 0, "built\n"))
         self.assertEqual(route(stub.seen[1]), "GET /v1/sandboxes/sbx_1/exec/bg_1")
 
+    def test_status_nulls_keep_what_the_start_said(self):
+        # The status read has no pid, and the API answers missing fields as
+        # null: id and pid must survive it, so stop() still has a path.
+        def answer(s):
+            if s["method"] == "POST" and s["path"].endswith("/exec"):
+                return 202, {"exec": {"id": "bg_1", "state": "running", "pid": 7, "output_path": "/o", "exit_path": "/e"}}
+            if s["path"].endswith("/stop"):
+                return 200, {"exec": {"id": "bg_1", "state": "exited", "exit": 143, "stopped": True}}
+            return 200, {"exec": {"id": None, "state": "running", "pid": None, "exit": None, "output_path": None, "exit_path": None}}
+
+        cloud, stub = make(answer)
+        job = CloudSandbox(cloud, sbx()).exec_background("sleep 9")
+        info = job.status()
+        self.assertEqual((info["id"], info["pid"], info["output_path"], info["exit_path"]), ("bg_1", 7, "/o", "/e"))
+        self.assertEqual(job.stop()["state"], "exited")
+        self.assertEqual(route(stub.seen[-1]), "POST /v1/sandboxes/sbx_1/exec/bg_1/stop")
+
     def test_get_exec_and_timeout(self):
         cloud, _ = make(lambda s: (200, {"exec": {"id": "bg_2", "state": "running", "pid": 1, "exit": None}}))
         job = CloudSandbox(cloud, sbx()).get_exec("bg_2")
