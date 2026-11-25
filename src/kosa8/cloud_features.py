@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from ._calls import AsyncCalls, Calls, key
 from .cloud_more import AsyncCloudPreviewDomains, CloudPreviewDomains
-from .errors import Kosa8TimeoutError
+from .errors import Kosa8Error, Kosa8PaymentRequiredError, Kosa8TimeoutError
 
 #: Pipelines run states that are final.
 PIPELINE_DONE_STATES = frozenset({"success", "failure", "cancelled", "skipped", "error"})
@@ -92,6 +92,63 @@ class CloudBackgroundExec(Calls):
                 raise Kosa8TimeoutError(f"background command {self.id} still running after {timeout} s")
             time.sleep(interval)
 
+    def read(self, offset: int = 0, *, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Its output from byte ``offset``: ``output``, ``next_offset`` (where
+        the next read starts), ``output_more`` and ``state``/``exit``. Read
+        again with ``next_offset`` after a dropped connection: nothing is
+        missed or repeated. It is complete when ``state`` is ``exited`` and
+        ``output_more`` is false."""
+        return self._call("GET", self._read_path(offset, limit), then=self._set)
+
+    def _read_path(self, offset: int, limit: Optional[int]) -> str:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("offset must be a whole number of bytes, 0 or more")
+        q = f"offset={offset}" + (f"&limit={int(limit)}" if limit is not None else "")
+        return f"/v1/sandboxes/{self._sid}/exec/{_q(self.id)}?{q}"
+
+    def follow(self, offset: int = 0, *, timeout: float = 3600.0, interval: float = 1.0,
+               retries: int = 5) -> Any:
+        """Yield its output as it is written, from ``offset``, until it exits
+        and all of it has been read; then ``.info`` has its ``exit``. A read
+        that fails with a lost connection or a 5xx is tried again from the
+        same byte (``retries`` in a row)::
+
+            for text in job.follow():
+                print(text, end="")
+            print("exit", job.info["exit"])
+        """
+        deadline = time.monotonic() + timeout
+        failed = 0
+        while True:
+            try:
+                r = self.read(offset)
+            except Kosa8Error as e:
+                if not _retryable(e) or failed >= retries:
+                    raise
+                failed += 1
+            else:
+                failed = 0
+                if r.get("output"):
+                    yield r["output"]
+                offset = r.get("next_offset", offset)
+                if r.get("output_more"):
+                    continue
+                if r.get("state") == "exited":
+                    return
+            if time.monotonic() + interval > deadline:
+                raise Kosa8TimeoutError(f"background command {self.id} still running after {timeout} s "
+                                        f"(read up to byte {offset}; go on with follow(offset={offset}))")
+            time.sleep(interval)
+
+
+def _retryable(e: Exception) -> bool:
+    """A lost connection, a 5xx or a 429: worth reading again from the same byte.
+    A plan limit (a payment error, even as a 429) is not."""
+    if isinstance(e, Kosa8PaymentRequiredError):
+        return False
+    status = getattr(e, "status", None)
+    return status is None or status == 429 or status >= 500
+
 
 class AsyncCloudBackgroundExec(AsyncCalls, CloudBackgroundExec):
     """:class:`CloudBackgroundExec` for :class:`~kosa8.AsyncCloudSandbox`."""
@@ -104,6 +161,32 @@ class AsyncCloudBackgroundExec(AsyncCalls, CloudBackgroundExec):
                 return s
             if time.monotonic() + interval > deadline:
                 raise Kosa8TimeoutError(f"background command {self.id} still running after {timeout} s")
+            await asyncio.sleep(interval)
+
+    async def follow(self, offset: int = 0, *, timeout: float = 3600.0, interval: float = 1.0,  # type: ignore[override]
+                     retries: int = 5) -> Any:
+        """:meth:`CloudBackgroundExec.follow`, as an async iterator."""
+        deadline = time.monotonic() + timeout
+        failed = 0
+        while True:
+            try:
+                r = await self.read(offset)
+            except Kosa8Error as e:
+                if not _retryable(e) or failed >= retries:
+                    raise
+                failed += 1
+            else:
+                failed = 0
+                if r.get("output"):
+                    yield r["output"]
+                offset = r.get("next_offset", offset)
+                if r.get("output_more"):
+                    continue
+                if r.get("state") == "exited":
+                    return
+            if time.monotonic() + interval > deadline:
+                raise Kosa8TimeoutError(f"background command {self.id} still running after {timeout} s "
+                                        f"(read up to byte {offset}; go on with follow(offset={offset}))")
             await asyncio.sleep(interval)
 
 

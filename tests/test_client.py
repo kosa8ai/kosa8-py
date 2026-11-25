@@ -173,7 +173,7 @@ class ForkExploreTest(Base):
 
         def run(r, h):
             variant = r.json()["args"][2]
-            send_frames(h, [{"stream": "stdout", "data": variant}, {"done": True, "exit": 0 if variant == "ok" else 1}])
+            send_frames(h, [{"stream": "stdout", "data": variant}, {"done": True, "ok": True, "exit": 0 if variant == "ok" else 1}])
 
         self.d.on("POST", "/kosa8/v1/sandboxes/{id}/run", run)
         self.d.on("DELETE", "/kosa8/v1/sandboxes/{id}", lambda r, h: send_json(h, 200, {"ok": True}))
