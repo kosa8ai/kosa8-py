@@ -144,11 +144,12 @@ cloud.capabilities()                                  # feature detection
 
 ```python
 # The value goes in one request body and never comes back; sandboxes hold a placeholder.
-cloud.secrets.set("OPENAI", os.environ["OPENAI_API_KEY"], upstream="api.openai.com", pipelines=True)
-box = cloud.sandboxes.create(secrets=["OPENAI"])
-cloud.secrets.list(); cloud.secrets.delete("OPENAI")
+# A name is 1-32 of a-z, 0-9 and -.
+cloud.secrets.set("openai", os.environ["OPENAI_API_KEY"], upstream="api.openai.com", pipelines=True)
+box = cloud.sandboxes.create(secrets=["openai"])
+cloud.secrets.list(); cloud.secrets.delete("openai")
 
-run = cloud.pipelines.run("https://github.com/me/app", ref="main", size="4x8", secrets=["NPM_TOKEN"])
+run = cloud.pipelines.run("https://github.com/me/app", ref="main", size="4x8", secrets=["npm-token"])
 done = cloud.pipelines.wait(run["id"])                # success, failure, cancelled or error
 print(cloud.pipelines.logs(run["id"])["logs"][0]["text"])
 for a in cloud.pipelines.artifacts(run["id"]):
